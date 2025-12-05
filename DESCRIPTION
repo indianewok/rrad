@@ -1,0 +1,22 @@
+Package: rad
+Type: Package
+Title: read-agnostic demultiplexer
+Version: 1.0
+Date: 2024-07-30
+Author: Chinmay Vaidya
+Maintainer: Chinmay Vaidya <chinmay.m.vaidya.GR@dartmouth.edu>
+Description: This package contains a read-agnostic demultiplexer, implemented in R, along with a suite of demultiplexing/sequence manipulation tools for the interested user.
+License: GPL (>= 2)
+Imports: 
+    data.table,
+    ggplot2,
+    ggpubr,
+    magrittr,
+    memuse,
+    pbapply,
+    Rcpp (>= 1.0.9),
+    stringr,
+    tidytable,
+    BH (>= 1.75.0-0)
+LinkingTo: Rcpp, BH
+RoxygenNote: 7.2.2
