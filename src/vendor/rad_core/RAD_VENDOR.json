@@ -1,0 +1,149 @@
+{
+  "upstream": "https://github.com/indianewok/rad",
+  "version": "1.0.2",
+  "commit": "24d5ce47e172222c96cd7dd19e94758d32aa5009",
+  "license": "MIT",
+  "copied_paths": [
+    "include/",
+    "resources/"
+  ],
+  "adapted_paths": [
+    {
+      "source": "include/csv-parser/single_include/csv.hpp",
+      "destination": "include/csv-parser/single_include/csv.hpp"
+    },
+    {
+      "source": "include/fkYAML/node.hpp",
+      "destination": "include/fkYAML/node.hpp"
+    },
+    {
+      "source": "include/gzstream/gzstream.h",
+      "destination": "include/gzstream/gzstream.h"
+    },
+    {
+      "source": "include/kseq/kseq.h",
+      "destination": "include/kseq/kseq.h"
+    },
+    {
+      "source": "include/parallel_hashmap/phmap.h",
+      "destination": "include/parallel_hashmap/phmap.h"
+    },
+    {
+      "source": "include/parallel_hashmap/phmap_base.h",
+      "destination": "include/parallel_hashmap/phmap_base.h"
+    },
+    {
+      "source": "include/parallel_hashmap/phmap_bits.h",
+      "destination": "include/parallel_hashmap/phmap_bits.h"
+    },
+    {
+      "source": "include/rad/barcode_correction.hpp",
+      "destination": "include/rad/barcode_correction.hpp"
+    },
+    {
+      "source": "generated for rrad",
+      "section": "package-safe captured console",
+      "destination": "include/rad/embedded_console.hpp"
+    },
+    {
+      "source": "include/rad/io_streaming.hpp",
+      "destination": "include/rad/io_streaming.hpp"
+    },
+    {
+      "source": "include/rad/misc_utils.hpp",
+      "destination": "include/rad/misc_utils.hpp"
+    },
+    {
+      "source": "generated for rrad",
+      "section": "portable serial/OpenMP compatibility layer",
+      "destination": "include/rad/openmp_compat.hpp"
+    },
+    {
+      "source": "include/rad/rad_headers.h",
+      "destination": "include/rad/rad_headers.h"
+    },
+    {
+      "source": "include/rad/read_layout.hpp",
+      "destination": "include/rad/read_layout.hpp"
+    },
+    {
+      "source": "src/main.cpp",
+      "section": "reformat",
+      "destination": "include/rad/reformat.hpp"
+    },
+    {
+      "source": "include/rad/seqspec.hpp",
+      "destination": "include/rad/seqspec.hpp"
+    },
+    {
+      "source": "include/rad/sigstring.hpp",
+      "destination": "include/rad/sigstring.hpp"
+    },
+    {
+      "source": "include/rad/whitelist_generator.hpp",
+      "destination": "include/rad/whitelist_generator.hpp"
+    },
+    {
+      "source": "include/ssw/sse2neon.h",
+      "destination": "include/ssw/sse2neon.h"
+    },
+    {
+      "source": "include/ssw/ssw.c",
+      "destination": "include/ssw/ssw.c"
+    }
+  ],
+  "installed_resource_root": "inst/rad/resources",
+  "remote_resource_manifest": "inst/rad/resources/REMOTE_RESOURCES.tsv",
+  "remote_asset_set": "rad-1.0.2-24d5ce47",
+  "remote_asset_origin": "https://github.com/indianewok/rad/tree/24d5ce47e172222c96cd7dd19e94758d32aa5009/resources/wl",
+  "remote_fetch_policy": "runtime on demand; exact byte count and SHA-256 required before use",
+  "upstream_include_tree_sha256": "a43f5384c8c8d48a92fa98c1868c36bbce2f1ba082ce7c589a17bff581f70267",
+  "embedded_source_digest": "ab7272977588d6c33db6d27ebae43010a75507e1ecc18be69faa1dce23f5c5a8",
+  "embedded_source_digest_algorithm": "sha256 of sorted lines: lowercase file sha256, two spaces, POSIX path relative to include/, LF",
+  "resource_tree_sha256": "b3081d5fd40d2d9309108fa79dd591d286e3ec1422582b0c520712659ffec4fb",
+  "resource_tree_sha256_algorithm": "sha256 of sorted lines: lowercase file sha256, two spaces, POSIX path relative to inst/rad/resources/, LF",
+  "resource_schema": 1,
+  "core_api_version": 1,
+  "patches": [
+    "isolate upstream declarations in package namespace rrad_rad_core",
+    "replace Boost.Filesystem with std::filesystem",
+    "replace Boost.Iostreams gzip streams with gzstream/zlib",
+    "replace Boost.Lockfree output queue with a bounded std queue",
+    "qualify std::hash specializations for namespaced RAD types",
+    "ignore per-user RAD layout and whitelist overrides when RAD_EMBEDDED_ONLY is set",
+    "isolate the seqspec translator and port it to std::filesystem",
+    "propagate kseq parse failures from chunk streaming and reject unsupported sequence inputs",
+    "make debug artifacts additive without suppressing the primary demultiplexed FASTQ",
+    "preserve explicit global and true whitelist roles independently of catalog size",
+    "serialize chunk acquisition, capture OpenMP worker exceptions, and poll host interrupts only at serial boundaries",
+    "validate gzip input and whitelist integrity and separate regular-file versus pigz-pipe ownership",
+    "explicitly finalize and validate primary, debug, metrics, whitelist, layout, and position-map outputs",
+    "key remote seqspec onlist cache entries by URL and sanitize filenames before atomic download",
+    "reuse calibration caches only when both layout and position-map artifacts are present",
+    "strictly trim and validate explicit character and packed-integer whitelist rows and reject files with no valid barcodes",
+    "retain a layout-derived reference whitelist as the global catalog after automatic whitelist detection",
+    "resolve omitted default whitelists through an R-validated per-call cache overlay with machine-readable missing-resource markers",
+    "preflight every derived artifact against explicit and layout-derived inputs, reused caches, and companion maps, and make full output-integrity validation interruptible",
+    "harden single-, split-, and rescan whitelist workflows with transactional outputs, checked gzip parsing, exact-adapter N wildcards, indel-aware adapter bounds, complete mirrored extraction windows, bounded pair aggregation, deterministic statistics, effective packed-length reporting, and serial host-interrupt polling",
+    "remove the unused historical shifted-barcode helper from the embedded core",
+    "adapt the RAD reformat command into a reusable in-process API with parallel ordered transformation, bounded split writers, opt-in collapsed identifiers, preserved empty records and FASTQ plus-line data, FASTA-aware names, non-destructive coordinate metadata rewriting, coordinate-input integrity checks, safe barcode filenames, prepublication host-result construction, allocation-safe split rollback bookkeeping, and atomic no-clobber installation",
+    "guard optional HOME-based diagnostic output paths so ordinary embedded runs remain safe when HOME is unset",
+    "recognize barcode and UMI annotations only as complete SAM-style header fields",
+    "constrain packed barcodes to unsigned two-bit values of at most 32 bases and reject malformed compound specifications",
+    "validate spatial masks and axes strictly before native execution",
+    "treat local seqspec onlists as authoritative, reject arbitrary remote onlists in embedded mode, and use secure temporary translation files",
+    "publish demultiplex and whitelist-scan artifact sets under persistent per-prefix locks with same-filesystem staging and recoverable rollback",
+    "snapshot reusable layout and position-map cache pairs together under the publication lock before parsing or republishing them",
+    "preserve input-record order when consolidating dynamically scheduled multithreaded demultiplex output",
+    "quote pigz inputs, propagate subprocess failures, and reject truncated, corrupt, or concatenated gzip input",
+    "copy each verified on-demand whitelist into a private permission-restricted per-call overlay before native use",
+    "route embedded RAD and SSW diagnostics through a package-owned thread-safe capture stream instead of process stdout or stderr",
+    "modernize vendored literal and allocator syntax and replace warning-suppressed undefined SIMD values with explicit zero initialization"
+  ],
+  "excluded": [
+    "resources/wl/visium_hd_coordinates.csv.gz (ignored and not tracked upstream)",
+    "three large 3M whitelist payloads (catalogued by inst/rad/resources/REMOTE_RESOURCES.tsv and fetched on demand)",
+    "unused sciplot and kdepp headers",
+    "unused parallel_hashmap btree, dump, and memory-info headers"
+  ]
+}

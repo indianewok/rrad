@@ -1,0 +1,8 @@
+﻿Read Layout,,,,,
+id,seq,expected_length,type,class,whitelist
+forw_primer,CTACACGACGCTCTTCCGATCT,,static,,
+barcode,,16,variable,barcode,10x_3v3
+umi,,12,variable,umi,
+poly_t,,,static,poly_t,
+read,,,variable,read,
+rev_primer,ACTCTGCGTTGATACCACTGCTT,,static,,

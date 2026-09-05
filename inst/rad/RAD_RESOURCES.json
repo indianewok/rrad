@@ -1,0 +1,10 @@
+{
+  "upstream": "https://github.com/indianewok/rad",
+  "version": "1.0.2",
+  "commit": "24d5ce47e172222c96cd7dd19e94758d32aa5009",
+  "resource_schema": 1,
+  "resource_tree_sha256": "b3081d5fd40d2d9309108fa79dd591d286e3ec1422582b0c520712659ffec4fb",
+  "remote_resource_manifest": "resources/REMOTE_RESOURCES.tsv",
+  "remote_asset_set": "rad-1.0.2-24d5ce47",
+  "remote_fetch_policy": "on demand with pinned SHA-256 verification"
+}

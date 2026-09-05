@@ -1,0 +1,5 @@
+Read Layout:bulk,,,,,
+id,seq,expected_length,type,class,whitelist
+linker_1,AATGTACTTCGTTCAGTTACGTATTGCTAAGGTTAANNNNNNNNNNNNNNNNNNNNNNNNCAGCACCT,,static,,
+read,,,variable,read,
+linker_3,AGGTGCTGNNNNNNNNNNNNNNNNNNNNNNNNTTAACCTTAGCAATACGTAACTGAACGAAGT,,static,,

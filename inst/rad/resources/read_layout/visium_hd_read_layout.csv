@@ -1,0 +1,9 @@
+Read Layout,,,,,,
+id,seq,expected_length,type,class,whitelist,flags
+forw_primer,CTACACGACGCTCTTCCGATCT,,static,,,
+umi,,9,variable,umi,,
+barcode_1,,15-16,variable,barcode,visium_hd_bc1,joint_barcode
+barcode_2,,14-15,variable,barcode,visium_hd_bc2,joint_barcode
+poly_t,,,static,poly_t,,
+read,,,variable,read,,
+rev_primer,ACTCTGCGTTGATACCACTGCTT,,static,,,

@@ -1,0 +1,4 @@
+key	path	asset_set	url	sha256	bytes	kits
+10x_3v3	wl/3M-february-2018-3v3.txt_bitlist.csv.gz	rad-1.0.2-24d5ce47	https://raw.githubusercontent.com/indianewok/rad/24d5ce47e172222c96cd7dd19e94758d32aa5009/resources/wl/3M-february-2018-3v3.txt_bitlist.csv.gz	02f771363a95e786ab1a6ab1e554c770e58cdff2fb30f2d7a9fb50a97762d452	17174934	10x_3v3;10x_3v3.1;10x_3HTv3.1
+10x_3v4	wl/3M-3pgex-may-2023.txt_bitlist.csv.gz	rad-1.0.2-24d5ce47	https://raw.githubusercontent.com/indianewok/rad/24d5ce47e172222c96cd7dd19e94758d32aa5009/resources/wl/3M-3pgex-may-2023.txt_bitlist.csv.gz	d1f4fa488a0ce631b496362b6b424eb73b6593d0e5aa52dca7d0e737f750b8fe	18397208	10x_3v4
+10x_5v3	wl/3M-5pgex-jan-2023.txt_bitlist.csv.gz	rad-1.0.2-24d5ce47	https://raw.githubusercontent.com/indianewok/rad/24d5ce47e172222c96cd7dd19e94758d32aa5009/resources/wl/3M-5pgex-jan-2023.txt_bitlist.csv.gz	bd987e0c0cf78f5d8952b986e3ae9e7b7beb8e16b86ad7e1d98a2480305006a4	9332586	10x_5v3

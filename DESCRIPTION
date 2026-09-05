@@ -1,22 +1,36 @@
-Package: rad
+Package: rrad
 Type: Package
-Title: read-agnostic demultiplexer
-Version: 1.0
-Date: 2024-07-30
-Author: Chinmay Vaidya
-Maintainer: Chinmay Vaidya <chinmay.m.vaidya.GR@dartmouth.edu>
-Description: This package contains a read-agnostic demultiplexer, implemented in R, along with a suite of demultiplexing/sequence manipulation tools for the interested user.
-License: GPL (>= 2)
-Imports: 
+OS_type: unix
+Encoding: UTF-8
+Depends:
+    R (>= 4.0.0)
+Title: R Interface and Toolkit for Read-Agnostic Demultiplexing
+Version: 1.1.0
+Date: 2026-09-02
+Authors@R: person(
+    given = "Chinmay",
+    family = "Vaidya",
+    email = "chinmay.m.vaidya.GR@dartmouth.edu",
+    role = c("aut", "cre")
+    )
+Description: Provides an embedded build of the read-agnostic demultiplexer
+    ('RAD') together with streaming and compact read storage for R.
+    Demultiplexing, barcode-whitelist discovery, and tagged-read reformatting
+    run in-process. Compatible RAD layouts and small whitelists are included;
+    large built-in whitelists are downloaded automatically when first needed,
+    verified, and reused on later runs. No separate command-line installation
+    is required.
+License: GPL (>= 3)
+Imports:
+    bit64,
     data.table,
-    ggplot2,
-    ggpubr,
-    magrittr,
-    memuse,
-    pbapply,
-    Rcpp (>= 1.0.9),
-    stringr,
-    tidytable,
-    BH (>= 1.75.0-0)
-LinkingTo: Rcpp, BH
+    digest,
+    Rcpp (>= 1.0.9)
+LinkingTo:
+    BH,
+    Rcpp
+Suggests:
+    testthat (>= 3.0.0)
+SystemRequirements: C++17, zlib
+Config/testthat/edition: 3
 RoxygenNote: 7.2.2

@@ -1,0 +1,17 @@
+seqspec_version: 0.3.0
+assay_id: rrad-minimal-bulk
+library_spec:
+  - region_id: RNA
+    region_type: RNA
+    regions:
+      - region_id: linker_1
+        region_type: adapter
+        sequence_type: fixed
+        sequence: AATGTACTTCGTTCAGTTACGTATTGCTAAGGTTAANNNNNNNNNNNNNNNNNNNNNNNNCAGCACCT
+      - region_id: read
+        region_type: cdna
+        sequence_type: random
+      - region_id: linker_3
+        region_type: adapter
+        sequence_type: fixed
+        sequence: AGGTGCTGNNNNNNNNNNNNNNNNNNNNNNNNTTAACCTTAGCAATACGTAACTGAACGAAGT

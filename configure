@@ -1,0 +1,62 @@
+#!/bin/sh
+
+set -eu
+
+if test -n "${R_HOME:-}"; then
+    rrad_r_bin="${R_HOME}/bin/R"
+else
+    rrad_r_bin="$(command -v R)"
+fi
+rrad_cxx17="$("${rrad_r_bin}" CMD config CXX17 2>/dev/null || true)"
+if test -z "${rrad_cxx17}"; then
+    rrad_cxx17="$("${rrad_r_bin}" CMD config CXX 2>/dev/null || true)"
+fi
+rrad_cxx17std="$("${rrad_r_bin}" CMD config CXX17STD 2>/dev/null || true)"
+rrad_cppflags="$("${rrad_r_bin}" CMD config CPPFLAGS 2>/dev/null || true)"
+rrad_ldflags="$("${rrad_r_bin}" CMD config LDFLAGS 2>/dev/null || true)"
+rrad_openmp_flags='$(SHLIB_OPENMP_CXXFLAGS)'
+if test "$(uname -s 2>/dev/null || true)" = "Darwin"; then
+    # R's bundled libomp may lag the Apple clang runtime ABI. The default
+    # macOS source build remains serial; openmp_compat.hpp supplies stubs.
+    rrad_openmp_flags=""
+fi
+
+rrad_probe_parent="${TMPDIR:-/tmp}"
+rrad_probe_dir="$(mktemp -d "${rrad_probe_parent%/}/rrad-filesystem.XXXXXX")" || {
+    echo "configure: error: could not create a private compiler probe directory" >&2
+    exit 1
+}
+chmod 700 "${rrad_probe_dir}"
+trap 'rm -rf "${rrad_probe_dir}"' EXIT HUP INT TERM
+
+cat > "${rrad_probe_dir}/filesystem.cpp" <<'EOF'
+#include <filesystem>
+int main() {
+    return std::filesystem::path("rrad").filename().empty() ? 1 : 0;
+}
+EOF
+
+rrad_try_link() {
+    rrad_extra_libs="$1"
+    eval "${rrad_cxx17} ${rrad_cxx17std} ${rrad_cppflags} \"${rrad_probe_dir}/filesystem.cpp\" ${rrad_ldflags} ${rrad_extra_libs} -o \"${rrad_probe_dir}/filesystem\"" \
+        >/dev/null 2>&1
+}
+
+rrad_filesystem_libs=""
+if rrad_try_link ""; then
+    :
+elif rrad_try_link "-lstdc++fs"; then
+    rrad_filesystem_libs=" -lstdc++fs"
+else
+    echo "configure: error: the C++17 compiler cannot link std::filesystem" >&2
+    exit 1
+fi
+
+sed \
+    -e "s|@FILESYSTEM_LIBS_SUFFIX@|${rrad_filesystem_libs}|g" \
+    -e "s|@OPENMP_CXXFLAGS@|${rrad_openmp_flags}|g" \
+    -e 's/[[:space:]]*$//' \
+    src/Makevars.in > src/Makevars
+
+echo "configure: std::filesystem libraries: ${rrad_filesystem_libs:-none}"
+echo "configure: OpenMP flags: ${rrad_openmp_flags:-none}"

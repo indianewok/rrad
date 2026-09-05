@@ -1,0 +1,12 @@
+@read-one CB:Z:AACC UB:Z:TGCA
+ACGTACGT
++
+IIIIIIII
+@read-two CB:Z:TTGA UB:Z:CCCC
+TGCATGCA
++
+HHHHHHHH
+@read-three RG:Z:sample
+AAAACCCC
++
+GGGGGGGG

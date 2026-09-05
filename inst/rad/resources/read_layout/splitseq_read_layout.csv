@@ -1,0 +1,9 @@
+﻿Read Layout,,,,,
+id,seq,expected_length,type,class,whitelist
+read,,,variable,read,
+barcode_1,,8,variable,barcode,splitseq_bc2
+linker_1,CCACAGTCTCAAGCACGTGGAT,,static,linker,
+barcode_2,,8,variable,barcode,splitseq_bc1
+linker_2,AGTCGTACGCCGATGCGAAACATCGGCCAC,,static,linker,
+barcode_3,,8,variable,barcode,splitseq_bc1
+umi,,10,variable,umi,

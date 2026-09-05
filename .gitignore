@@ -3,7 +3,10 @@
 .RData
 .Ruserdata
 src/*.o
+src/*.o.tmp
 src/*.so
 src/*.dll
 .DS_Store
+src/Makevars
 .Rproj
+/rrad_*.tar.gz

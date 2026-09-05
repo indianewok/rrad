@@ -1,0 +1,6 @@
+Read Layout,,,,,
+id,seq,expected_length,type,class,whitelist
+anchor,ACGTACGT,,static,linker,
+barcode,,4,variable,barcode,
+poly_t,TTTTTTTT,,static,poly_t,
+read,,,variable,read,

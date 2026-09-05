@@ -1,0 +1,4 @@
+# Preserve byte-for-byte upstream inputs. Their recorded SHA-256 provenance
+# depends on line endings and whitespace exactly as vendored.
+src/vendor/rad_core/include/** -text -whitespace
+inst/rad/resources/read_layout/** -text -whitespace
