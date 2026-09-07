@@ -21,6 +21,8 @@ Description: Provides an embedded build of the read-agnostic demultiplexer
     verified, and reused on later runs. No separate command-line installation
     is required.
 License: GPL (>= 3)
+URL: https://github.com/indianewok/rrad
+BugReports: https://github.com/indianewok/rrad/issues
 Imports:
     bit64,
     data.table,

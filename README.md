@@ -10,21 +10,13 @@ for read identifiers, nucleotide sequences, and Phred qualities.
 
 ## Installation
 
-This repository is private. A user must first have read access to
-`indianewok/rrad` and authenticate GitHub on the machine where R will install
-the package. Store the credential in the system credential manager rather than
-putting a token in an R script, repository URL, or committed `.Renviron` file.
+`rrad` is public and can be installed directly from its pinned GitHub release;
+no GitHub credential or separate RAD installation is required.
 
 ```r
-install.packages(c("gitcreds", "remotes"))
-gitcreds::gitcreds_set() # one-time interactive credential setup
-
+install.packages("remotes")
 remotes::install_github("indianewok/rrad@v1.2.1")
 ```
-
-The credential needs read access to this repository. GitHub may report missing
-or insufficient private-repository access as a repository-not-found or 404
-error.
 
 ## Native RAD workflow
 
