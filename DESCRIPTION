@@ -5,8 +5,8 @@ Encoding: UTF-8
 Depends:
     R (>= 4.0.0)
 Title: R Interface and Toolkit for Read-Agnostic Demultiplexing
-Version: 1.1.0
-Date: 2026-09-02
+Version: 1.2.0
+Date: 2026-09-07
 Authors@R: person(
     given = "Chinmay",
     family = "Vaidya",

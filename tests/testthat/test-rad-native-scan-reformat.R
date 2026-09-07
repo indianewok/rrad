@@ -667,6 +667,294 @@ test_that("native FASTA splitting preserves records and case-folded suffixes", {
                    c(">fa-read\tCB:Z:AACC UB:Z:TGCA", "ACGT"))
 })
 
+test_that("native reformat converts FASTQ to tagged FASTA for IgBLAST", {
+  work <- tempfile("rad-native-fq2fa-")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE), add = TRUE)
+  input <- file.path(work, "tagged.fastq.gz")
+  output <- file.path(work, "igblast.fa")
+  connection <- gzfile(input, open = "wt")
+  writeLines(c(
+    "@read-one CB:Z:AACC UB:Z:TGCA XX:Z:keep",
+    "ACGT",
+    "+read-one plus payload",
+    "!5I~",
+    "@read-two CB:Z:TTGA UB:Z:CCCC",
+    "TGCA",
+    "+",
+    "JJJJ"
+  ), connection)
+  close(connection)
+
+  result <- rad_reformat(
+    input,
+    output_fastq = output,
+    to_fasta = TRUE,
+    threads = 1L,
+    chunk_size = 1L
+  )
+
+  expect_identical(native_read_lines(output), c(
+    ">read-one\tCB:Z:AACC UB:Z:TGCA XX:Z:keep", "ACGT",
+    ">read-two\tCB:Z:TTGA UB:Z:CCCC", "TGCA"
+  ))
+  expect_identical(result$artifacts$fastx, normalizePath(output))
+  expect_identical(result$artifacts$fasta, normalizePath(output))
+  expect_identical(result$artifacts$fastq, "")
+  expect_length(result$artifacts$split_fasta, 0L)
+  expect_equal(result$stats$records_read, 2)
+  expect_equal(result$stats$records_written, 2)
+  expect_equal(result$stats$records_converted_to_fasta, 2)
+  expect_true("reformat-fasta" %in% result$core$features)
+  expect_true(file.exists(input))
+})
+
+test_that("native FASTA conversion composes with collapsed IgBLAST headers", {
+  work <- tempfile("rad-native-igblast-header-")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE), add = TRUE)
+  input <- file.path(work, "tagged.fastq")
+  output <- file.path(work, "igblast.fasta.gz")
+  writeLines(c(
+    "@sample:read CB:Z:AACC UB:Z:TGCA XX:Z:discard",
+    "ACGT",
+    "+sample:read retained-only-in-fastq",
+    "IIII"
+  ), input)
+
+  result <- rad_reformat(
+    input,
+    reformat_header = TRUE,
+    delimiter = "|",
+    output_fastq = output,
+    to_fasta = TRUE,
+    threads = 1L
+  )
+
+  expect_identical(
+    native_read_lines(output),
+    c(">sample:read|AACC|TGCA", "ACGT")
+  )
+  expect_equal(result$stats$records_reformatted, 1)
+  expect_equal(result$stats$records_converted_to_fasta, 1)
+})
+
+test_that("native pRESTO headers use ordered annotations from SAM tags", {
+  work <- tempfile("rad-native-presto-header-")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE), add = TRUE)
+  input <- file.path(work, "tagged.fastq.gz")
+  output <- file.path(work, "igblast.fa.gz")
+  connection <- gzfile(input, open = "wt")
+  writeLines(c(
+    paste0(
+      "@read-one-F TS:A:+ UB:Z:TGCA XX:Z:ignore CB:Z:AACC CR:Z:AATC ",
+      "BC:Z:s_002um_00001_00002-1"
+    ),
+    "ACGT", "+read-one-F", "IIII",
+    "@read-no-umi-R BC:Z: CR:Z:TTGA CB:Z:TTGA TS:A:-",
+    "TGCA", "+", "JJJJ",
+    "@read-no-barcode-F UB:Z:CCCC TS:A:+",
+    "AAAA", "+", "HHHH"
+  ), connection)
+  close(connection)
+
+  result <- rad_reformat(
+    input,
+    output_fastq = output,
+    to_fasta = TRUE,
+    header_format = "presto",
+    threads = 1L,
+    chunk_size = 1L
+  )
+
+  expect_identical(native_read_lines(output), c(
+    ">read-one-F|BARCODE=s_002um_00001_00002-1|UMI=TGCA", "ACGT",
+    ">read-no-umi-R|BARCODE=TTGA", "TGCA",
+    ">read-no-barcode-F|UMI=CCCC", "AAAA"
+  ))
+  expect_identical(result$config$header_format, "presto")
+  expect_identical(result$config$reformat_header, FALSE)
+  expect_equal(result$stats$records_reformatted, 3)
+  expect_equal(result$stats$records_converted_to_fasta, 3)
+  expect_true("reformat-presto-header" %in% result$core$features)
+})
+
+test_that("native pRESTO headers accept tagged FASTA input", {
+  work <- tempfile("rad-native-presto-fasta-")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE), add = TRUE)
+  input <- file.path(work, "tagged.fasta")
+  output <- file.path(work, "presto.fasta")
+  writeLines(c(
+    ">fasta-read UB:Z:ACAC TS:A:+ CB:Z:GGTG", "ACGT"
+  ), input)
+
+  result <- rad_reformat(
+    input,
+    header_format = "presto",
+    output_fastq = output,
+    threads = 1L
+  )
+
+  expect_identical(
+    native_read_lines(output),
+    c(">fasta-read|BARCODE=GGTG|UMI=ACAC", "ACGT")
+  )
+  expect_equal(result$stats$records_converted_to_fasta, 0)
+  expect_equal(result$stats$records_reformatted, 1)
+})
+
+test_that("pRESTO BARCODE prefers BC while splitting remains keyed by CB", {
+  work <- tempfile("rad-native-presto-spatial-split-")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE), add = TRUE)
+  input <- file.path(work, "spatial.fastq")
+  writeLines(c(
+    paste0(
+      "@spot UB:Z:TGCA BC:Z:s_008um_00003_00004-1 ",
+      "XX:Z:keep CB:Z:CELL_AACC"
+    ),
+    "ACGT", "+", "IIII"
+  ), input)
+
+  result <- rad_reformat(
+    input,
+    out_dir = file.path(work, "split"),
+    split_bc = TRUE,
+    to_fasta = TRUE,
+    header_format = "presto",
+    threads = 1L
+  )
+
+  expect_identical(names(result$artifacts$split_fasta), "CELL_AACC")
+  expect_identical(
+    native_read_lines(result$artifacts$split_fasta[["CELL_AACC"]]),
+    c(">spot|BARCODE=s_008um_00003_00004-1|UMI=TGCA", "ACGT")
+  )
+})
+
+test_that("unsafe pRESTO header values fail before atomic publication", {
+  work <- tempfile("rad-native-presto-unsafe-")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE), add = TRUE)
+  records <- list(
+    qname_pipe = c("@bad|qname CB:Z:AACC", "pRESTO QNAME"),
+    qname_equals = c("@bad=qname CB:Z:AACC", "pRESTO QNAME"),
+    qname_comma = c("@bad,qname CB:Z:AACC", "pRESTO QNAME"),
+    barcode_pipe = c("@read CB:Z:AA|CC", "pRESTO BARCODE value"),
+    barcode_comma = c("@read CB:Z:AA,CC", "pRESTO BARCODE value"),
+    barcode_whitespace = c(
+      "@read CB:Z:AA\vCC", "pRESTO BARCODE value"
+    ),
+    spatial_barcode_pipe = c(
+      "@read CB:Z:AACC BC:Z:spatial|bad", "pRESTO BARCODE value"
+    ),
+    umi_equals = c("@read CB:Z:AACC UB:Z:TG=CA", "pRESTO UB value")
+  )
+
+  for (name in names(records)) {
+    input <- file.path(work, paste0(name, ".fastq"))
+    output <- file.path(work, paste0(name, ".fa"))
+    writeLines(c(records[[name]][[1L]], "ACGT", "+", "IIII"), input)
+    expect_error(
+      rad_reformat(
+        input,
+        header_format = "presto",
+        output_fastq = output,
+        threads = 1L
+      ),
+      records[[name]][[2L]]
+    )
+    expect_false(file.exists(output))
+  }
+  expect_length(list.files(
+    work, pattern = "^\\.rrad-reformat-stage-", all.files = TRUE
+  ), 0L)
+})
+
+test_that("native to_fasta passes FASTA through without inventing qualities", {
+  work <- tempfile("rad-native-fasta-pass-")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE), add = TRUE)
+  input <- file.path(work, "tagged.fa")
+  output <- file.path(work, "copy.fa.gz")
+  writeLines(c(
+    ">fa-one CB:Z:AACC UB:Z:TGCA XX:Z:keep", "ACGT",
+    ">fa-two", ""
+  ), input)
+
+  result <- rad_reformat(
+    input,
+    output_fastq = output,
+    to_fasta = TRUE,
+    threads = 1L
+  )
+
+  expect_identical(native_read_lines(output), c(
+    ">fa-one\tCB:Z:AACC UB:Z:TGCA XX:Z:keep", "ACGT",
+    ">fa-two", ""
+  ))
+  expect_equal(result$stats$records_read, 2)
+  expect_equal(result$stats$records_written, 2)
+  expect_equal(result$stats$records_converted_to_fasta, 0)
+})
+
+test_that("native split FASTA conversion emits per-barcode fa.gz files", {
+  work <- tempfile("rad-native-split-fasta-")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE), add = TRUE)
+  input <- file.path(work, "tagged.fastq")
+  native_write_fastq(
+    input,
+    c("one", "two", "missing"),
+    c("ACGT", "TGCA", "AAAA"),
+    c("CB:Z:AACC UB:Z:TGCA", "CB:Z:TTGA UB:Z:CCCC", "")
+  )
+
+  result <- rad_reformat(
+    input,
+    out_dir = file.path(work, "split"),
+    split_bc = TRUE,
+    to_fasta = TRUE,
+    threads = 1L
+  )
+
+  expect_setequal(names(result$artifacts$split_fasta), c("AACC", "TTGA"))
+  expect_true(all(grepl("\\.fa\\.gz$", result$artifacts$split_fasta)))
+  expect_identical(result$artifacts$split_fastx,
+                   result$artifacts$split_fasta)
+  expect_length(result$artifacts$split_fastq, 0L)
+  expect_identical(
+    native_read_lines(result$artifacts$split_fasta[["AACC"]]),
+    c(">one\tCB:Z:AACC UB:Z:TGCA", "ACGT")
+  )
+  expect_equal(result$stats$records_written, 2)
+  expect_equal(result$stats$records_skipped_missing_cb, 1)
+  expect_equal(result$stats$records_converted_to_fasta, 2)
+})
+
+test_that("failed FASTA conversion does not publish a partial output", {
+  work <- tempfile("rad-native-fq2fa-rollback-")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE), add = TRUE)
+  input <- file.path(work, "bad.fastq")
+  output <- file.path(work, "bad.fa")
+  writeLines(c(
+    "@good CB:Z:AACC", "ACGT", "+", "IIII",
+    "@truncated", "ACGT", "+"
+  ), input)
+
+  expect_error(
+    rad_reformat(input, output_fastq = output, to_fasta = TRUE),
+    "sequence read failed"
+  )
+  expect_false(file.exists(output))
+  expect_length(list.files(
+    work, pattern = "^\\.rrad-reformat-stage-", all.files = TRUE
+  ), 0L)
+})
+
 test_that("native split reformat rejects unsafe barcode filenames", {
   work <- tempfile("rad-native-reformat-unsafe-")
   dir.create(work)

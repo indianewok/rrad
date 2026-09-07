@@ -36,7 +36,7 @@ constexpr int kResourceSchema = 1;
 constexpr const char* kSourceCommit =
     "24d5ce47e172222c96cd7dd19e94758d32aa5009";
 constexpr const char* kEmbeddedSourceDigest =
-    "ab7272977588d6c33db6d27ebae43010a75507e1ecc18be69faa1dce23f5c5a8";
+    "ffd077ed022c9ac936c2199d1bd61ef79d72f3f5df7d269474bcd006fcd18bbd";
 constexpr const char* kResourceDigest =
     "b3081d5fd40d2d9309108fa79dd591d286e3ec1422582b0c520712659ffec4fb";
 
@@ -880,6 +880,8 @@ Rcpp::List reformat_stats_as_list(const core::reformat_result& run,
             static_cast<double>(stats.records_skipped_missing_cb),
         Rcpp::_["records_reformatted"] =
             static_cast<double>(stats.records_reformatted),
+        Rcpp::_["records_converted_to_fasta"] =
+            static_cast<double>(stats.records_converted_to_fasta),
         Rcpp::_["coordinate_mapped"] =
             static_cast<double>(stats.coordinate_mapped),
         Rcpp::_["coordinate_unmapped"] =
@@ -935,6 +937,7 @@ Rcpp::List core_info_impl() {
             "demux", "file-fastq", "gzip", "builtin-layouts",
             "custom-layout", "custom-whitelist", "auto-whitelist",
             "debug-output", "seqspec", "scan-wl", "reformat",
+            "reformat-fasta", "reformat-presto-header",
             "remote-resource-cache"),
         Rcpp::_["build"] = Rcpp::List::create(
             Rcpp::_["platform"] = platform,
@@ -1155,6 +1158,9 @@ SEXP rad_reformat_cpp(Rcpp::List options) {
             bool_option(options, "split_by_barcode", false);
         config.reformat_header =
             bool_option(options, "reformat_header", false);
+        config.presto_header =
+            bool_option(options, "presto_header", false);
+        config.to_fasta = bool_option(options, "to_fasta", false);
         config.parse_collapsed_id =
             bool_option(options, "parse_collapsed_id", false);
         const std::string delimiter =
@@ -1213,6 +1219,8 @@ SEXP rad_reformat_cpp(Rcpp::List options) {
                     throw std::runtime_error(
                         "reformat core returned no output destination");
                 }
+                const auto split_paths = reformat_split_paths(run);
+                const Rcpp::CharacterVector no_paths(0);
                 Rcpp::List result = Rcpp::List::create(
                     Rcpp::_["success"] = true,
                     Rcpp::_["backend"] = "embedded",
@@ -1223,10 +1231,27 @@ SEXP rad_reformat_cpp(Rcpp::List options) {
                                           ? "split"
                                           : "aggregate",
                     Rcpp::_["files"] = Rcpp::List::create(
-                        Rcpp::_["fastq"] = config.split_by_barcode
+                        Rcpp::_["fastx"] = config.split_by_barcode
                                                   ? std::string()
                                                   : run.output_path,
-                        Rcpp::_["split_fastq"] = reformat_split_paths(run)),
+                        Rcpp::_["fastq"] =
+                            config.split_by_barcode || config.to_fasta
+                                ? std::string()
+                                : run.output_path,
+                        Rcpp::_["fasta"] =
+                            config.split_by_barcode || !config.to_fasta
+                                ? std::string()
+                                : run.output_path,
+                        Rcpp::_["split_fastx"] =
+                            config.split_by_barcode ? split_paths : no_paths,
+                        Rcpp::_["split_fastq"] =
+                            config.split_by_barcode && !config.to_fasta
+                                ? split_paths
+                                : no_paths,
+                        Rcpp::_["split_fasta"] =
+                            config.split_by_barcode && config.to_fasta
+                                ? split_paths
+                                : no_paths),
                     Rcpp::_["stats"] = reformat_stats_as_list(
                         run, requested_threads, effective_threads),
                     Rcpp::_["log"] = capture.str());

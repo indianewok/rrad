@@ -108,6 +108,17 @@ Embedding adaptations are deliberately limited to the vendored copy:
     transformations are rejected. Aggregate, in-place, and split outputs are
     installed atomically only after successful validation; the no-overwrite
     path uses a no-clobber filesystem operation.
+19. Reformat can emit FASTA directly from FASTQ in the same streamed pass as
+    header collapse, coordinate conversion, or barcode splitting. Aggregate
+    and per-barcode FASTA outputs retain the existing transactional publication
+    and gzip validation guarantees, while unchanged headers preserve complete
+    RAD SAM-style tag comments for downstream tools.
+20. Reformat can produce canonical pRESTO identifiers for IgBLAST as
+    `QNAME|BARCODE=BC_OR_CB|UMI=UB`. It prefers a complete nonempty spatial
+    `BC:Z:` value, falls back to `CB:Z:`, recognizes fields independent of their
+    order, and leaves split-file selection keyed by `CB:Z:`. It omits absent
+    annotations and rejects whitespace plus pRESTO's reserved field,
+    assignment, and list delimiters before transactional output publication.
 
 The bridge resolves the installed `rrad` resource bundle through
 `system.file("rad/resources", package = "rrad")`. For an unchanged built-in

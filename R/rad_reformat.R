@@ -1,5 +1,20 @@
 # Native RAD output reformatting ---------------------------------------------
 
+.rad_reformat_input <- function(x) {
+  if (inherits(x, "rad_demux_result")) {
+    candidate <- x$artifacts$fastq
+    if (!is.character(candidate) || length(candidate) != 1L ||
+        is.na(candidate) || !nzchar(candidate)) {
+      stop(
+        "the rad_demux_result does not contain one aggregate FASTQ artifact",
+        call. = FALSE
+      )
+    }
+    x <- candidate
+  }
+  .rad_existing_file(x, "fastq")
+}
+
 .rad_reformat_output_file <- function(x) {
   x <- .rad_scalar_character(x, "output_fastq")
   expanded <- path.expand(x)
@@ -22,6 +37,17 @@
   file.path(normalizePath(parent, mustWork = TRUE), basename(expanded))
 }
 
+.rad_reformat_require_fasta_suffix <- function(x) {
+  if (!grepl("\\.(fa|fasta)(\\.gz)?$", x, ignore.case = TRUE)) {
+    stop(
+      "output_fastq must end in .fa, .fasta, .fa.gz, or .fasta.gz ",
+      "when to_fasta is TRUE",
+      call. = FALSE
+    )
+  }
+  x
+}
+
 .rad_reformat_delimiter <- function(x) {
   x <- .rad_scalar_character(x, "delimiter")
   if (nchar(x, type = "bytes") != 1L) {
@@ -33,11 +59,48 @@
   x
 }
 
-.rad_reformat_require_feature <- function(core) {
+.rad_reformat_header_format <- function(header_format, reformat_header) {
+  if (is.null(header_format)) {
+    return(if (reformat_header) "collapsed" else "preserve")
+  }
+  header_format <- .rad_scalar_character(header_format, "header_format")
+  header_format <- tolower(header_format)
+  choices <- c("preserve", "collapsed", "presto")
+  if (!(header_format %in% choices)) {
+    stop(
+      "header_format must be one of preserve, collapsed, or presto",
+      call. = FALSE
+    )
+  }
+  if (reformat_header && !identical(header_format, "collapsed")) {
+    stop(
+      "reformat_header = TRUE conflicts with header_format = \"",
+      header_format, "\"; use header_format = \"collapsed\" or omit it",
+      call. = FALSE
+    )
+  }
+  header_format
+}
+
+.rad_reformat_require_feature <- function(core, to_fasta = FALSE,
+                                          header_format = "preserve") {
   if (!is.character(core$features) || anyNA(core$features) ||
       !("reformat" %in% core$features)) {
     stop("the embedded RAD core does not advertise the reformat feature",
          call. = FALSE)
+  }
+  if (to_fasta && !("reformat-fasta" %in% core$features)) {
+    stop(
+      "the embedded RAD core does not advertise FASTA reformatting",
+      call. = FALSE
+    )
+  }
+  if (identical(header_format, "presto") &&
+      !("reformat-presto-header" %in% core$features)) {
+    stop(
+      "the embedded RAD core does not advertise pRESTO header formatting",
+      call. = FALSE
+    )
   }
 }
 
@@ -113,11 +176,12 @@
 #'
 #' Streams a FASTQ or FASTA file through RAD's native post-processing engine.
 #' It can collapse `CB:Z` and `UB:Z` tags into the read name, split records into
-#' barcode-specific gzip files, or translate Visium HD barcode pairs into
-#' spatial coordinate headers. No external RAD or compression executable is
-#' launched.
+#' barcode-specific gzip files, emit canonical pRESTO annotations for IgBLAST,
+#' convert FASTQ to FASTA, or translate Visium HD barcode pairs into spatial
+#' coordinate headers. No external RAD or compression executable is launched.
 #'
-#' @param fastq Input FASTQ, FASTA, or gzip-compressed FASTQ/FASTA path.
+#' @param fastq Input FASTQ, FASTA, or gzip-compressed FASTQ/FASTA path, or a
+#'   `rad_demux_result` whose aggregate `artifacts$fastq` should be consumed.
 #' @param out_dir Output directory for barcode-specific files. Required when
 #'   `split_bc = TRUE` and unused otherwise.
 #' @param split_bc Write one gzip file per observed `CB:Z` barcode, using
@@ -125,7 +189,8 @@
 #' @param reformat_header Collapse the read name, cell barcode, and UMI to
 #'   `QNAME<delimiter>CB<delimiter>UB`. For RAD CLI parity, the complete input
 #'   comment is removed, including fields other than the `CB` and `UB` tags.
-#'   This cannot be combined with `coordinate`.
+#'   This is the legacy equivalent of `header_format = "collapsed"` and cannot
+#'   be combined with a different explicit `header_format` or with `coordinate`.
 #' @param collapsed_input Parse tagless input names as already-collapsed
 #'   `QNAME<delimiter>CB<delimiter>UB` values. The default is `FALSE` so normal
 #'   read names containing delimiters cannot be mistaken for cell barcodes.
@@ -134,25 +199,51 @@
 #' @param coordinate Optional coordinate mode. `NULL` disables coordinate
 #'   rewriting; `"vizHD-v1"` maps bundled Visium HD BC1/BC2 barcodes to spatial
 #'   bin identifiers. Coordinate mode preserves unrelated comment fields, is
-#'   mutually exclusive with `reformat_header`, and counts as a requested
-#'   action.
+#'   mutually exclusive with transforming header formats, and counts as a
+#'   requested action.
 #' @param bin_size Positive spatial bin size in microns.
 #' @param output_fastq Optional aggregate output path for a non-splitting run.
 #'   When omitted, a header or coordinate rewrite replaces `fastq` atomically
-#'   in place. It cannot be supplied with `split_bc = TRUE`.
+#'   in place. Despite the legacy argument name, this is also the FASTA output
+#'   path when `to_fasta = TRUE`. It cannot be supplied with
+#'   `split_bc = TRUE`.
 #' @param threads Positive requested worker-thread count. A build without
 #'   OpenMP warns and uses one effective thread.
 #' @param chunk_size Positive number of records per streaming chunk.
 #' @param verbose Print native progress captured during the completed run.
+#' @param to_fasta Convert FASTQ input records to FASTA by omitting the plus
+#'   and quality lines, like `seqkit fq2fa`. The read name and complete comment,
+#'   including RAD's SAM-style tags, are preserved unless another requested
+#'   header transformation changes them. Aggregate conversion requires an
+#'   explicit `output_fastq` path; split conversion writes `.fa.gz` files.
+#' @param header_format Optional header transformation. `NULL` preserves legacy
+#'   behavior: `reformat_header = TRUE` selects `"collapsed"`; otherwise
+#'   `"preserve"` is used. `"preserve"` keeps the QNAME and full comment,
+#'   `"collapsed"` emits the positional legacy form, and `"presto"` emits the
+#'   whitespace-free pRESTO annotation form
+#'   `QNAME|BARCODE=BC_OR_CB|UMI=UB`. `BARCODE` uses a complete, nonempty
+#'   SAM-style `BC:Z:` spatial barcode when present and otherwise falls back to
+#'   `CB:Z:`; `UMI` uses `UB:Z:`. Fields may occur in any order, and missing
+#'   fields are omitted. QNAME and emitted barcode/UMI values containing
+#'   whitespace or the reserved pRESTO delimiters `|`, `=`, or `,` are rejected.
 #' @return A `rad_reformat_result` containing provenance, normalized config,
 #'   exact output paths, processing statistics, and captured log output.
 #' @details
-#' At least one of `split_bc`, `reformat_header`, or `coordinate` must request
-#' work. Split-only runs leave the input untouched. A non-splitting run with no
-#' `output_fastq` performs a checked temporary write followed by atomic
-#' replacement; the original is retained if parsing or writing fails. Legal
-#' zero-length FASTQ/FASTA records and FASTQ plus-line identifiers or comments
-#' are preserved.
+#' At least one of `split_bc`, a transforming `header_format`, `coordinate`, or
+#' `to_fasta` must request work. Split-only runs leave the input untouched. A
+#' non-splitting run with no `output_fastq` performs a checked temporary write
+#' followed by atomic replacement; the original is retained if parsing or
+#' writing fails. Legal zero-length FASTQ/FASTA records and FASTQ plus-line
+#' identifiers or comments are preserved unless FASTA output intentionally
+#' removes FASTQ-only fields.
+#'
+#' The pRESTO format always writes QNAME first, followed by `BARCODE` and `UMI`
+#' annotations in that canonical order when their source tags are present.
+#' Other SAM-style fields are intentionally not copied into the whitespace-free
+#' identifier. Barcode-specific splitting remains keyed by `CB:Z:` even when a
+#' distinct `BC:Z:` value is projected into the pRESTO `BARCODE` annotation.
+#' This makes the result directly usable as a stable IgBLAST query identifier
+#' while leaving downstream code to reject reads without a barcode.
 #' @name rad-reformat
 #' @rdname rad-reformat
 rad_reformat <- function(fastq,
@@ -166,8 +257,10 @@ rad_reformat <- function(fastq,
                          output_fastq = NULL,
                          threads = 1L,
                          chunk_size = 5000L,
-                         verbose = FALSE) {
-  fastq <- .rad_existing_file(fastq, "fastq")
+                         verbose = FALSE,
+                         to_fasta = FALSE,
+                         header_format = NULL) {
+  fastq <- .rad_reformat_input(fastq)
   split_bc <- .rad_scalar_logical(split_bc, "split_bc")
   reformat_header <- .rad_scalar_logical(
     reformat_header, "reformat_header"
@@ -176,12 +269,27 @@ rad_reformat <- function(fastq,
     collapsed_input, "collapsed_input"
   )
   verbose <- .rad_scalar_logical(verbose, "verbose")
+  to_fasta <- .rad_scalar_logical(to_fasta, "to_fasta")
+  header_format <- .rad_reformat_header_format(
+    header_format, reformat_header
+  )
+  reformat_header <- identical(header_format, "collapsed")
   delimiter <- .rad_reformat_delimiter(delimiter)
   if (!is.null(coordinate)) {
     coordinate <- .rad_scalar_character(coordinate, "coordinate")
   }
-  if (reformat_header && !is.null(coordinate)) {
-    stop("reformat_header cannot be combined with coordinate", call. = FALSE)
+  if (!identical(header_format, "preserve") && !is.null(coordinate)) {
+    if (identical(header_format, "collapsed")) {
+      stop("reformat_header cannot be combined with coordinate", call. = FALSE)
+    }
+    stop("header_format cannot be combined with coordinate", call. = FALSE)
+  }
+  if (identical(header_format, "presto") && collapsed_input) {
+    stop(
+      "header_format = \"presto\" requires actual SAM tags and cannot ",
+      "be combined with collapsed_input = TRUE",
+      call. = FALSE
+    )
   }
   bin_size <- .rad_scalar_integer(bin_size, "bin_size", minimum = 1L)
   threads <- .rad_scalar_integer(threads, "threads", minimum = 1L)
@@ -189,9 +297,13 @@ rad_reformat <- function(fastq,
     chunk_size, "chunk_size", minimum = 1L
   )
 
-  if (!split_bc && !reformat_header && is.null(coordinate)) {
+  if (!split_bc && identical(header_format, "preserve") &&
+      is.null(coordinate) && !to_fasta) {
     stop(
-      "request at least one of split_bc, reformat_header, or coordinate",
+      paste0(
+        "request at least one of split_bc, a transforming header_format, ",
+        "coordinate, or to_fasta"
+      ),
       call. = FALSE
     )
   }
@@ -213,10 +325,21 @@ rad_reformat <- function(fastq,
     } else {
       .rad_reformat_output_file(output_fastq)
     }
+    if (to_fasta && is.null(output_fastq)) {
+      stop(
+        "output_fastq is required for aggregate FASTA conversion",
+        call. = FALSE
+      )
+    }
+    if (to_fasta) {
+      output_fastq <- .rad_reformat_require_fasta_suffix(output_fastq)
+    }
   }
 
   core <- rad_core_info()
-  .rad_reformat_require_feature(core)
+  .rad_reformat_require_feature(
+    core, to_fasta = to_fasta, header_format = header_format
+  )
   threads_requested <- threads
   threads_effective <- if (isTRUE(core$build$openmp)) threads else 1L
   if (threads_requested > 1L && threads_effective == 1L) {
@@ -231,6 +354,7 @@ rad_reformat <- function(fastq,
     out_dir = out_dir,
     split_bc = split_bc,
     reformat_header = reformat_header,
+    header_format = header_format,
     collapsed_input = collapsed_input,
     delimiter = delimiter,
     coordinate = coordinate,
@@ -240,13 +364,15 @@ rad_reformat <- function(fastq,
     threads_requested = threads_requested,
     threads_effective = threads_effective,
     chunk_size = chunk_size,
-    verbose = verbose
+    verbose = verbose,
+    to_fasta = to_fasta
   )
   native_options <- .rad_drop_null(list(
     input_path = fastq,
     split_output_dir = out_dir,
     split_by_barcode = split_bc,
     reformat_header = reformat_header,
+    presto_header = identical(header_format, "presto"),
     parse_collapsed_id = collapsed_input,
     delimiter = delimiter,
     coordinate_mode = coordinate,
@@ -254,7 +380,8 @@ rad_reformat <- function(fastq,
     output_path = output_fastq,
     threads = threads_requested,
     chunk_size = chunk_size,
-    verbose = verbose
+    verbose = verbose,
+    to_fasta = to_fasta
   ))
   native <- .rad_reformat_cpp(native_options)
   .rad_reformat_validate_result(native, config, core)

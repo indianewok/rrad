@@ -126,3 +126,34 @@ test_that("RAD source and resource provenance digests stay synchronized", {
   expect_identical(vendor_resource, resource_digest)
   expect_identical(bridge_resource, resource_digest)
 })
+
+test_that("reformat bridge returns its prepared SEXP without wrapping", {
+  root <- normalizePath(test_path("..", ".."), mustWork = FALSE)
+  exports <- file.path(root, "src", "RcppExports.cpp")
+  if (!file.exists(exports)) {
+    skip("generated native bridge source is unavailable in this test context")
+  }
+
+  lines <- readLines(exports, warn = FALSE, encoding = "UTF-8")
+  start <- grep(
+    "^RcppExport SEXP _rrad_rad_reformat_cpp\\(SEXP optionsSEXP\\) \\{$",
+    lines
+  )
+  expect_length(start, 1L)
+  if (length(start) != 1L) {
+    return(invisible(NULL))
+  }
+  following <- which(seq_along(lines) > start & lines == "}")
+  expect_true(length(following) > 0L)
+  if (!length(following)) {
+    return(invisible(NULL))
+  }
+  wrapper <- lines[start:following[[1L]]]
+
+  expect_true(any(grepl(
+    "^[[:space:]]*return rad_reformat_cpp\\(options\\);$", wrapper
+  )))
+  expect_false(any(grepl(
+    "Rcpp::wrap|Rcpp::RObject|Rcpp::RNGScope", wrapper
+  )))
+})

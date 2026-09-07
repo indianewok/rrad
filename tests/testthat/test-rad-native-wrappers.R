@@ -1,4 +1,7 @@
-wrapper_core_info <- function(features = c("demux", "scan-wl", "reformat"),
+wrapper_core_info <- function(features = c(
+                                "demux", "scan-wl", "reformat",
+                                "reformat-fasta", "reformat-presto-header"
+                              ),
                               openmp = TRUE,
                               source_digest = paste(rep("c", 64L), collapse = "")) {
   list(
@@ -68,6 +71,7 @@ wrapper_scan_result <- function(options, core = wrapper_core_info()) {
 
 wrapper_reformat_result <- function(options, core = wrapper_core_info()) {
   split <- isTRUE(options$split_by_barcode)
+  to_fasta <- isTRUE(options$to_fasta)
   output <- if (split) {
     options$split_output_dir
   } else if (!is.null(options$output_path)) {
@@ -81,14 +85,22 @@ wrapper_reformat_result <- function(options, core = wrapper_core_info()) {
     core = core,
     input = options$input_path,
     output = output,
-    files = list(
-      fastq = if (split) "" else output,
-      split_fastq = if (split) {
-        stats::setNames(file.path(output, "AACC.fq.gz"), "AACC")
+    files = {
+      split_paths <- if (split) {
+        suffix <- if (to_fasta) ".fa.gz" else ".fq.gz"
+        stats::setNames(file.path(output, paste0("AACC", suffix)), "AACC")
       } else {
         character()
       }
-    ),
+      list(
+        fastx = if (split) "" else output,
+        fastq = if (split || to_fasta) "" else output,
+        fasta = if (split || !to_fasta) "" else output,
+        split_fastx = split_paths,
+        split_fastq = if (split && !to_fasta) split_paths else character(),
+        split_fasta = if (split && to_fasta) split_paths else character()
+      )
+    },
     stats = list(records_processed = 2, records_written = 2),
     log = "mock reformat"
   )
@@ -616,6 +628,96 @@ test_that("rad_reformat delegates coordinate and aggregate output paths", {
   expect_identical(result$output, captured$output_path)
 })
 
+test_that("rad_reformat delegates FASTA conversion and demux results", {
+  work <- tempfile("rrad-fasta-wrapper-")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE), add = TRUE)
+  input <- file.path(work, "demux.fq.gz")
+  output <- file.path(work, "igblast.fa.gz")
+  writeLines("mock", input)
+  captured <- NULL
+  core <- wrapper_core_info()
+  demux_result <- structure(
+    list(artifacts = list(fastq = input)),
+    class = c("rad_demux_result", "list")
+  )
+
+  local_mocked_bindings(
+    rad_core_info = function() core,
+    .rad_reformat_cpp = function(options) {
+      captured <<- options
+      wrapper_reformat_result(options, core)
+    },
+    .package = "rrad"
+  )
+
+  result <- rad_reformat(
+    demux_result,
+    reformat_header = TRUE,
+    delimiter = "|",
+    output_fastq = output,
+    to_fasta = TRUE
+  )
+
+  expect_identical(captured$input_path, normalizePath(input))
+  expect_identical(captured$reformat_header, TRUE)
+  expect_identical(captured$delimiter, "|")
+  expect_identical(captured$to_fasta, TRUE)
+  expect_identical(result$config$to_fasta, TRUE)
+  expect_identical(result$artifacts$fasta, captured$output_path)
+  expect_identical(result$artifacts$fastq, "")
+})
+
+test_that("rad_reformat resolves explicit header formats compatibly", {
+  work <- tempfile("rrad-header-format-wrapper-")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE), add = TRUE)
+  input <- file.path(work, "demux.fastq")
+  writeLines(c("@read CB:Z:AACC UB:Z:TGCA", "ACGT", "+", "IIII"),
+             input)
+  captured <- NULL
+  core <- wrapper_core_info()
+
+  local_mocked_bindings(
+    rad_core_info = function() core,
+    .rad_reformat_cpp = function(options) {
+      captured <<- options
+      wrapper_reformat_result(options, core)
+    },
+    .package = "rrad"
+  )
+
+  presto <- rad_reformat(
+    input,
+    header_format = "PRESTO",
+    output_fastq = file.path(work, "presto.fastq")
+  )
+  expect_identical(captured$presto_header, TRUE)
+  expect_identical(captured$reformat_header, FALSE)
+  expect_identical(presto$config$header_format, "presto")
+  expect_identical(presto$config$reformat_header, FALSE)
+
+  collapsed <- rad_reformat(
+    input,
+    header_format = "collapsed",
+    output_fastq = file.path(work, "collapsed.fastq")
+  )
+  expect_identical(captured$presto_header, FALSE)
+  expect_identical(captured$reformat_header, TRUE)
+  expect_identical(collapsed$config$header_format, "collapsed")
+  expect_identical(collapsed$config$reformat_header, TRUE)
+
+  preserved <- rad_reformat(
+    input,
+    header_format = "preserve",
+    output_fastq = file.path(work, "preserved.fa"),
+    to_fasta = TRUE
+  )
+  expect_identical(captured$presto_header, FALSE)
+  expect_identical(captured$reformat_header, FALSE)
+  expect_identical(preserved$config$header_format, "preserve")
+})
+
 test_that("rad_reformat rejects invalid and contradictory configurations", {
   work <- tempfile("rrad-reformat-validation-")
   dir.create(work)
@@ -650,6 +752,50 @@ test_that("rad_reformat rejects invalid and contradictory configurations", {
                "chunk_size")
   expect_error(rad_reformat(input, split_bc = 1, out_dir = work),
                "split_bc must be TRUE or FALSE")
+  expect_error(rad_reformat(input, to_fasta = 1),
+               "to_fasta must be TRUE or FALSE")
+  expect_error(rad_reformat(input, to_fasta = TRUE),
+               "output_fastq is required")
+  expect_error(
+    rad_reformat(
+      input,
+      output_fastq = file.path(work, "wrong.fastq"),
+      to_fasta = TRUE
+    ),
+    "must end in .fa"
+  )
+  malformed_demux <- structure(
+    list(artifacts = list()),
+    class = c("rad_demux_result", "list")
+  )
+  expect_error(
+    rad_reformat(
+      malformed_demux,
+      output_fastq = file.path(work, "out.fa"),
+      to_fasta = TRUE
+    ),
+    "does not contain one aggregate FASTQ"
+  )
+  expect_error(
+    rad_reformat(input, header_format = "unknown"),
+    "header_format"
+  )
+  expect_error(
+    rad_reformat(
+      input,
+      reformat_header = TRUE,
+      header_format = "presto"
+    ),
+    "conflicts with header_format"
+  )
+  expect_error(
+    rad_reformat(
+      input,
+      header_format = "presto",
+      collapsed_input = TRUE
+    ),
+    "requires actual SAM tags"
+  )
 })
 
 test_that("rad_reformat enforces feature and result handshakes", {
@@ -668,6 +814,30 @@ test_that("rad_reformat enforces feature and result handshakes", {
   expect_error(
     rad_reformat(input, reformat_header = TRUE, output_fastq = output),
     "does not advertise the reformat feature"
+  )
+
+  local_mocked_bindings(
+    rad_core_info = function() wrapper_core_info(features = "reformat"),
+    .rad_reformat_cpp = function(options) stop("must not run"),
+    .package = "rrad"
+  )
+  expect_error(
+    rad_reformat(
+      input,
+      output_fastq = file.path(work, "out.fa"),
+      to_fasta = TRUE
+    ),
+    "does not advertise FASTA reformatting"
+  )
+
+  local_mocked_bindings(
+    rad_core_info = function() wrapper_core_info(features = "reformat"),
+    .rad_reformat_cpp = function(options) stop("must not run"),
+    .package = "rrad"
+  )
+  expect_error(
+    rad_reformat(input, header_format = "presto", output_fastq = output),
+    "does not advertise pRESTO header formatting"
   )
 
   core <- wrapper_core_info()

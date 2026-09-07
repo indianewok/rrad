@@ -12,6 +12,8 @@ struct reformat_options {
     std::string split_output_dir;
     bool split_by_barcode = false;
     bool reformat_header = false;
+    bool presto_header = false;
+    bool to_fasta = false;
     bool parse_collapsed_id = false;
     char delimiter = '_';
     std::optional<std::string> coordinate_mode;
@@ -29,6 +31,7 @@ struct reformat_stats {
     uint64_t records_written = 0;
     uint64_t records_skipped_missing_cb = 0;
     uint64_t records_reformatted = 0;
+    uint64_t records_converted_to_fasta = 0;
     uint64_t coordinate_mapped = 0;
     uint64_t coordinate_unmapped = 0;
     uint64_t empty_sequences_skipped = 0;
@@ -71,6 +74,11 @@ inline std::string lower_copy(std::string value) {
     return value;
 }
 
+inline bool has_fasta_suffix(const std::string& path) {
+    return ends_with(path, ".fa") || ends_with(path, ".fasta") ||
+           ends_with(path, ".fa.gz") || ends_with(path, ".fasta.gz");
+}
+
 inline std::optional<std::string> extract_tag_value(
     const std::string& source, const std::string& tag) {
     size_t start = 0;
@@ -101,6 +109,11 @@ inline std::optional<std::string> extract_ub(const std::string& comment) {
     return extract_tag_value(comment, tag);
 }
 
+inline std::optional<std::string> extract_bc(const std::string& comment) {
+    static const std::string tag = "BC:Z:";
+    return extract_tag_value(comment, tag);
+}
+
 inline std::string collapse_id(const std::string& qname,
                                const std::optional<std::string>& cb,
                                const std::optional<std::string>& ub,
@@ -113,6 +126,38 @@ inline std::string collapse_id(const std::string& qname,
     if (ub && !ub->empty()) {
         output.push_back(delimiter);
         output.append(*ub);
+    }
+    return output;
+}
+
+inline void validate_presto_component(const std::string& value,
+                                      const char* label) {
+    const bool unsafe = std::any_of(
+        value.begin(), value.end(), [](unsigned char character) {
+            return std::isspace(character) || character == '|' ||
+                   character == '=' || character == ',';
+        });
+    if (unsafe) {
+        throw std::invalid_argument(
+            std::string("pRESTO ") + label +
+            " contains whitespace or a reserved delimiter (|, =, or ,)");
+    }
+}
+
+inline std::string presto_id(const std::string& qname,
+                             const std::optional<std::string>& barcode,
+                             const std::optional<std::string>& ub) {
+    validate_presto_component(qname, "QNAME");
+    std::string output = qname;
+    if (barcode && !barcode->empty()) {
+        validate_presto_component(*barcode, "BARCODE value");
+        output += "|BARCODE=";
+        output += *barcode;
+    }
+    if (ub && !ub->empty()) {
+        validate_presto_component(*ub, "UB value");
+        output += "|UMI=";
+        output += *ub;
     }
     return output;
 }
@@ -541,9 +586,10 @@ private:
     gzFile file_ = nullptr;
 };
 
-inline std::string serialize_record(const read_streaming::sequence& record) {
+inline std::string serialize_record(const read_streaming::sequence& record,
+                                    bool to_fasta) {
     std::string output;
-    if (record.is_fastq) {
+    if (record.is_fastq && !to_fasta) {
         output.reserve(record.id.size() + record.comment.size() +
                        record.seq.size() + record.plus.size() +
                        record.qual.size() + 16);
@@ -829,13 +875,26 @@ inline reformat_result reformat_fastx(
         throw std::invalid_argument("reformat input_path is required");
     }
     if (!options.split_by_barcode && !options.reformat_header &&
-        !options.coordinate_mode.has_value()) {
+        !options.presto_header && !options.coordinate_mode.has_value() &&
+        !options.to_fasta) {
         throw std::invalid_argument(
-            "reformat requires split_by_barcode, reformat_header, or coordinate_mode");
+            "reformat requires split_by_barcode, header formatting, coordinate_mode, or to_fasta");
+    }
+    if (options.reformat_header && options.presto_header) {
+        throw std::invalid_argument(
+            "collapsed and pRESTO header formatting cannot be combined");
     }
     if (options.reformat_header && options.coordinate_mode.has_value()) {
         throw std::invalid_argument(
             "reformat_header cannot be combined with coordinate_mode");
+    }
+    if (options.presto_header && options.coordinate_mode.has_value()) {
+        throw std::invalid_argument(
+            "pRESTO header formatting cannot be combined with coordinate_mode");
+    }
+    if (options.presto_header && options.parse_collapsed_id) {
+        throw std::invalid_argument(
+            "pRESTO header formatting requires SAM tags and cannot parse collapsed IDs");
     }
     if (options.split_by_barcode && options.split_output_dir.empty()) {
         throw std::invalid_argument(
@@ -844,6 +903,16 @@ inline reformat_result reformat_fastx(
     if (options.split_by_barcode && !options.output_path.empty()) {
         throw std::invalid_argument(
             "output_path cannot be combined with split_by_barcode");
+    }
+    if (options.to_fasta && !options.split_by_barcode &&
+        options.output_path.empty()) {
+        throw std::invalid_argument(
+            "output_path is required for aggregate FASTA conversion");
+    }
+    if (options.to_fasta && !options.split_by_barcode &&
+        !detail::has_fasta_suffix(options.output_path)) {
+        throw std::invalid_argument(
+            "FASTA output_path must end in .fa, .fasta, .fa.gz, or .fasta.gz");
     }
     if (options.delimiter == '\0' ||
         std::isspace(static_cast<unsigned char>(options.delimiter))) {
@@ -868,8 +937,9 @@ inline reformat_result reformat_fastx(
                                     input_path.string());
     }
     input_path = fs::canonical(input_path);
-    const std::string split_file_suffix =
-        path_utils::get_fastqa_type(input_path.string()) + ".gz";
+    const std::string split_file_suffix = options.to_fasta
+        ? ".fa.gz"
+        : path_utils::get_fastqa_type(input_path.string()) + ".gz";
 
     std::optional<detail::vizhd_axis_reference> spatial_reference;
     if (options.coordinate_mode) {
@@ -1049,6 +1119,7 @@ inline reformat_result reformat_fastx(
         std::string unmapped_id;
         bool skip_missing_barcode = false;
         bool reformatted = false;
+        bool converted_to_fasta = false;
         bool coordinate_mapped = false;
         bool coordinate_unmapped = false;
     };
@@ -1098,8 +1169,20 @@ inline reformat_result reformat_fastx(
                     static_cast<std::size_t>(raw_index);
                 try {
                     auto record = std::move(chunk[index]);
-                    auto cb = detail::extract_cb(record.id, record.comment);
+                    auto cb = options.presto_header
+                                  ? detail::extract_tag_value(
+                                        record.comment, "CB:Z:")
+                                  : detail::extract_cb(
+                                        record.id, record.comment);
                     auto ub = detail::extract_ub(record.comment);
+                    std::optional<std::string> presto_barcode;
+                    if (options.presto_header) {
+                        presto_barcode = detail::extract_bc(record.comment);
+                    }
+                    if (options.presto_header &&
+                        (!presto_barcode || presto_barcode->empty())) {
+                        presto_barcode = cb;
+                    }
                     std::string qname = record.id;
                     // Explicit SAM-style tags are authoritative. Only infer
                     // CB/UB from a previously collapsed ID when neither tag is
@@ -1156,6 +1239,11 @@ inline reformat_result reformat_fastx(
                             prepared[index].coordinate_unmapped = true;
                             prepared[index].unmapped_id = record.id;
                         }
+                    } else if (options.presto_header) {
+                        record.id = detail::presto_id(
+                            qname, presto_barcode, ub);
+                        record.comment.clear();
+                        prepared[index].reformatted = true;
                     } else if (options.reformat_header) {
                         record.id = detail::collapse_id(
                             qname, cb, ub, options.delimiter);
@@ -1164,13 +1252,15 @@ inline reformat_result reformat_fastx(
                     }
 
                     prepared[index].barcode = std::move(cb);
+                    prepared[index].converted_to_fasta =
+                        options.to_fasta && record.is_fastq;
                     if (options.split_by_barcode &&
                         (!prepared[index].barcode ||
                          prepared[index].barcode->empty())) {
                         prepared[index].skip_missing_barcode = true;
                     } else {
                         prepared[index].serialized =
-                            detail::serialize_record(record);
+                            detail::serialize_record(record, options.to_fasta);
                     }
                 } catch (...) {
                     errors[index] = std::current_exception();
@@ -1205,6 +1295,9 @@ inline reformat_result reformat_fastx(
                 if (record.skip_missing_barcode) {
                     ++result.stats.records_skipped_missing_cb;
                     continue;
+                }
+                if (record.converted_to_fasta) {
+                    ++result.stats.records_converted_to_fasta;
                 }
 
                 if (options.split_by_barcode) {
