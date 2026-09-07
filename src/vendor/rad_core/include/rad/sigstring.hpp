@@ -1204,9 +1204,16 @@ namespace barcode_correction {
         }
     }
 
-    int64_seq exp_bc;
-    exp_bc.sequence_to_bits(expanded_seq);
-    auto true_result = exhaustive_check_against_wl(exp_bc, "true", 2, verbose, mode, &wl);
+    // int64_seq intentionally stores at most 32 bases.  The expanded search
+    // window may be wider (the barcode plus flanking padding), so retain the
+    // original packed barcode for the exhaustive scorer when that happens.
+    // Sliding k-mers above still examine every barcode-sized window.
+    int64_seq exhaustive_query = original_barcode;
+    if (expanded_seq.size() <= 32) {
+        exhaustive_query.sequence_to_bits(expanded_seq);
+    }
+    auto true_result = exhaustive_check_against_wl(
+        exhaustive_query, "true", 2, verbose, mode, &wl);
     if (true_result.has_value()) {
         if (verbose) {
             #pragma omp critical
@@ -1253,12 +1260,19 @@ namespace barcode_correction {
             expanded_seq = seq_utils::revcomp(expanded_seq);
         }
 
-        int64_seq bc, rc_bc, exp_bc, exp_rcbc;
+        int64_seq bc, rc_bc;
 
         bc.sequence_to_bits(raw);
         rc_bc.sequence_to_bits(seq_utils::revcomp(raw));
-        exp_bc.sequence_to_bits(expanded_seq);
-        exp_rcbc.sequence_to_bits(seq_utils::revcomp(expanded_seq));
+
+        // Keep the padded region only when it fits the one-word barcode
+        // representation.  For a 25-32 base barcode, padding can make this
+        // window wider than 32 bases; the fuzzy k-mer pass still scans that
+        // full string, while packed fallback comparisons use the barcode.
+        int64_seq correction_query = bc;
+        if (expanded_seq.size() <= 32) {
+            correction_query.sequence_to_bits(expanded_seq);
+        }
 
         int bc_len = static_cast<int>(bc.length);
         int hp_threshold = std::max(4, static_cast<int>(bc_len * 0.4)); // 40% of barcode length, minimum 4
@@ -1494,12 +1508,12 @@ namespace barcode_correction {
         
         auto muts = mutation_tools::generate_mutated_barcodes(bc, mut_dist);
         if(mode == "defensive"){
-            auto global_result = check_against_wl(exp_bc, muts, "global", max_dist, verbose, mode, &wl);
+            auto global_result = check_against_wl(correction_query, muts, "global", max_dist, verbose, mode, &wl);
             if(global_result.has_value()){
                 return(global_result);
             }
 
-            auto true_result = check_against_wl(exp_bc, muts, "true", 2, verbose, mode, &wl);
+            auto true_result = check_against_wl(correction_query, muts, "true", 2, verbose, mode, &wl);
             if(true_result.has_value()){
                 return(true_result);
             }
@@ -1508,7 +1522,7 @@ namespace barcode_correction {
         // IF OFFENSIVE: Check against true first, and then global
         
         if(mode == "offensive") {
-            auto true_result = check_against_wl(exp_bc, muts, "true", 2, verbose, mode, &wl);
+            auto true_result = check_against_wl(correction_query, muts, "true", 2, verbose, mode, &wl);
             if (true_result.has_value()) {
                 if (verbose) {
                     #pragma omp critical
@@ -1520,7 +1534,7 @@ namespace barcode_correction {
                 return true_result;
             }
 
-            auto global_result = check_against_wl(exp_bc, muts, "global", max_dist, verbose, mode, &wl);
+            auto global_result = check_against_wl(correction_query, muts, "global", max_dist, verbose, mode, &wl);
             if (global_result.has_value()) {
                 if (verbose) {
                     #pragma omp critical

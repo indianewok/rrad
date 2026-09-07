@@ -321,36 +321,53 @@ test_that("embedded seqspec rejects remote onlists without network access", {
   expect_equal(global$stats$loaded_global_barcodes, 2)
 })
 
-test_that("barcode packing is lossless at 32 bases and rejects longer input", {
+test_that("padded barcode correction works through 32 bases and rejects 33", {
   work <- tempfile("rad-core-32-base-barcode-")
   dir.create(work)
   on.exit(unlink(work, recursive = TRUE), add = TRUE)
-  barcode <- paste(rep("G", 32L), collapse = "")
+  longest_barcode <- "GACCTAGTTCAGGATCCGTAACGTTCGAGTGC"
   whitelist <- file.path(work, "barcodes.txt")
   layout <- file.path(work, "layout.csv")
   fastq <- file.path(work, "reads.fastq")
-  writeLines(barcode, whitelist)
-  writeLines(c(
-    "Read Layout,,,,,",
-    "id,seq,expected_length,type,class,whitelist",
-    "anchor,ACGTACGT,,static,linker,",
-    paste0("barcode,,32,variable,barcode,", whitelist),
-    "poly_t,TTTTTTTT,,static,poly_t,",
-    "read,,,variable,read,"
-  ), layout)
-  sequence <- paste0("ACGTACGT", barcode, "TTTTTTTTGATTACA")
-  writeLines(c("@read", sequence, "+", paste(rep("I", nchar(sequence)),
-                                                collapse = "")), fastq)
+  for (barcode_length in c(24L, 25L, 32L)) {
+    barcode <- substr(longest_barcode, 1L, barcode_length)
+    writeLines(barcode, whitelist)
+    writeLines(c(
+      "Read Layout,,,,,",
+      "id,seq,expected_length,type,class,whitelist",
+      paste0(
+        "anchor_1,AATGTACTTCGTTCAGTTACGTATTGCTAAGGTTAA,,",
+        "static,linker,"
+      ),
+      paste0("barcode,,", barcode_length,
+             ",variable,barcode,", whitelist),
+      "anchor_2,CAGCACCTGATTACAAGGTGCTG,,static,linker,",
+      "read,,,variable,read,"
+    ), layout)
+    sequence <- paste0(
+      "AATGTACTTCGTTCAGTTACGTATTGCTAAGGTTAA", barcode,
+      "CAGCACCTGATTACAAGGTGCTG", "GATTACAGATTACA"
+    )
+    writeLines(c(
+      "@read", sequence, "+",
+      paste(rep("I", nchar(sequence)), collapse = "")
+    ), fastq)
 
-  result <- rad_demux(
-    layout, fastq, file.path(work, "out"), output = "packed32",
-    threads = 1L, chunk_size = 1L, min_read_length = 0L,
-    whitelist_mutation = 0L, generated_mutation = 0L
-  )
-  expect_identical(result$status, "success")
-  expect_equal(result$stats$loaded_true_barcodes, 1)
+    result <- rad_demux(
+      layout, fastq, file.path(work, paste0("out-", barcode_length)),
+      output = paste0("packed", barcode_length), threads = 1L,
+      chunk_size = 1L, min_read_length = 0L,
+      whitelist_mutation = 0L, generated_mutation = 0L
+    )
+    expect_identical(result$status, "success")
+    expect_equal(result$stats$loaded_true_barcodes, 1)
+    expect_equal(result$stats$reads_demultiplexed, 1)
+    expect_equal(result$stats$records_serialized, 1)
+    output_header <- readLines(gzfile(result$artifacts$fastq), n = 1L)
+    expect_match(output_header, paste0("CB:Z:", barcode), fixed = TRUE)
+  }
 
-  writeLines(paste0(barcode, "G"), whitelist)
+  writeLines(paste0(longest_barcode, "G"), whitelist)
   layout_lines <- readLines(layout)
   layout_lines[4] <- paste0("barcode,,33,variable,barcode,", whitelist)
   writeLines(layout_lines, layout)

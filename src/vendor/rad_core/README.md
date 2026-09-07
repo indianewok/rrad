@@ -119,6 +119,10 @@ Embedding adaptations are deliberately limited to the vendored copy:
     order, and leaves split-file selection keyed by `CB:Z:`. It omits absent
     annotations and rejects whitespace plus pRESTO's reserved field,
     assignment, and list delimiters before transactional output publication.
+21. Barcode correction keeps its padded search region as a string whenever it
+    is wider than the 32-base packed representation. Sliding barcode-length
+    k-mers still search the complete region, while later packed fallback
+    scoring conservatively uses the original barcode instead of overflowing.
 
 The bridge resolves the installed `rrad` resource bundle through
 `system.file("rad/resources", package = "rrad")`. For an unchanged built-in

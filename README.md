@@ -19,7 +19,7 @@ putting a token in an R script, repository URL, or committed `.Renviron` file.
 install.packages(c("gitcreds", "remotes"))
 gitcreds::gitcreds_set() # one-time interactive credential setup
 
-remotes::install_github("indianewok/rrad@v1.2.0")
+remotes::install_github("indianewok/rrad@v1.2.1")
 ```
 
 The credential needs read access to this repository. GitHub may report missing
