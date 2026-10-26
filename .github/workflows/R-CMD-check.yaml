@@ -54,9 +54,10 @@ jobs:
       - uses: r-lib/actions/setup-tinytex@v2
         if: matrix.config.manual
 
-      - name: Install PDF manual fonts
+      - name: Install manual validation tools and fonts
         if: matrix.config.manual
         run: |
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tidy
           tlmgr update --self
           tlmgr install inconsolata helvetic times courier ec
 
