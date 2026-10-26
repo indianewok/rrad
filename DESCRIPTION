@@ -5,8 +5,7 @@ Encoding: UTF-8
 Depends:
     R (>= 4.0.0)
 Title: R Interface and Toolkit for Read-Agnostic Demultiplexing
-Version: 1.2.1
-Date: 2026-09-07
+Version: 1.2.2
 Authors@R: person(
     given = "Chinmay",
     family = "Vaidya",
@@ -21,6 +20,8 @@ Description: Provides an embedded build of the read-agnostic demultiplexer
     verified, and reused on later runs. No separate command-line installation
     is required.
 License: GPL (>= 3)
+Copyright: See the installed file THIRD_PARTY_NOTICES.md for copyright
+    holders and licenses of bundled components.
 URL: https://github.com/indianewok/rrad
 BugReports: https://github.com/indianewok/rrad/issues
 Imports:
@@ -32,7 +33,9 @@ LinkingTo:
     BH,
     Rcpp
 Suggests:
+    knitr,
+    rmarkdown,
     testthat (>= 3.0.0)
-SystemRequirements: C++17, zlib
+VignetteBuilder: knitr
+SystemRequirements: C++17, zlib, POSIX threads; optional OpenMP
 Config/testthat/edition: 3
-RoxygenNote: 7.2.2

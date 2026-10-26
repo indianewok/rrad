@@ -11,26 +11,86 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.config.os }} (R ${{ matrix.config.r }}, OpenMP ${{ matrix.config.openmp }})
+    runs-on: ${{ matrix.config.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {os: ubuntu-latest, r: release, openmp: 'yes', manual: true}
+          - {os: ubuntu-latest, r: devel, openmp: 'yes', http-user-agent: release}
+          - {os: ubuntu-latest, r: oldrel-1, openmp: 'yes'}
+          - {os: ubuntu-latest, r: release, openmp: 'no'}
+          - {os: macos-latest, r: release, openmp: 'no'}
+          - {os: macos-15-intel, r: release, openmp: 'no'}
     env:
-      R_KEEP_PKG_SOURCE: yes
-      _R_CHECK_FORCE_SUGGESTS_: false
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+      R_KEEP_PKG_SOURCE: 'yes'
+      _R_CHECK_FORCE_SUGGESTS_: 'true'
+      RRAD_OPENMP: ${{ matrix.config.openmp }}
+      # Keep checks reproducible and below the CRAN check farm's CPU limit.
+      OMP_THREAD_LIMIT: '2'
+      OMP_NUM_THREADS: '2'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
 
     steps:
       - uses: actions/checkout@v6
 
+      - name: Prefer responsive Ubuntu mirrors
+        if: runner.os == 'Linux'
+        run: |
+          # Keep Ubuntu's security mirror, suites, and signing keys; only
+          # reprioritize the official archive ahead of the Azure mirror.
+          # See actions/runner-images/images/ubuntu/scripts/build/configure-apt-sources.sh.
+          if test -f /etc/apt/apt-mirrors.txt; then
+            sudo sed -i \
+              -e 's|^http://azure\.archive\.ubuntu\.com/ubuntu/\(.*\)priority:1$|http://azure.archive.ubuntu.com/ubuntu/\1priority:2|' \
+              -e 's|^https://archive\.ubuntu\.com/ubuntu/\(.*\)priority:2$|https://archive.ubuntu.com/ubuntu/\1priority:1|' \
+              /etc/apt/apt-mirrors.txt
+          fi
+          # Match current runner-image failover limits rather than waiting
+          # minutes per stalled download: https://github.com/actions/runner-images/issues/14594
+          sudo tee /etc/apt/apt.conf.d/zz-rrad-network >/dev/null <<'EOF'
+          Acquire::Retries "1";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          EOF
+
+      - uses: r-lib/actions/setup-pandoc@v2
+
       - uses: r-lib/actions/setup-r@v2
         with:
-          r-version: release
+          r-version: ${{ matrix.config.r }}
+          http-user-agent: ${{ matrix.config.http-user-agent }}
           use-public-rspm: true
 
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
-          cache: false
-          dependencies: 'c("Depends", "Imports", "LinkingTo")'
-          extra-packages: any::rcmdcheck, any::testthat
+          extra-packages: any::rcmdcheck
+          needs: check
+
+      - uses: r-lib/actions/setup-tinytex@v2
+        if: matrix.config.manual
+
+      - name: Install manual validation tools and fonts
+        if: matrix.config.manual
+        run: |
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tidy
+          tlmgr update --self
+          tlmgr install inconsolata helvetic times courier ec
+
+      - name: Verify vendored source provenance
+        shell: Rscript {0}
+        run: |
+          testthat::test_file("tests/testthat/test-rad-provenance.R",
+                              stop_on_failure = TRUE)
 
       - uses: r-lib/actions/check-r-package@v2
         with:
-          build_args: 'c("--no-manual", "--no-build-vignettes")'
-          args: 'c("--no-manual")'
+          build_args: ${{ matrix.config.manual && 'character()' || 'c("--no-manual")' }}
+          args: ${{ matrix.config.manual && 'c("--as-cran")' || 'c("--as-cran", "--no-manual")' }}
+          error-on: '"warning"'
+          upload-snapshots: true
+          upload-results: true

@@ -17,13 +17,14 @@
   x
 }
 
-.rad_scalar_integer <- function(x, name, minimum = 0L, allow_null = FALSE) {
+.rad_scalar_integer <- function(x, name, minimum = 0L, allow_null = FALSE,
+                                maximum = .Machine$integer.max) {
   if (allow_null && is.null(x)) return(NULL)
   if (!is.numeric(x) || length(x) != 1L || is.na(x) || !is.finite(x) ||
-      x != trunc(x) || x < minimum || x > .Machine$integer.max) {
+      x != trunc(x) || x < minimum || x > maximum) {
     stop(
       name, " must be one whole number between ", minimum,
-      " and ", .Machine$integer.max,
+      " and ", maximum,
       call. = FALSE
     )
   }

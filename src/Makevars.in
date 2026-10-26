@@ -1,5 +1,5 @@
 CXX_STD = CXX17
-PKG_CPPFLAGS = -DRRAD_EMBEDDED=1 -Ivendor/rad_core/include \
+PKG_CPPFLAGS = -pthread -DRRAD_EMBEDDED=1 -Ivendor/rad_core/include \
 	-Ivendor/rad_core/include/kseq \
 	-Ivendor/rad_core/include/edlib \
 	-Ivendor/rad_core/include/edlib/include \
@@ -7,4 +7,4 @@ PKG_CPPFLAGS = -DRRAD_EMBEDDED=1 -Ivendor/rad_core/include \
 	-Ivendor/rad_core/include/csv-parser/single_include \
 	-Ivendor/rad_core/include/ssw
 PKG_CXXFLAGS = @OPENMP_CXXFLAGS@
-PKG_LIBS = -lz@FILESYSTEM_LIBS_SUFFIX@ @OPENMP_CXXFLAGS@
+PKG_LIBS = -pthread -lz@FILESYSTEM_LIBS_SUFFIX@ @OPENMP_CXXFLAGS@

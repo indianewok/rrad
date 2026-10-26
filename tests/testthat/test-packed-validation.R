@@ -19,9 +19,9 @@ test_that("rad_pack_reads validates vector types and record lengths", {
 
 test_that("Phred ranges and offsets are validated losslessly", {
   expect_error(rad_pack_reads("r", "A", "!", phred_offset = -1L),
-               "phred_offset must be between")
+               "phred_offset must be one whole number between")
   expect_error(rad_pack_reads("r", "A", "!", phred_offset = 127L),
-               "phred_offset must be between")
+               "phred_offset must be one whole number between")
   expect_error(rad_pack_reads("r", "A", " ", phred_offset = 33L),
                "outside Q0-Q93")
 
@@ -37,8 +37,60 @@ test_that("Phred ranges and offsets are validated losslessly", {
   expect_identical(rad_qual_values(highest)[[1L]], 93L)
   expect_error(as.character(highest$qual, phred_offset = 34L),
                "cannot be represented")
-  expect_error(rad_qfraction(highest, -1L), "threshold must be between")
-  expect_error(rad_qfraction(highest, 94L), "threshold must be between")
+  expect_error(rad_qfraction(highest, -1L), "threshold must be one whole number between")
+  expect_error(rad_qfraction(highest, 94L), "threshold must be one whole number between")
+})
+
+test_that("packed numeric arguments do not silently truncate or coerce", {
+  packed <- rad_pack_reads("r", "A", "5")
+  invalid <- list(33.5, "33", TRUE, NA_real_, Inf, numeric(), c(33, 64))
+  for (offset in invalid) {
+    expect_error(rad_pack_reads("r", "A", "5", phred_offset = offset),
+                 "phred_offset must be one whole number")
+    expect_error(as.character(packed$qual, phred_offset = offset),
+                 "phred_offset must be one whole number")
+  }
+  for (threshold in list(19.5, "20", TRUE, NA_real_, Inf, numeric(), c(0, 20))) {
+    expect_error(rad_qfraction(packed, threshold),
+                 "threshold must be one whole number")
+  }
+  expect_identical(rad_qfraction(packed, 20), 1)
+  expect_identical(rad_qfraction(packed, 21), 0)
+  expect_error(format(packed$seq, width = 4.5), "width must be one whole number")
+  expect_error(rad_validate(packed, deep = "yes"), "deep must be TRUE or FALSE")
+})
+
+test_that("stream preflight rejects invalid options without consuming records", {
+  path <- tempfile(fileext = ".fastq")
+  on.exit(unlink(path), add = TRUE)
+  write_text_bytes(path, fastq_text(c("first", "second"), c("A", "C"), c("!", "5")))
+  expect_error(rad_stream(path, phred_offset = 33.5),
+               "phred_offset must be one whole number")
+  expect_error(rad_stream(path, keep_comment = NA), "keep_comment must be TRUE or FALSE")
+  expect_error(rad_stream(path, keep_comment = "TRUE"),
+               "keep_comment must be TRUE or FALSE")
+  expect_error(rad_stream(dirname(path)), "path does not identify an existing file")
+
+  stream <- rad_stream(path)
+  on.exit(rad_stream_close(stream), add = TRUE)
+  for (n in list(1.5, "1", TRUE, Inf, numeric(), c(1, 2))) {
+    expect_error(rad_stream_next(stream, n), "n must be one whole number")
+    expect_error(rad_read_fastq(path, max_reads = n),
+                 "max_reads must be one whole number")
+  }
+  expect_identical(as.character(rad_stream_next(stream, 1)$seq_id), "first")
+})
+
+test_that("column selectors identify one named column", {
+  input <- data.frame(id = "r", seq = "A", qual = "!")
+  expect_error(as_rad_reads(input, id_col = 1), "id_col must be one non-empty")
+  expect_error(as_rad_reads(input, seq_col = c("seq", "qual")),
+               "seq_col must be one non-empty")
+  expect_error(as_rad_reads(input, qual_col = NA_character_),
+               "qual_col must be one non-empty")
+  expect_error(as_rad_reads(input, comment_col = character()),
+               "comment_col must be one non-empty")
+  expect_true(is.na(as.character(as_rad_reads(input, qual_col = NULL)$qual)))
 })
 
 test_that("public helpers reject incompatible objects and arguments", {
@@ -62,9 +114,9 @@ test_that("public helpers reject incompatible objects and arguments", {
   write_text_bytes(path, fastq_text("r", "A", "!"))
   stream <- rad_stream(path)
   on.exit(rad_stream_close(stream), add = TRUE)
-  expect_error(rad_stream_next(stream, 0L), "positive integer")
-  expect_error(rad_stream_next(stream, NA_integer_), "positive integer")
-  expect_error(rad_stream_next(stream, -1L), "positive integer")
+  expect_error(rad_stream_next(stream, 0L), "n must be one whole number between")
+  expect_error(rad_stream_next(stream, NA_integer_), "n must be one whole number between")
+  expect_error(rad_stream_next(stream, -1L), "n must be one whole number between")
 })
 
 test_that("missing and mismatched handles cannot be written as FASTQ", {

@@ -36,7 +36,7 @@ constexpr int kResourceSchema = 1;
 constexpr const char* kSourceCommit =
     "24d5ce47e172222c96cd7dd19e94758d32aa5009";
 constexpr const char* kEmbeddedSourceDigest =
-    "9a86a3cdfd751d418945101dcc534f03fb2037be3844c4b31ebfb53d3a6af5e5";
+    "80a6bf5631e5cd45fb122c087e5d6de7d79428513d26cc0799fd40e8b6eb62d5";
 constexpr const char* kResourceDigest =
     "b3081d5fd40d2d9309108fa79dd591d286e3ec1422582b0c520712659ffec4fb";
 
@@ -957,12 +957,12 @@ Rcpp::List core_info_impl() {
 
 }  // namespace
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::List rad_core_info_cpp() {
     return core_info_impl();
 }
 
-// [[Rcpp::export(name = ".rad_any_file_equivalent_cpp")]]
+// [[Rcpp::export(name = ".rad_any_file_equivalent_cpp", rng = false)]]
 bool rad_any_file_equivalent_cpp(Rcpp::CharacterVector candidates,
                                  Rcpp::CharacterVector protected_paths) {
     try {
@@ -1016,7 +1016,7 @@ bool rad_any_file_equivalent_cpp(Rcpp::CharacterVector candidates,
     return false;
 }
 
-// [[Rcpp::export(name = ".rad_scan_wl_cpp")]]
+// [[Rcpp::export(name = ".rad_scan_wl_cpp", rng = false)]]
 Rcpp::List rad_scan_wl_cpp(Rcpp::List options) {
     const std::string input = string_option(options, "input");
     const std::string output_prefix = string_option(options, "output_prefix");
@@ -1144,7 +1144,7 @@ Rcpp::List rad_scan_wl_cpp(Rcpp::List options) {
     return Rcpp::List::create();
 }
 
-// [[Rcpp::export(name = ".rad_reformat_cpp")]]
+// [[Rcpp::export(name = ".rad_reformat_cpp", rng = false)]]
 SEXP rad_reformat_cpp(Rcpp::List options) {
     const std::string input = string_option(options, "input_path");
     if (input.empty()) Rcpp::stop("`input_path` is required");
@@ -1271,7 +1271,7 @@ SEXP rad_reformat_cpp(Rcpp::List options) {
     return R_NilValue;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::List rad_demux_cpp(Rcpp::List options) {
     const std::string layout_requested = string_option(options, "layout");
     const std::string fastq_requested = string_option(options, "fastq");

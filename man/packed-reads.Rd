@@ -98,25 +98,37 @@ rad_qfraction(x, threshold = 20L)
 \arguments{
   \item{seq_id}{Character vector of primary read identifiers.}
   \item{seq}{Character vector of nucleotide sequences.}
-  \item{qual}{Optional character vector of FASTQ quality strings.}
+  \item{qual}{Optional character vector of FASTQ quality strings, with one
+  character per sequence base. \code{NULL} or \code{NA} represents missing
+  quality. Missing qualities cannot be written to FASTQ.}
   \item{seq_comment}{Optional character vector of header comments.}
-  \item{phred_offset}{Integer quality-character offset; normally 33. It is
-  never inferred automatically.}
+  \item{phred_offset}{One whole-number quality-character offset from 0 through
+  126; normally 33. It is never inferred automatically.}
   \item{x}{A conventional read table, a \code{rad_reads} table, or a packed
   handle column as appropriate.}
-  \item{id_col,seq_col,qual_col,comment_col}{Column names used when converting
-  a conventional table.}
+  \item{id_col,seq_col,qual_col,comment_col}{Each is one nonempty column name
+  used when converting a conventional table. Set \code{qual_col = NULL} for
+  reads without qualities; \code{comment_col = NULL} omits comments.
+  \code{as_rad_reads()} converts only the selected read columns; it does not
+  preserve additional annotation columns.}
   \item{path,file}{Input or output path. Gzip FASTQ is selected by a
   \file{.gz} suffix.}
-  \item{keep_comment}{Whether to retain FASTQ comments separately.}
+  \item{keep_comment}{\code{TRUE} or \code{FALSE}; whether to retain FASTQ
+  comments separately.}
   \item{stream}{A \code{rad_stream} iterator.}
-  \item{n,max_reads}{Maximum number of records to read.}
-  \item{append}{Append to an existing FASTQ output.}
+  \item{n,max_reads}{One positive whole-number record limit, at most
+  \code{.Machine$integer.max}.}
+  \item{append}{\code{TRUE} or \code{FALSE}; append to an existing FASTQ
+  output. Before appending, read the existing stream to check gzip integrity
+  and its final byte. A missing final newline is inserted; incomplete or
+  corrupt gzip streams are rejected. Existing compression must match the
+  filename suffix. These checks also apply when \code{x} has no rows.}
   \item{use.names,fill}{Arguments used when combining tables.}
   \item{compress}{Compression accepted by \code{saveRDS}.}
-  \item{deep}{Also decode data and validate record lengths and cached quality
-  summaries.}
-  \item{threshold}{Phred threshold for the returned fraction.}
+  \item{deep}{\code{TRUE} or \code{FALSE}; also decode data and validate
+  record lengths and cached quality summaries.}
+  \item{threshold}{One whole-number Phred threshold from 0 through 93 for
+  the returned fraction.}
   \item{...}{Additional packed tables or method arguments.}
 }
 \details{
@@ -170,17 +182,61 @@ and reject additional columns containing nested native references.
 Non-appending and appending FASTQ writes, as well as \code{rad_save()}, are
 assembled in a private sibling staging directory and installed at the requested
 path only after the complete write succeeds. Append therefore copies the
-existing destination before extending it; this favors failure safety over
+existing destination and reads its complete decompressed stream before
+extending it. This uses bounded memory, inserts a missing final newline, and
+rejects incomplete or corrupt gzip streams and compression that does not match
+the filename suffix, including when appending zero rows. It does not validate
+every existing FASTQ record. The scan and copy favor failure safety over
 in-place append speed.
 
 The functions whose names begin with \code{packed_} are registered native
 bridges used by the public R interface and are not intended for direct use.
 }
 \value{
-\code{rad_pack_reads()}, \code{rad_read_fastq()}, and
-\code{rad_stream_next()} return a \code{rad_reads} object inheriting from
-\code{data.table}. Quality functions return numeric summaries or a list of
-integer vectors. Stream state functions return logical values. Other functions
-return the object or path described above.
+\code{rad_pack_reads()}, \code{as_rad_reads()}, \code{rad_read_fastq()},
+\code{rad_compact()}, \code{rad_rbind_reads()}, and \code{rad_load()} return a
+\code{rad_reads} object inheriting from \code{data.table}.
+\code{rad_stream_next()} returns a \code{rad_reads} chunk, or \code{NULL} at
+end of input. \code{rad_stream()} returns a \code{rad_stream} iterator;
+\code{rad_stream_done()} returns one logical value, and
+\code{rad_stream_close()} returns the iterator invisibly.
+
+\code{rad_materialize()} returns an ordinary \code{data.table} with character
+read columns and preserved annotations. \code{rad_storage_stats()} returns a
+named list of storage sizes, record counts, and encoding metadata for the whole
+backing store, including any records omitted by a subset.
+\code{rad_write_fastq()} and \code{rad_save()} return the normalized output
+path invisibly. \code{rad_validate()} returns \code{TRUE} invisibly or raises
+an error when an invariant is violated.
+
+\code{rad_qual_values()} returns a list of integer score vectors, with
+\code{NULL} for missing qualities. \code{rad_qmean()}, \code{rad_qmin()}, and
+\code{rad_qfraction()} return one numeric summary per read; missing or empty
+qualities yield \code{NA}.
 }
 \seealso{\code{data.table::data.table}}
+\examples{
+reads <- rad_pack_reads(
+  seq_id = c("read-1", "read-2"),
+  seq = c("ACGTN", "TGCAT"),
+  qual = c("IIIII", "!!!!!")
+)
+rad_qmean(reads)
+selected <- reads[reads$mean_q >= 20, ]
+rad_materialize(selected)
+rad_validate(selected, deep = TRUE)
+
+local({
+  fastq <- tempfile(fileext = ".fastq.gz")
+  saved <- tempfile(fileext = ".rds")
+  on.exit(unlink(c(fastq, saved)))
+  rad_write_fastq(reads, fastq)
+  stream <- rad_stream(fastq)
+  on.exit(rad_stream_close(stream), add = TRUE)
+  chunk <- rad_stream_next(stream, n = 1L)
+  as.character(chunk$seq)
+  rad_save(chunk, saved)
+  restored <- rad_load(saved)
+  stopifnot(identical(as.character(chunk$seq), as.character(restored$seq)))
+})
+}

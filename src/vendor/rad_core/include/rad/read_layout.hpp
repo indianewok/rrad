@@ -43,7 +43,9 @@ struct ParsedPosition {
         if(verbose){
             RAD_COUT << "[from_string] Parsing position string: '" << pos_str << "'\n";
         }
-        assert(pipe_stream.good());
+        if (!pipe_stream.good()) {
+            throw std::runtime_error("could not parse layout position string");
+        }
         while(std::getline(pipe_stream, temp, '|')) {
             if(verbose){
                 RAD_COUT << "[from_string] Flags: eof =" << pipe_stream.eof()  << " fail =" << pipe_stream.fail()  << " bad =" << pipe_stream.bad() << "\n";
@@ -186,12 +188,12 @@ struct ReadElement {
         type(std::move(type)),
         order(order),
         direction(std::move(direction)),
+        unidirectional(unidirectional),
         global_class(std::move(global_class)),
         whitelist_path(std::move(whitelist_path)),
-        unidirectional(unidirectional),
+        misalignment_threshold(misalignment_threshold),
         aligned_positions(aligned_positions),
         misaligned_positions(misaligned_positions),
-        misalignment_threshold(misalignment_threshold),
         ref_pos(ref_pos) {}
 };
 
@@ -747,20 +749,6 @@ public:
         auto mean_or_zero = [](const std::vector<double>& vals) {
             if (vals.empty()) return 0.0;
             return std::accumulate(vals.begin(), vals.end(), 0.0) / static_cast<double>(vals.size());
-        };
-
-        auto direction_label = [](size_t fwd_hits, size_t rev_hits) {
-            double total = static_cast<double>(fwd_hits + rev_hits);
-            if (total == 0.0) return std::string("forward");
-
-            double fwd_ratio = fwd_hits / total;
-            double rev_ratio = rev_hits / total;
-            constexpr double kMinorOrientationThreshold = 0.05;  // 5%
-
-            if (fwd_hits > 0 && rev_ratio <= kMinorOrientationThreshold) return std::string("forward_only");
-            if (rev_hits > 0 && fwd_ratio <= kMinorOrientationThreshold) return std::string("reverse_only");
-
-            return (rev_hits > fwd_hits) ? std::string("reverse") : std::string("forward");
         };
 
         std::vector<ordered_element> ordered_parts;
@@ -2010,10 +1998,6 @@ void display_read_layout(bool max_verbose = false) {
         oss << std::fixed << std::setprecision(2) << v;
         return oss.str();
     };
-    auto pos_to_string_clean = [](const ParsedPosition& pos) {
-        ParsedPosition clean{pos.ref_id, pos.is_start, pos.offset, ""};
-        return clean.to_string();
-    };
     auto fmt_ref = [&](const ParsedPosition& pos) {
         if (pos.ref_id.empty()) {
             return std::string("[unset]");
@@ -2666,7 +2650,8 @@ public:
             mean = mean + (new_edit_distance - mean) / count;
             sum_squares += (new_edit_distance - old_mean) * (new_edit_distance - mean);
             double sample_ratio = static_cast<double>(count) / total_reads_seen;
-            is_stable = ((std::abs(mean - old_mean) < 0.5) && (sample_ratio > 0.01)|| count >= 10000);
+            is_stable = ((std::abs(mean - old_mean) < 0.5) &&
+                         (sample_ratio > 0.01)) || count >= 10000;
             dir_counts = {forward_count, reverse_count};
         }
 
@@ -3171,9 +3156,7 @@ private:
     for (size_t pos = 0; pos < it->position_counts.size() && pos < adapter_seq.length(); pos++) {
         int total_count = 0;
         double max_percentage = 0.0;
-        char max_base = 'N';
         char original_base = adapter_seq[pos];
-        const char bases[] = {'A', 'C', 'G', 'T'};
     
         for (const auto& [base, count] : it->position_counts[pos]) {
             total_count += count;
@@ -3192,7 +3175,6 @@ private:
             consensus_matrix[pos][idx] = percentage;
             if (percentage > max_percentage) {
                 max_percentage = percentage;
-                max_base = base;
             }
         }
         // Decide the masked character for this position.

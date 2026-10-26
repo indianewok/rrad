@@ -1287,6 +1287,8 @@ public:
                    // Quick access to key data
                    volatile auto len = k.length;
                    volatile auto bits_empty = k.bits.empty();
+                   (void)len;
+                   (void)bits_empty;
                } catch (...) {
                    corrupted++;
                }
@@ -2170,7 +2172,6 @@ class whitelist {
                 }
                 
                 // TIMING: Generate mutations and shifts
-                auto start_generation = high_resolution_clock::now();
                 
                 size_t total_mutations_generated = 0;
                 size_t mutations_added = 0;
@@ -2200,7 +2201,6 @@ class whitelist {
                     total_mutations_generated += mutated.size();
                     
                     // === MUTATION LOOKUP & INSERT ===
-                    auto mutation_lookup_start = high_resolution_clock::now();
                     for (auto const &m_bits : mutated) {
                         auto lookup_start = high_resolution_clock::now();
                         bool in_wl = global_bcs.check_wl_for(m_bits) || true_bcs.check_wl_for(m_bits);
@@ -2217,7 +2217,6 @@ class whitelist {
                         }
                     }
                     
-                    auto mutation_lookup_end = high_resolution_clock::now();
                     // Detailed timing for first 10 barcodes
                     if (verbose && i < 10) {
                         auto barcode_end = high_resolution_clock::now();
@@ -2243,8 +2242,6 @@ class whitelist {
                 auto end_loop = high_resolution_clock::now();
                 double loop_ms = duration<double, std::milli>(end_loop - start_loop).count();
                 
-                auto end_generation = high_resolution_clock::now();
-                double generation_ms = duration<double, std::milli>(end_generation - start_generation).count();
                 
                 // Final memory usage
                 size_t final_true_bcs_size = true_bcs.associations.size();

@@ -524,6 +524,7 @@ rad_pack_reads <- function(seq_id, seq, qual = NULL, seq_comment = NULL,
   if (!is.null(seq_comment) && !is.character(seq_comment)) {
     stop("seq_comment must be NULL or a character vector", call. = FALSE)
   }
+  phred_offset <- .rad_scalar_integer(phred_offset, "phred_offset", maximum = 126L)
   seq_id <- enc2utf8(seq_id)
   if (!is.null(seq_comment)) seq_comment <- enc2utf8(seq_comment)
   out <- packed_reads_build_cpp(
@@ -531,7 +532,7 @@ rad_pack_reads <- function(seq_id, seq, qual = NULL, seq_comment = NULL,
     sequences = seq,
     qualities_sexp = qual,
     comments_sexp = seq_comment,
-    phred_offset = as.integer(phred_offset)
+    phred_offset = phred_offset
   )
   .as_rad_reads(out)
 }
@@ -548,8 +549,11 @@ as_rad_reads <- function(x, id_col = if ("seq_id" %in% names(x)) "seq_id" else "
                          seq_col = "seq", qual_col = "qual", comment_col = NULL,
                          phred_offset = 33L) {
   if (!is.data.frame(x)) stop("x must be a data.frame or data.table", call. = FALSE)
+  id_col <- .rad_scalar_character(id_col, "id_col")
+  seq_col <- .rad_scalar_character(seq_col, "seq_col")
+  qual_col <- .rad_scalar_character(qual_col, "qual_col", allow_null = TRUE)
+  comment_col <- .rad_scalar_character(comment_col, "comment_col", allow_null = TRUE)
   needed <- c(id_col, seq_col, qual_col, comment_col)
-  needed <- needed[!is.null(needed)]
   missing_columns <- setdiff(needed, names(x))
   if (length(missing_columns)) {
     stop("missing columns: ", paste(missing_columns, collapse = ", "), call. = FALSE)
@@ -574,17 +578,16 @@ as_rad_reads <- function(x, id_col = if ("seq_id" %in% names(x)) "seq_id" else "
 #'   separate `seq_comment` column.
 #' @return A `rad_stream` iterator.
 rad_stream <- function(path, phred_offset = 33L, keep_comment = TRUE) {
-  if (length(path) != 1L || is.na(path) || !nzchar(path)) {
-    stop("path must be one non-empty filename", call. = FALSE)
-  }
-  path <- normalizePath(path, mustWork = TRUE)
+  path <- .rad_existing_file(path, "path")
+  phred_offset <- .rad_scalar_integer(phred_offset, "phred_offset", maximum = 126L)
+  keep_comment <- .rad_scalar_logical(keep_comment, "keep_comment")
   pointer <- packed_fastq_stream_open_cpp(
     path = path,
-    phred_offset = as.integer(phred_offset),
-    keep_comment = isTRUE(keep_comment)
+    phred_offset = phred_offset,
+    keep_comment = keep_comment
   )
   structure(
-    list(pointer = pointer, path = path, phred_offset = as.integer(phred_offset)),
+    list(pointer = pointer, path = path, phred_offset = phred_offset),
     class = "rad_stream"
   )
 }
@@ -596,10 +599,8 @@ rad_stream <- function(path, phred_offset = 33L, keep_comment = TRUE) {
 #' @return A `rad_reads` data.table, or `NULL` at end of file.
 rad_stream_next <- function(stream, n = 50000L) {
   if (!inherits(stream, "rad_stream")) stop("stream must be a rad_stream", call. = FALSE)
-  if (length(n) != 1L || is.na(n) || n <= 0 || n > .Machine$integer.max) {
-    stop("n must be one positive integer", call. = FALSE)
-  }
-  out <- packed_fastq_stream_next_cpp(stream$pointer, as.integer(n))
+  n <- .rad_scalar_integer(n, "n", minimum = 1L)
+  out <- packed_fastq_stream_next_cpp(stream$pointer, n)
   if (is.null(out)) return(NULL)
   .as_rad_reads(out)
 }
@@ -628,6 +629,7 @@ rad_stream_close <- function(stream) {
 #'   empty file.
 rad_read_fastq <- function(path, max_reads = .Machine$integer.max,
                            phred_offset = 33L, keep_comment = TRUE) {
+  max_reads <- .rad_scalar_integer(max_reads, "max_reads", minimum = 1L)
   stream <- rad_stream(path, phred_offset = phred_offset, keep_comment = keep_comment)
   on.exit(rad_stream_close(stream), add = TRUE)
   out <- rad_stream_next(stream, n = max_reads)
@@ -674,6 +676,13 @@ rad_materialize <- function(x, phred_offset = 33L) {
 }
 
 #' Write packed reads directly to FASTQ
+#'
+#' @param append `TRUE` or `FALSE`; append to an existing FASTQ output.
+#'   The existing stream is read before appending to check gzip integrity and
+#'   its final byte. A missing final newline is inserted; incomplete or corrupt
+#'   gzip streams are rejected. Existing compression must match the filename
+#'   suffix. These checks also apply when `x` has no rows; they do not validate
+#'   every existing FASTQ record.
 rad_write_fastq <- function(x, path, phred_offset = 33L, append = FALSE) {
   if (!inherits(x, "rad_reads")) stop("x must be a rad_reads table", call. = FALSE)
   if (!all(c("seq_id", "seq", "qual") %in% names(x))) {
@@ -683,12 +692,7 @@ rad_write_fastq <- function(x, path, phred_offset = 33L, append = FALSE) {
       !nzchar(path)) {
     stop("path must be one non-empty filename", call. = FALSE)
   }
-  if (!is.numeric(phred_offset) || length(phred_offset) != 1L ||
-      is.na(phred_offset) || !is.finite(phred_offset) ||
-      phred_offset != trunc(phred_offset) || phred_offset < 0L ||
-      phred_offset > 126L) {
-    stop("phred_offset must be one integer between 0 and 126", call. = FALSE)
-  }
+  phred_offset <- .rad_scalar_integer(phred_offset, "phred_offset", maximum = 126L)
   if (!is.logical(append) || length(append) != 1L || is.na(append)) {
     stop("append must be TRUE or FALSE", call. = FALSE)
   }
@@ -861,6 +865,7 @@ rad_load <- function(file) {
 
 #' Validate packed handles and sequence/quality invariants
 rad_validate <- function(x, deep = FALSE) {
+  deep <- .rad_scalar_logical(deep, "deep")
   if (!inherits(x, "rad_reads") || !data.table::is.data.table(x)) {
     stop("x must be a rad_reads data.table", call. = FALSE)
   }
@@ -931,7 +936,8 @@ rad_qmin <- function(x) {
 rad_qfraction <- function(x, threshold = 20L) {
   if (inherits(x, "rad_reads")) x <- x$qual
   if (!inherits(x, "rad_phred")) stop("x must be rad_phred", call. = FALSE)
-  packed_quality_fraction_cpp(x, as.integer(threshold))
+  threshold <- .rad_scalar_integer(threshold, "threshold", maximum = 93L)
+  packed_quality_fraction_cpp(x, threshold)
 }
 
 .rad_handle_is_na <- function(x) packed_handle_is_na_cpp(x)
@@ -964,7 +970,8 @@ rep.rad_phred <- .rad_handle_rep
 as.character.rad_id <- function(x, ...) packed_id_decode_cpp(x)
 as.character.rad_seq <- function(x, ...) packed_sequence_decode_cpp(x)
 as.character.rad_phred <- function(x, ..., phred_offset = 33L) {
-  packed_quality_decode_cpp(x, as.integer(phred_offset))
+  phred_offset <- .rad_scalar_integer(phred_offset, "phred_offset", maximum = 126L)
+  packed_quality_decode_cpp(x, phred_offset)
 }
 
 as.integer.rad_phred <- function(x, ...) {
@@ -1016,7 +1023,8 @@ sort.rad_id <- function(x, decreasing = FALSE, ...) {
 
 format.rad_id <- function(x, ...) as.character(x)
 format.rad_seq <- function(x, ..., width = 24L) {
-  packed_sequence_format_cpp(x, as.integer(width))
+  width <- .rad_scalar_integer(width, "width", minimum = 1L)
+  packed_sequence_format_cpp(x, width)
 }
 format.rad_phred <- function(x, ...) packed_quality_format_cpp(x)
 

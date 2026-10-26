@@ -98,7 +98,7 @@
   "remote_asset_origin": "https://github.com/indianewok/rad/tree/24d5ce47e172222c96cd7dd19e94758d32aa5009/resources/wl",
   "remote_fetch_policy": "runtime on demand; exact byte count and SHA-256 required before use",
   "upstream_include_tree_sha256": "a43f5384c8c8d48a92fa98c1868c36bbce2f1ba082ce7c589a17bff581f70267",
-  "embedded_source_digest": "9a86a3cdfd751d418945101dcc534f03fb2037be3844c4b31ebfb53d3a6af5e5",
+  "embedded_source_digest": "80a6bf5631e5cd45fb122c087e5d6de7d79428513d26cc0799fd40e8b6eb62d5",
   "embedded_source_digest_algorithm": "sha256 of sorted lines: lowercase file sha256, two spaces, POSIX path relative to include/, LF",
   "resource_tree_sha256": "b3081d5fd40d2d9309108fa79dd591d286e3ec1422582b0c520712659ffec4fb",
   "resource_tree_sha256_algorithm": "sha256 of sorted lines: lowercase file sha256, two spaces, POSIX path relative to inst/rad/resources/, LF",
@@ -139,7 +139,8 @@
     "quote pigz inputs, propagate subprocess failures, and reject truncated, corrupt, or concatenated gzip input",
     "copy each verified on-demand whitelist into a private permission-restricted per-call overlay before native use",
     "route embedded RAD and SSW diagnostics through a package-owned thread-safe capture stream instead of process stdout or stderr",
-    "modernize vendored literal and allocator syntax and replace warning-suppressed undefined SIMD values with explicit zero initialization"
+    "modernize vendored literal and allocator syntax and replace warning-suppressed undefined SIMD values with explicit zero initialization",
+    "replace the remaining layout-parser assertion with a recoverable exception, order member initialization consistently, and remove unused native diagnostics without suppressing compiler warnings"
   ],
   "excluded": [
     "resources/wl/visium_hd_coordinates.csv.gz (ignored and not tracked upstream)",

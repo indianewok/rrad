@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
@@ -27,6 +28,14 @@ constexpr std::uint8_t kSequenceBits = 2;
 constexpr std::uint8_t kQualityBits = 7;
 constexpr std::uint64_t kFrontCodingRestart = 64;
 constexpr std::int64_t kInteger64NA = std::numeric_limits<std::int64_t>::min();
+
+// Packed operations run on R's main thread. Checking at record boundaries
+// keeps large imports, materialization, and output responsive without putting
+// R API calls in per-base hot loops. Rcpp's interrupt exception also unwinds
+// native owners and the stream/writer cleanup handlers.
+void check_record_interrupt(std::uint64_t index) {
+  if ((index & 4095U) == 0U) Rcpp::checkUserInterrupt();
+}
 
 SEXP packed_store_tag() {
   return Rf_install("rad::PackedReadStore");
@@ -188,6 +197,7 @@ class PackedStringStore {
     build_handles();
     bool uuid_compatible = !values_.empty();
     for (std::size_t i = 0; i < values_.size(); ++i) {
+      check_record_interrupt(i);
       if (!present_[i] || !is_canonical_lower_uuid(values_[i])) {
         uuid_compatible = false;
         break;
@@ -263,6 +273,7 @@ class PackedStringStore {
     handles_.resize(values_.size(), 0U);
     std::unordered_map<std::uint64_t, std::size_t> unique_handles;
     for (std::size_t i = 0; i < values_.size(); ++i) {
+      check_record_interrupt(i);
       if (!present_[i]) continue;
       const std::uint64_t handle_value = stable_string_handle(values_[i]);
       const auto found = unique_handles.find(handle_value);
@@ -299,7 +310,9 @@ class PackedStringStore {
 
   void encode_uuids() {
     payload_.reserve(values_.size() * 16U);
+    std::uint64_t index = 0;
     for (const std::string& value : values_) {
+      check_record_interrupt(index++);
       std::uint8_t high = 0;
       bool have_high = false;
       for (char character : value) {
@@ -318,6 +331,7 @@ class PackedStringStore {
   void encode_front() {
     std::string previous;
     for (std::size_t i = 0; i < values_.size(); ++i) {
+      check_record_interrupt(i);
       if (i % kFrontCodingRestart == 0) {
         restart_offsets_.push_back(payload_.size());
         previous.clear();
@@ -702,6 +716,7 @@ Rcpp::NumericVector make_handles(const Rcpp::XPtr<PackedReadStore>& store,
   const std::size_t count = store->size();
   Rcpp::NumericVector result(count);
   for (std::size_t i = 0; i < count; ++i) {
+    check_record_interrupt(i);
     bool present = true;
     if (kind == "rad_id") {
       present = field == "comment" ? store->has_comment(i) : store->has_id(i);
@@ -722,6 +737,7 @@ Rcpp::NumericVector make_handles(const Rcpp::XPtr<PackedReadStore>& store,
 Rcpp::NumericVector make_read_keys(std::size_t count) {
   Rcpp::NumericVector result(count);
   for (std::size_t i = 0; i < count; ++i) {
+    check_record_interrupt(i);
     set_integer64_value(result, i, static_cast<std::int64_t>(i + 1U));
   }
   result.attr("class") = "integer64";
@@ -749,6 +765,7 @@ std::vector<std::size_t> indices_from_handles(SEXP handles,
   Rcpp::NumericVector vector(handles);
   std::vector<std::size_t> result(vector.size(), std::numeric_limits<std::size_t>::max());
   for (R_xlen_t i = 0; i < vector.size(); ++i) {
+    check_record_interrupt(i);
     const std::int64_t value = get_integer64_value(vector, i);
     if (value == kInteger64NA) {
       if (!allow_missing) Rcpp::stop("missing packed handle is not permitted here");
@@ -783,6 +800,7 @@ Rcpp::DataFrame table_from_store(std::unique_ptr<PackedReadStore> store_owner,
   const std::size_t count = store->size();
   Rcpp::NumericVector lengths(count);
   for (std::size_t i = 0; i < count; ++i) {
+    check_record_interrupt(i);
     lengths[i] = static_cast<double>(store->sequence_length(i));
   }
   Rcpp::NumericVector means = Rcpp::wrap(store->means());
@@ -854,6 +872,7 @@ class FastqStream {
       std::unique_ptr<PackedReadStore> store(new PackedReadStore(phred_offset_));
       std::size_t loaded = 0;
       while (loaded < count) {
+        check_record_interrupt(loaded);
         const std::int64_t status = kseq_read(record_);
         if (status == -1) {
           int zlib_code = Z_OK;
@@ -962,6 +981,7 @@ void validate_handle_alignment(SEXP id_handles,
   const std::vector<std::size_t> quality_indices =
     indices_from_handles(quality_handles, *quality_store, true);
   for (R_xlen_t i = 0; i < sequences.size(); ++i) {
+    check_record_interrupt(i);
     const std::size_t record = sequence_indices[i];
     const std::int64_t id_value = get_integer64_value(ids, i);
     if (id_value != sequence_store->id_handle(record, false)) {
@@ -998,6 +1018,52 @@ bool contains_line_break(const std::string& value) {
     value.find('\r') != std::string::npos;
 }
 
+bool append_requires_newline(const std::string& path, bool gzip) {
+  // gzread also handles uncompressed files. Inspect the complete stream so a
+  // missing gzip trailer is rejected before opening the output for append.
+  // FASTQ permits a final quality line without a terminating newline; the
+  // next record must begin on a separate line in the decompressed stream.
+  errno = 0;
+  gzFile input = gzopen(path.c_str(), "rb");
+  if (input == nullptr) {
+    if (errno == ENOENT) return false;
+    throw std::runtime_error("could not inspect existing FASTQ output: " + path);
+  }
+  bool have_bytes = false;
+  char last = '\n';
+  try {
+    std::array<char, 65536> buffer;
+    int amount;
+    while ((amount = gzread(input, buffer.data(), buffer.size())) > 0) {
+      Rcpp::checkUserInterrupt();
+      have_bytes = true;
+      last = buffer[static_cast<std::size_t>(amount - 1)];
+    }
+    int code = Z_OK;
+    const char* detail = gzerror(input, &code);
+    if (amount < 0 || (code != Z_OK && code != Z_STREAM_END)) {
+      throw std::runtime_error(
+        "could not read complete existing FASTQ output: " + path +
+        (detail == nullptr ? std::string() : " (" + std::string(detail) + ")"));
+    }
+    // An empty ordinary file can acquire either encoding. A nonempty file,
+    // including a valid empty gzip member, must retain its existing encoding:
+    // mixing plain text with gzip members can silently hide appended reads.
+    if (gzoffset(input) > 0 && (gzdirect(input) == 0) != gzip) {
+      throw std::runtime_error(
+        "existing FASTQ compression does not match the output filename suffix; "
+        "use .gz for gzip and another suffix for plain text");
+    }
+  } catch (...) {
+    gzclose(input);
+    throw;
+  }
+  if (gzclose(input) != Z_OK) {
+    throw std::runtime_error("could not close existing FASTQ input: " + path);
+  }
+  return have_bytes && last != '\n';
+}
+
 void gz_write_all(gzFile file, const std::string& data) {
   std::size_t offset = 0;
   while (offset < data.size()) {
@@ -1012,7 +1078,7 @@ void gz_write_all(gzFile file, const std::string& data) {
 
 }  // namespace
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 SEXP packed_reads_build_cpp(Rcpp::CharacterVector ids,
                             Rcpp::CharacterVector sequences,
                             SEXP qualities_sexp = R_NilValue,
@@ -1036,6 +1102,7 @@ SEXP packed_reads_build_cpp(Rcpp::CharacterVector ids,
 
   std::unique_ptr<PackedReadStore> store(new PackedReadStore(phred_offset));
   for (R_xlen_t i = 0; i < count; ++i) {
+    check_record_interrupt(i);
     if (sequences[i] == NA_STRING) Rcpp::stop("sequences cannot contain NA");
     const bool id_present = ids[i] != NA_STRING;
     const std::string id = id_present
@@ -1061,7 +1128,7 @@ SEXP packed_reads_build_cpp(Rcpp::CharacterVector ids,
   return table_from_store(std::move(store), have_comments);
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::CharacterVector packed_id_decode_cpp(SEXP handles) {
   Rcpp::NumericVector vector(handles);
   Rcpp::XPtr<PackedReadStore> store = store_from_handles(handles);
@@ -1069,6 +1136,7 @@ Rcpp::CharacterVector packed_id_decode_cpp(SEXP handles) {
     Rcpp::as<std::string>(vector.attr(".rad_field")) == "comment";
   Rcpp::CharacterVector result(vector.size());
   for (R_xlen_t i = 0; i < vector.size(); ++i) {
+    check_record_interrupt(i);
     const std::int64_t handle_value = get_integer64_value(vector, i);
     if (handle_value == kInteger64NA) {
       result[i] = NA_STRING;
@@ -1088,23 +1156,27 @@ Rcpp::CharacterVector packed_id_decode_cpp(SEXP handles) {
   return result;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::CharacterVector packed_sequence_decode_cpp(SEXP handles) {
   Rcpp::NumericVector vector(handles);
   Rcpp::XPtr<PackedReadStore> store = store_from_handles(handles);
   const std::vector<std::size_t> indices = indices_from_handles(handles, *store, false);
   Rcpp::CharacterVector result(vector.size());
-  for (R_xlen_t i = 0; i < vector.size(); ++i) result[i] = store->sequence(indices[i]);
+  for (R_xlen_t i = 0; i < vector.size(); ++i) {
+    check_record_interrupt(i);
+    result[i] = store->sequence(indices[i]);
+  }
   return result;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::CharacterVector packed_quality_decode_cpp(SEXP handles, int phred_offset = 33) {
   Rcpp::NumericVector vector(handles);
   Rcpp::XPtr<PackedReadStore> store = store_from_handles(handles);
   const std::vector<std::size_t> indices = indices_from_handles(handles, *store);
   Rcpp::CharacterVector result(vector.size());
   for (R_xlen_t i = 0; i < vector.size(); ++i) {
+    check_record_interrupt(i);
     if (indices[i] == std::numeric_limits<std::size_t>::max()) {
       result[i] = NA_STRING;
     } else {
@@ -1114,13 +1186,14 @@ Rcpp::CharacterVector packed_quality_decode_cpp(SEXP handles, int phred_offset =
   return result;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::List packed_quality_values_cpp(SEXP handles) {
   Rcpp::NumericVector vector(handles);
   Rcpp::XPtr<PackedReadStore> store = store_from_handles(handles);
   const std::vector<std::size_t> indices = indices_from_handles(handles, *store);
   Rcpp::List result(vector.size());
   for (R_xlen_t i = 0; i < vector.size(); ++i) {
+    check_record_interrupt(i);
     if (indices[i] == std::numeric_limits<std::size_t>::max()) {
       result[i] = R_NilValue;
     } else {
@@ -1130,13 +1203,14 @@ Rcpp::List packed_quality_values_cpp(SEXP handles) {
   return result;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::NumericVector packed_quality_mean_cpp(SEXP handles) {
   Rcpp::NumericVector vector(handles);
   Rcpp::XPtr<PackedReadStore> store = store_from_handles(handles);
   const std::vector<std::size_t> indices = indices_from_handles(handles, *store);
   Rcpp::NumericVector result(vector.size(), R_NaReal);
   for (R_xlen_t i = 0; i < vector.size(); ++i) {
+    check_record_interrupt(i);
     if (indices[i] != std::numeric_limits<std::size_t>::max()) {
       result[i] = store->mean_quality(indices[i]);
     }
@@ -1144,13 +1218,14 @@ Rcpp::NumericVector packed_quality_mean_cpp(SEXP handles) {
   return result;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::IntegerVector packed_quality_min_cpp(SEXP handles) {
   Rcpp::NumericVector vector(handles);
   Rcpp::XPtr<PackedReadStore> store = store_from_handles(handles);
   const std::vector<std::size_t> indices = indices_from_handles(handles, *store);
   Rcpp::IntegerVector result(vector.size(), NA_INTEGER);
   for (R_xlen_t i = 0; i < vector.size(); ++i) {
+    check_record_interrupt(i);
     if (indices[i] != std::numeric_limits<std::size_t>::max()) {
       result[i] = store->minimum_quality(indices[i]);
     }
@@ -1158,7 +1233,7 @@ Rcpp::IntegerVector packed_quality_min_cpp(SEXP handles) {
   return result;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::NumericVector packed_quality_fraction_cpp(SEXP handles, int threshold) {
   if (threshold < 0 || threshold > 93) Rcpp::stop("threshold must be between Q0 and Q93");
   Rcpp::NumericVector vector(handles);
@@ -1166,6 +1241,7 @@ Rcpp::NumericVector packed_quality_fraction_cpp(SEXP handles, int threshold) {
   const std::vector<std::size_t> indices = indices_from_handles(handles, *store);
   Rcpp::NumericVector result(vector.size(), R_NaReal);
   for (R_xlen_t i = 0; i < vector.size(); ++i) {
+    check_record_interrupt(i);
     if (indices[i] != std::numeric_limits<std::size_t>::max()) {
       result[i] = store->fraction_at_least(indices[i], threshold);
     }
@@ -1173,12 +1249,13 @@ Rcpp::NumericVector packed_quality_fraction_cpp(SEXP handles, int threshold) {
   return result;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::CharacterVector packed_sequence_format_cpp(SEXP handles, int width = 24) {
   if (width < 4) width = 4;
   Rcpp::CharacterVector decoded = packed_sequence_decode_cpp(handles);
   Rcpp::CharacterVector result(decoded.size());
   for (R_xlen_t i = 0; i < decoded.size(); ++i) {
+    check_record_interrupt(i);
     const std::string value = Rcpp::as<std::string>(decoded[i]);
     if (static_cast<int>(value.size()) <= width) {
       result[i] = value;
@@ -1189,13 +1266,14 @@ Rcpp::CharacterVector packed_sequence_format_cpp(SEXP handles, int width = 24) {
   return result;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::CharacterVector packed_quality_format_cpp(SEXP handles) {
   Rcpp::NumericVector vector(handles);
   Rcpp::XPtr<PackedReadStore> store = store_from_handles(handles);
   const std::vector<std::size_t> indices = indices_from_handles(handles, *store);
   Rcpp::CharacterVector result(vector.size());
   for (R_xlen_t i = 0; i < vector.size(); ++i) {
+    check_record_interrupt(i);
     if (indices[i] == std::numeric_limits<std::size_t>::max()) {
       result[i] = "<no quality>";
       continue;
@@ -1210,12 +1288,12 @@ Rcpp::CharacterVector packed_quality_format_cpp(SEXP handles) {
   return result;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::List packed_store_stats_cpp(SEXP handles) {
   return store_from_handles(handles)->statistics();
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 bool packed_validate_handles_cpp(SEXP id_handles,
                                  SEXP sequence_handles,
                                  SEXP quality_handles,
@@ -1224,17 +1302,18 @@ bool packed_validate_handles_cpp(SEXP id_handles,
   return true;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::LogicalVector packed_handle_is_na_cpp(SEXP handles) {
   Rcpp::NumericVector vector(handles);
   Rcpp::LogicalVector result(vector.size());
   for (R_xlen_t i = 0; i < vector.size(); ++i) {
+    check_record_interrupt(i);
     result[i] = get_integer64_value(vector, i) == kInteger64NA;
   }
   return result;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 SEXP packed_fastq_stream_open_cpp(std::string path,
                                   int phred_offset = 33,
                                   bool keep_comment = true) {
@@ -1249,7 +1328,7 @@ SEXP packed_fastq_stream_open_cpp(std::string path,
   return R_NilValue;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 SEXP packed_fastq_stream_next_cpp(SEXP pointer, int chunk_size = 50000) {
   if (chunk_size <= 0) Rcpp::stop("chunk_size must be positive");
   Rcpp::XPtr<FastqStream> stream = stream_pointer(pointer);
@@ -1263,7 +1342,7 @@ SEXP packed_fastq_stream_next_cpp(SEXP pointer, int chunk_size = 50000) {
   return R_NilValue;
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 Rcpp::LogicalVector packed_fastq_stream_state_cpp(SEXP pointer) {
   Rcpp::XPtr<FastqStream> stream = stream_pointer(pointer);
   return Rcpp::LogicalVector::create(
@@ -1271,13 +1350,13 @@ Rcpp::LogicalVector packed_fastq_stream_state_cpp(SEXP pointer) {
     Rcpp::Named("done") = stream->done());
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 void packed_fastq_stream_close_cpp(SEXP pointer) {
   Rcpp::XPtr<FastqStream> stream = stream_pointer(pointer);
   stream->close();
 }
 
-// [[Rcpp::export]]
+// [[Rcpp::export(rng = false)]]
 void packed_write_fastq_cpp(SEXP id_handles,
                            SEXP sequence_handles,
                            SEXP quality_handles,
@@ -1314,6 +1393,7 @@ void packed_write_fastq_cpp(SEXP id_handles,
   // requested output encoding must never be allowed to destroy an existing
   // file before the error is reported.
   for (R_xlen_t i = 0; i < ids.size(); ++i) {
+    check_record_interrupt(i);
     const std::int64_t id_handle = get_integer64_value(ids, i);
     if (id_handle == kInteger64NA) {
       Rcpp::stop("FASTQ output cannot contain missing IDs");
@@ -1342,6 +1422,9 @@ void packed_write_fastq_cpp(SEXP id_handles,
   }
 
   const bool gzip = ends_with(path, ".gz");
+  // Even a zero-row gzip append writes an empty member on close. Validate
+  // existing bytes before opening it; only newline insertion needs new rows.
+  const bool separate_record = append && append_requires_newline(path, gzip) && ids.size() > 0;
   gzFile gzip_file = nullptr;
   std::ofstream plain_file;
   if (gzip) {
@@ -1353,7 +1436,16 @@ void packed_write_fastq_cpp(SEXP id_handles,
   }
 
   try {
+    if (separate_record) {
+      if (gzip) {
+        gz_write_all(gzip_file, "\n");
+      } else {
+        plain_file.put('\n');
+        if (!plain_file.good()) throw std::runtime_error("failed while writing FASTQ output");
+      }
+    }
     for (R_xlen_t i = 0; i < ids.size(); ++i) {
+      check_record_interrupt(i);
       const std::int64_t id_handle = get_integer64_value(ids, i);
       if (id_handle == kInteger64NA) throw std::runtime_error("FASTQ output cannot contain missing IDs");
       const std::string id = id_store->string_from_handle(id_handle, false);
@@ -1368,7 +1460,7 @@ void packed_write_fastq_cpp(SEXP id_handles,
       }
       std::string record;
       record.reserve(id.size() + sequence.size() + quality.size() + 8U);
-      if (id.empty() || id[0] != '@') record.push_back('@');
+      record.push_back('@');
       record += id;
       const std::int64_t comment_handle = have_comments
         ? get_integer64_value(comments, i) : kInteger64NA;
