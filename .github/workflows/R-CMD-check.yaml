@@ -38,6 +38,26 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Prefer responsive Ubuntu mirrors
+        if: runner.os == 'Linux'
+        run: |
+          # Keep Ubuntu's security mirror, suites, and signing keys; only
+          # reprioritize the official archive ahead of the Azure mirror.
+          # See actions/runner-images/images/ubuntu/scripts/build/configure-apt-sources.sh.
+          if test -f /etc/apt/apt-mirrors.txt; then
+            sudo sed -i \
+              -e 's|^http://azure\.archive\.ubuntu\.com/ubuntu/\(.*\)priority:1$|http://azure.archive.ubuntu.com/ubuntu/\1priority:2|' \
+              -e 's|^https://archive\.ubuntu\.com/ubuntu/\(.*\)priority:2$|https://archive.ubuntu.com/ubuntu/\1priority:1|' \
+              /etc/apt/apt-mirrors.txt
+          fi
+          # Match current runner-image failover limits rather than waiting
+          # minutes per stalled download: https://github.com/actions/runner-images/issues/14594
+          sudo tee /etc/apt/apt.conf.d/zz-rrad-network >/dev/null <<'EOF'
+          Acquire::Retries "1";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          EOF
+
       - uses: r-lib/actions/setup-pandoc@v2
 
       - uses: r-lib/actions/setup-r@v2
