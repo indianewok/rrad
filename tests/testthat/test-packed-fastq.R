@@ -141,12 +141,15 @@ test_that("FASTQ append rejects incomplete gzip input without changing it", {
     as.integer(corrupted[length(corrupted) - 7L]), 1L
   ))
   for (invalid in list(truncated, corrupted)) {
-    writeBin(invalid, path)
-    expect_error(
-      rad_write_fastq(rad_pack_reads("second", "TG", "II"), path, append = TRUE),
-      "could not read complete existing FASTQ output"
-    )
-    expect_identical(readBin(path, "raw", n = file.info(path)$size), invalid)
+    for (reads in list(rad_pack_reads("second", "TG", "II"),
+                       rad_pack_reads(character(), character(), character()))) {
+      writeBin(invalid, path)
+      expect_error(
+        rad_write_fastq(reads, path, append = TRUE),
+        "could not read complete existing FASTQ output"
+      )
+      expect_identical(readBin(path, "raw", n = file.info(path)$size), invalid)
+    }
   }
 })
 
@@ -160,9 +163,11 @@ test_that("FASTQ append rejects incompatible existing compression", {
     close(connection)
     original <- readBin(path, "raw", n = file.info(path)$size)
     expect_identical(as.character(rad_read_fastq(path)$seq_id), "first")
-    expect_error(rad_write_fastq(second, path, append = TRUE),
-                 "existing FASTQ compression does not match")
-    expect_identical(readBin(path, "raw", n = file.info(path)$size), original)
+    for (reads in list(second, rad_pack_reads(character(), character(), character()))) {
+      expect_error(rad_write_fastq(reads, path, append = TRUE),
+                   "existing FASTQ compression does not match")
+      expect_identical(readBin(path, "raw", n = file.info(path)$size), original)
+    }
   }
 })
 

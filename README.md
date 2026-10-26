@@ -20,8 +20,13 @@ remotes::install_github("indianewok/rrad@v1.2.1")
 For the current development version:
 
 ```r
+install.packages(c("remotes", "knitr", "rmarkdown"))
 remotes::install_github("indianewok/rrad", build_vignettes = TRUE)
 ```
+
+Building the vignette also requires Pandoc (available with RStudio or as a
+standalone installation). Omit `build_vignettes = TRUE` to install without
+building the guide.
 
 Source installation requires R >= 4.0.0, a C++17 compiler, GNU make, zlib
 development headers, and POSIX threads. R dependencies are installed by `remotes`.

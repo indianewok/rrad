@@ -121,7 +121,8 @@ rad_qfraction(x, threshold = 20L)
   \item{append}{\code{TRUE} or \code{FALSE}; append to an existing FASTQ
   output. Before appending, read the existing stream to check gzip integrity
   and its final byte. A missing final newline is inserted; incomplete or
-  corrupt gzip streams are rejected.}
+  corrupt gzip streams are rejected. Existing compression must match the
+  filename suffix. These checks also apply when \code{x} has no rows.}
   \item{use.names,fill}{Arguments used when combining tables.}
   \item{compress}{Compression accepted by \code{saveRDS}.}
   \item{deep}{\code{TRUE} or \code{FALSE}; also decode data and validate
@@ -183,8 +184,10 @@ assembled in a private sibling staging directory and installed at the requested
 path only after the complete write succeeds. Append therefore copies the
 existing destination and reads its complete decompressed stream before
 extending it. This uses bounded memory, inserts a missing final newline, and
-rejects incomplete or corrupt gzip streams. It does not validate every existing
-FASTQ record. The scan and copy favor failure safety over in-place append speed.
+rejects incomplete or corrupt gzip streams and compression that does not match
+the filename suffix, including when appending zero rows. It does not validate
+every existing FASTQ record. The scan and copy favor failure safety over
+in-place append speed.
 
 The functions whose names begin with \code{packed_} are registered native
 bridges used by the public R interface and are not intended for direct use.

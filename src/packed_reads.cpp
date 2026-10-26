@@ -1422,7 +1422,9 @@ void packed_write_fastq_cpp(SEXP id_handles,
   }
 
   const bool gzip = ends_with(path, ".gz");
-  const bool separate_record = append && ids.size() > 0 && append_requires_newline(path, gzip);
+  // Even a zero-row gzip append writes an empty member on close. Validate
+  // existing bytes before opening it; only newline insertion needs new rows.
+  const bool separate_record = append && append_requires_newline(path, gzip) && ids.size() > 0;
   gzFile gzip_file = nullptr;
   std::ofstream plain_file;
   if (gzip) {

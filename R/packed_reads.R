@@ -680,8 +680,9 @@ rad_materialize <- function(x, phred_offset = 33L) {
 #' @param append `TRUE` or `FALSE`; append to an existing FASTQ output.
 #'   The existing stream is read before appending to check gzip integrity and
 #'   its final byte. A missing final newline is inserted; incomplete or corrupt
-#'   gzip streams are rejected. This does not validate every existing FASTQ
-#'   record.
+#'   gzip streams are rejected. Existing compression must match the filename
+#'   suffix. These checks also apply when `x` has no rows; they do not validate
+#'   every existing FASTQ record.
 rad_write_fastq <- function(x, path, phred_offset = 33L, append = FALSE) {
   if (!inherits(x, "rad_reads")) stop("x must be a rad_reads table", call. = FALSE)
   if (!all(c("seq_id", "seq", "qual") %in% names(x))) {
