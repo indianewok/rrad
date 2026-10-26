@@ -14,7 +14,7 @@ Install the published GitHub release:
 
 ```r
 install.packages("remotes")
-remotes::install_github("indianewok/rrad@v1.2.1")
+remotes::install_github("indianewok/rrad@v1.2.2")
 ```
 
 For the current development version:
