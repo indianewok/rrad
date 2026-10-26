@@ -138,10 +138,22 @@ layout and position-map caches are ignored unless the caller explicitly
 enables cache reuse.
 
 Package configuration link-probes C++17 `std::filesystem` and adds
-`-lstdc++fs` only for older toolchains that require it. The default macOS
-build is deliberately serial because CRAN's Apple-clang/OpenMP runtime pair is
-not portable; the public result distinguishes requested and effective thread
-counts. Native execution restores the caller's prior OpenMP thread setting.
+`-lstdc++fs` only for older toolchains that require it. It also checks zlib and
+POSIX threads, which the asynchronous streaming writer needs even in serial
+builds. OpenMP is optional and is enabled only after compiling and loading a
+probe with R's selected C++17 compiler. The default macOS build is deliberately
+serial because Apple's compiler does not include an OpenMP runtime. Set
+`RRAD_OPENMP=no` before installation to force a serial build on any platform,
+or `RRAD_OPENMP=yes` to require a working OpenMP toolchain. The default is
+`RRAD_OPENMP=auto`. The public result distinguishes requested and effective
+thread counts. Native execution restores the caller's prior OpenMP thread
+setting.
+
+The layout parser reports stream failures as exceptions instead of process
+assertions. Unused diagnostic variables and lambdas have been removed, and
+member initialization follows declaration order so compiler warnings remain
+useful without being suppressed. These changes are recorded in the vendoring
+manifest along with the updated source digest.
 
 `embedded_source_digest` identifies the final patched `include/` tree. It is
 SHA-256 over a canonical UTF-8 manifest: enumerate every file beneath

@@ -249,7 +249,7 @@ namespace seq_utils {
     return str.substr(start_pos, length);
 }
 
-    static std::vector<std::pair<size_t,std::string>>extract(const std::string& seq, const std::string& pattern, size_t length, int offset){
+    inline std::vector<std::pair<size_t,std::string>>extract(const std::string& seq, const std::string& pattern, size_t length, int offset){
         std::vector<std::pair<size_t,std::string>> results;
         if (pattern.empty() || length == 0 || seq.empty())
             return results;

@@ -658,7 +658,6 @@ namespace barcode_correction {
 
             int raw_count = all_counts.load(barcode_counts::raw);
             int total_count = all_counts.load(barcode_counts::total);
-            int filtered_count = all_counts.load(barcode_counts::filtered);
             int corrected_count = all_counts.load(barcode_counts::corrected);
                     
             if(total_count < 0 & raw_count < 2){
@@ -3650,7 +3649,6 @@ public:
         // Check if the element has aligned and misaligned positions
         if (it->aligned_positions && it->misaligned_positions) {
             const auto& [start_mean, start_var] = it->aligned_positions->start_stats;
-            const auto& [mis_start, start_mvar] = it->misaligned_positions->start_stats;
             // Compute expected region boundaries based on the aligned stats
             expected_start = (start_mean < 50.0) ? 1 
             : static_cast<int>(std::max(0.0, ((start_mean - (start_var * 1.25)) / 100.0) * read_length));
@@ -3892,7 +3890,6 @@ public:
         std::string mode, const std::string& joint_bc_mode, int min_read_length = -1
     ) {
         
-        constexpr char qual_mask = '\x7F';
         auto direction_elements = group_directionally();
         
         std::string filtered_because = "";
@@ -4264,7 +4261,6 @@ public:
 
             if (my_chunk_id % 100 == 0) {
                 for (const auto& kv : layout.wl_map.maps) {
-                    const std::string& class_id = kv.first;
                     auto& wl = kv.second.get();
                     bc_mem_utils::print_mem_snapshot(wl.true_bcs, wl.global_bcs, my_chunk_id);
                 }

@@ -83,6 +83,18 @@ test_that("plain FASTQ writer produces standard four-line records", {
                      "@r2", "TG", "+", "5I"))
 })
 
+test_that("FASTQ writing preserves a literal leading at-sign in read IDs", {
+  ids <- c("ordinary", "@first", "@@second")
+  packed <- rad_pack_reads(ids, c("A", "C", "G"), c("!", "5", "I"))
+  for (extension in c(".fastq", ".fastq.gz")) {
+    path <- tempfile(fileext = extension)
+    on.exit(unlink(path), add = TRUE)
+    rad_write_fastq(packed, path)
+    restored <- rad_read_fastq(path)
+    expect_identical(as.character(restored$seq_id), ids)
+  }
+})
+
 test_that("FASTQ append is staged and preserves complete records", {
   first <- rad_pack_reads("first", "AC", "!!")
   second <- rad_pack_reads("second", "TG", "II")
@@ -97,6 +109,77 @@ test_that("FASTQ append is staged and preserves complete records", {
     expect_identical(as.character(restored$seq_id), c("first", "second"))
     expect_identical(as.character(restored$seq), c("AC", "TG"))
     expect_identical(as.character(restored$qual), c("!!", "II"))
+  }
+})
+
+test_that("FASTQ append separates a final record without a trailing newline", {
+  second <- rad_pack_reads("second", "TG", "II")
+  for (extension in c(".fastq", ".fastq.gz")) {
+    path <- tempfile(fileext = extension)
+    on.exit(unlink(path), add = TRUE)
+    connection <- if (extension == ".fastq.gz") gzfile(path, "wb") else file(path, "wb")
+    writeBin(charToRaw("@first\nAC\n+\n!!"), connection)
+    close(connection)
+    expect_identical(as.character(rad_read_fastq(path)$seq_id), "first")
+
+    rad_write_fastq(second, path, append = TRUE)
+    restored <- rad_read_fastq(path)
+    expect_identical(as.character(restored$seq_id), c("first", "second"))
+    expect_identical(as.character(restored$seq), c("AC", "TG"))
+    expect_identical(as.character(restored$qual), c("!!", "II"))
+  }
+})
+
+test_that("FASTQ append rejects incomplete gzip input without changing it", {
+  path <- tempfile(fileext = ".fastq.gz")
+  on.exit(unlink(path), add = TRUE)
+  rad_write_fastq(rad_pack_reads("first", "AC", "!!"), path)
+  bytes <- readBin(path, "raw", n = file.info(path)$size)
+  truncated <- bytes[seq_len(length(bytes) - 8L)]
+  corrupted <- bytes
+  corrupted[length(corrupted) - 7L] <- as.raw(bitwXor(
+    as.integer(corrupted[length(corrupted) - 7L]), 1L
+  ))
+  for (invalid in list(truncated, corrupted)) {
+    writeBin(invalid, path)
+    expect_error(
+      rad_write_fastq(rad_pack_reads("second", "TG", "II"), path, append = TRUE),
+      "could not read complete existing FASTQ output"
+    )
+    expect_identical(readBin(path, "raw", n = file.info(path)$size), invalid)
+  }
+})
+
+test_that("FASTQ append rejects incompatible existing compression", {
+  second <- rad_pack_reads("second", "TG", "II")
+  for (extension in c(".fastq", ".fastq.gz")) {
+    path <- tempfile(fileext = extension)
+    on.exit(unlink(path), add = TRUE)
+    connection <- if (extension == ".fastq") gzfile(path, "wb") else file(path, "wb")
+    writeBin(charToRaw("@first\nAC\n+\n!!\n"), connection)
+    close(connection)
+    original <- readBin(path, "raw", n = file.info(path)$size)
+    expect_identical(as.character(rad_read_fastq(path)$seq_id), "first")
+    expect_error(rad_write_fastq(second, path, append = TRUE),
+                 "existing FASTQ compression does not match")
+    expect_identical(readBin(path, "raw", n = file.info(path)$size), original)
+  }
+})
+
+test_that("FASTQ append handles new and empty destinations", {
+  reads <- rad_pack_reads("read", "A", "!")
+  for (extension in c(".fastq", ".fastq.gz")) {
+    for (initial in c("missing", "empty", "encoded_empty")) {
+      path <- tempfile(fileext = extension)
+      on.exit(unlink(path), add = TRUE)
+      if (initial == "empty") file.create(path)
+      if (initial == "encoded_empty") {
+        connection <- if (extension == ".fastq.gz") gzfile(path, "wb") else file(path, "wb")
+        close(connection)
+      }
+      rad_write_fastq(reads, path, append = TRUE)
+      expect_identical(as.character(rad_read_fastq(path)$seq_id), "read")
+    }
   }
 })
 

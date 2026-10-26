@@ -118,6 +118,19 @@ the built-in whitelists before an offline or batch run; set
 network access.
 }
 \examples{
+local({
+  work <- tempfile("rrad-scan-example-")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE))
+  input <- file.path(work, "reads.fasta")
+  writeLines(c(">read-1", "ACGTAACC", ">read-2", "ACGTTTGA"), input)
+  scan <- rad_scan_wl(
+    input, file.path(work, "cells"), adapter_seq = "ACGT",
+    barcode_length = 4L, max_error = 0, selection = "above_floor"
+  )
+  readLines(scan$artifacts$whitelist)
+})
+
 \dontrun{
 scan <- rad_scan_wl(
   input = "reads.fastq.gz",

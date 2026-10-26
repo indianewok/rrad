@@ -1,0 +1,212 @@
+---
+title: "An offline RAD workflow in R"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{An offline RAD workflow in R}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+library(rrad)
+old_options <- options(rrad.offline = TRUE)
+work <- tempfile("rrad-vignette-")
+dir.create(work)
+```
+
+`rrad` brings RAD's demultiplexing, barcode discovery, and read reformatting
+engines into R. It is the RAD companion package used by SIRUP and does not
+require a separate RAD executable. This guide creates a small synthetic data
+set and runs entirely offline. Its sequences demonstrate API behavior, not a
+real sequencing chemistry or a statistical benchmark.
+
+## Pack and inspect reads
+
+Each synthetic read has an eight-base adapter, a four-base cell barcode, an
+eight-base poly-T segment, and a short cDNA sequence. Quality strings must have
+exactly the same lengths as their sequences. Phred offsets are explicit; they
+are never guessed from input.
+
+```{r pack}
+sequences <- c("ACGTACGTAACCTTTTTTTTGATTACA",
+               "ACGTACGTTTGATTTTTTTTCAGTCA")
+reads <- rad_pack_reads(
+  seq_id = c("read-1", "read-2"),
+  seq = sequences,
+  qual = strrep("I", nchar(sequences))
+)
+rad_validate(reads, deep = TRUE)
+rad_qmean(reads)
+rad_materialize(reads)
+```
+
+The result is a `data.table` with class `rad_reads`. The `seq_id`, `seq`, and
+`qual` columns hold handles to a shared native store. Length and quality
+summaries are ordinary numeric columns computed during ingestion. Filter by
+these summaries without decoding all sequences:
+
+```{r filter}
+selected <- reads[reads$mean_q >= 20, ]
+as.character(selected$seq)
+```
+
+Subsets share the original store. After discarding many reads,
+`selected <- rad_compact(selected)` can rebuild a smaller store; the original
+store is released when no remaining object refers to it. Use `rad_materialize()`
+when another package requires character columns. Keep packed core columns
+unchanged; repack a modified materialized table with `as_rad_reads()`.
+
+## Discover a whitelist and demultiplex
+
+Write a FASTQ file and an explicit CSV layout in the temporary working
+directory. The layout's `whitelist` column is empty because this example will
+provide the discovered whitelist directly.
+
+```{r input-files}
+fastq <- file.path(work, "reads.fastq")
+rad_write_fastq(reads, fastq)
+layout <- file.path(work, "layout.csv")
+writeLines(c(
+  "Read Layout,,,,,",
+  "id,seq,expected_length,type,class,whitelist",
+  "anchor,ACGTACGT,,static,linker,",
+  "barcode,,4,variable,barcode,",
+  "poly_t,TTTTTTTT,,static,poly_t,",
+  "read,,,variable,read,"
+), layout)
+```
+
+`rad_scan_wl()` finds barcodes following an adapter and writes a selected
+whitelist plus counts and annotations. For this tiny example, use
+`selection = "above_floor"` so both observed barcodes are retained. The default
+`"high_specificity"` selection applies RAD's statistical barcode caller and is
+intended for data sets with enough observations to estimate a count distribution.
+
+```{r scan}
+scan <- rad_scan_wl(
+  input = fastq,
+  output_prefix = file.path(work, "cells"),
+  adapter_seq = "ACGTACGT",
+  barcode_length = 4L,
+  max_error = 0,
+  selection = "above_floor",
+  threads = 1L
+)
+readLines(scan$artifacts$whitelist)
+```
+
+Pass the selected whitelist into demultiplexing. The zero minimum cDNA length
+is only for the short synthetic reads; choose a scientifically appropriate
+filter for real data.
+
+```{r demux}
+run <- rad_demux(
+  layout = layout,
+  fastq = fastq,
+  out_dir = file.path(work, "demux"),
+  custom_whitelist = scan$artifacts$whitelist,
+  min_read_length = 0L,
+  threads = 1L
+)
+run$status
+run$stats[c("total_reads", "reads_demultiplexed", "records_serialized")]
+```
+
+The primary gzip FASTQ contains the extracted reads with RAD's SAM-style
+barcode tags. The `artifacts` list gives exact paths; use those paths instead
+of reconstructing output filenames. For a single discovery-and-demultiplexing
+call, use `auto_whitelist = TRUE` instead of `custom_whitelist`.
+
+## Export pRESTO FASTA for IgBLAST
+
+`rad_reformat()` accepts a demultiplexing result directly. An explicit output
+path keeps the demultiplexed input available. Without an explicit path, a
+non-splitting header or coordinate rewrite replaces its input after a successful
+temporary write; FASTA conversion always requires an explicit output path.
+
+```{r reformat}
+fasta <- rad_reformat(
+  run,
+  to_fasta = TRUE,
+  header_format = "presto",
+  output_fastq = file.path(work, "igblast-input.fasta")
+)
+readLines(fasta$artifacts$fasta)
+```
+
+pRESTO output uses `QNAME|BARCODE=...|UMI=...`, omitting annotations absent
+from the input. `BARCODE` prefers a spatial `BC:Z:` tag and otherwise uses
+`CB:Z:`. This toy layout has no UMI, so its output has no UMI annotation.
+`header_format = "preserve"` retains the original tags, while `"collapsed"`
+uses RAD's legacy positional header. To split output by cell barcode, use
+`split_bc = TRUE` with `out_dir`; splitting is always keyed by `CB:Z:`.
+
+## Process larger files in chunks
+
+`rad_read_fastq()` reads a file into one packed store. For bounded-memory
+processing, open a stream, process one chunk at a time, and close it even if
+processing fails. Each returned chunk owns its own store.
+
+```{r streaming}
+count_high_quality <- function(path, chunk_size = 50000L) {
+  stream <- rad_stream(path)
+  on.exit(rad_stream_close(stream), add = TRUE)
+  total <- 0
+  repeat {
+    chunk <- rad_stream_next(stream, n = chunk_size)
+    if (is.null(chunk)) break
+    total <- total + sum(chunk$mean_q >= 20, na.rm = TRUE)
+  }
+  total
+}
+count_high_quality(fastq, chunk_size = 1L)
+```
+
+Use `rad_rbind_reads()` to combine independently owned chunks. Directly binding
+their handle columns can associate handles with the wrong store. Native R
+comparisons of IDs are exact; `data.table` joins between independent stores
+compare 63-bit ID fingerprints. Materialize ID keys when exact cross-store
+joining or lexical ordering is required. See `?rad_pack_reads` for details.
+
+## Save data and provenance
+
+Use `rad_save()` and `rad_load()` across R sessions. They serialize a versioned,
+materialized payload and recreate native storage on load. Plain `saveRDS()` of
+a packed table cannot preserve its native pointers.
+
+```{r save}
+saved <- file.path(work, "reads.rds")
+rad_save(selected, saved)
+restored <- rad_load(saved)
+stopifnot(identical(as.character(restored$seq), as.character(selected$seq)))
+```
+
+Native workflow results contain the effective configuration and a `core`
+provenance record. Preserve these with the analysis outputs. `rad_core_info()`
+also reports the embedded RAD version, upstream commit, patched-source digest,
+resource digest, and build capabilities:
+
+```{r provenance}
+info <- rad_core_info()
+info[c("core_version", "source_commit", "embedded_source_digest",
+       "resource_digest")]
+info$build$openmp
+```
+
+Linux can use OpenMP when the configured compiler supports it. The default
+macOS installation is serial. Requests for multiple threads on serial builds
+warn and use one thread; results report both requested and effective counts.
+
+Small reference layouts and whitelists ship with the package. Large 10x
+whitelists are fetched only when requested, from immutable URLs and with byte
+count and SHA-256 verification. Before an offline run that needs them, call
+`rad_download_whitelists()` while online, then set `options(rrad.offline = TRUE)`.
+The `rrad.cache_dir` option or `RRAD_CACHE_DIR` environment variable selects the
+cache location. `rad_clear_resource_cache(confirm = TRUE)` removes cached
+resources. This vignette enables offline mode throughout and needs no downloads.
+
+```{r cleanup, include=FALSE}
+unlink(work, recursive = TRUE)
+options(old_options)
+```

@@ -2,3 +2,6 @@
 ^\.Rproj\.user$
 ^\.github$
 ^src/Makevars$
+^CONTRIBUTING\.md$
+^cran-comments\.md$
+^QC_REPORT\.md$

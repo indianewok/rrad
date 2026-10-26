@@ -30,7 +30,7 @@ rad_reformat(
 
   \item{split_bc}{Whether to write one gzip file per observed \code{CB:Z}
   barcode, using \code{.fq.gz} for FASTQ input and \code{.fa.gz} for FASTA
-  input.}
+  input or when \code{to_fasta = TRUE}.}
 
   \item{reformat_header}{Whether to collapse the read name, cell barcode, and
   UMI to \code{QNAME<delimiter>CB<delimiter>UB}. For RAD CLI parity, the full
@@ -125,6 +125,17 @@ plus-line identifiers or comments are preserved unless FASTA output
 intentionally removes FASTQ-only fields.
 }
 \examples{
+local({
+  input <- tempfile(fileext = ".fastq")
+  output <- tempfile(fileext = ".fasta")
+  on.exit(unlink(c(input, output)))
+  writeLines(c("@read-1 CB:Z:AACC UB:Z:TGCA", "ACGT", "+", "IIII"), input)
+  result <- rad_reformat(
+    input, output_fastq = output, to_fasta = TRUE, header_format = "presto"
+  )
+  readLines(result$artifacts$fasta)
+})
+
 \dontrun{
 # Preserve the demultiplexed input and write one gzip per cell barcode.
 split <- rad_reformat(

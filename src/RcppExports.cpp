@@ -15,7 +15,6 @@ SEXP packed_reads_build_cpp(Rcpp::CharacterVector ids, Rcpp::CharacterVector seq
 RcppExport SEXP _rrad_packed_reads_build_cpp(SEXP idsSEXP, SEXP sequencesSEXP, SEXP qualities_sexpSEXP, SEXP comments_sexpSEXP, SEXP phred_offsetSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< Rcpp::CharacterVector >::type ids(idsSEXP);
     Rcpp::traits::input_parameter< Rcpp::CharacterVector >::type sequences(sequencesSEXP);
     Rcpp::traits::input_parameter< SEXP >::type qualities_sexp(qualities_sexpSEXP);
@@ -30,7 +29,6 @@ Rcpp::CharacterVector packed_id_decode_cpp(SEXP handles);
 RcppExport SEXP _rrad_packed_id_decode_cpp(SEXP handlesSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type handles(handlesSEXP);
     rcpp_result_gen = Rcpp::wrap(packed_id_decode_cpp(handles));
     return rcpp_result_gen;
@@ -41,7 +39,6 @@ Rcpp::CharacterVector packed_sequence_decode_cpp(SEXP handles);
 RcppExport SEXP _rrad_packed_sequence_decode_cpp(SEXP handlesSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type handles(handlesSEXP);
     rcpp_result_gen = Rcpp::wrap(packed_sequence_decode_cpp(handles));
     return rcpp_result_gen;
@@ -52,7 +49,6 @@ Rcpp::CharacterVector packed_quality_decode_cpp(SEXP handles, int phred_offset);
 RcppExport SEXP _rrad_packed_quality_decode_cpp(SEXP handlesSEXP, SEXP phred_offsetSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type handles(handlesSEXP);
     Rcpp::traits::input_parameter< int >::type phred_offset(phred_offsetSEXP);
     rcpp_result_gen = Rcpp::wrap(packed_quality_decode_cpp(handles, phred_offset));
@@ -64,7 +60,6 @@ Rcpp::List packed_quality_values_cpp(SEXP handles);
 RcppExport SEXP _rrad_packed_quality_values_cpp(SEXP handlesSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type handles(handlesSEXP);
     rcpp_result_gen = Rcpp::wrap(packed_quality_values_cpp(handles));
     return rcpp_result_gen;
@@ -75,7 +70,6 @@ Rcpp::NumericVector packed_quality_mean_cpp(SEXP handles);
 RcppExport SEXP _rrad_packed_quality_mean_cpp(SEXP handlesSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type handles(handlesSEXP);
     rcpp_result_gen = Rcpp::wrap(packed_quality_mean_cpp(handles));
     return rcpp_result_gen;
@@ -86,7 +80,6 @@ Rcpp::IntegerVector packed_quality_min_cpp(SEXP handles);
 RcppExport SEXP _rrad_packed_quality_min_cpp(SEXP handlesSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type handles(handlesSEXP);
     rcpp_result_gen = Rcpp::wrap(packed_quality_min_cpp(handles));
     return rcpp_result_gen;
@@ -97,7 +90,6 @@ Rcpp::NumericVector packed_quality_fraction_cpp(SEXP handles, int threshold);
 RcppExport SEXP _rrad_packed_quality_fraction_cpp(SEXP handlesSEXP, SEXP thresholdSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type handles(handlesSEXP);
     Rcpp::traits::input_parameter< int >::type threshold(thresholdSEXP);
     rcpp_result_gen = Rcpp::wrap(packed_quality_fraction_cpp(handles, threshold));
@@ -109,7 +101,6 @@ Rcpp::CharacterVector packed_sequence_format_cpp(SEXP handles, int width);
 RcppExport SEXP _rrad_packed_sequence_format_cpp(SEXP handlesSEXP, SEXP widthSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type handles(handlesSEXP);
     Rcpp::traits::input_parameter< int >::type width(widthSEXP);
     rcpp_result_gen = Rcpp::wrap(packed_sequence_format_cpp(handles, width));
@@ -121,7 +112,6 @@ Rcpp::CharacterVector packed_quality_format_cpp(SEXP handles);
 RcppExport SEXP _rrad_packed_quality_format_cpp(SEXP handlesSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type handles(handlesSEXP);
     rcpp_result_gen = Rcpp::wrap(packed_quality_format_cpp(handles));
     return rcpp_result_gen;
@@ -132,7 +122,6 @@ Rcpp::List packed_store_stats_cpp(SEXP handles);
 RcppExport SEXP _rrad_packed_store_stats_cpp(SEXP handlesSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type handles(handlesSEXP);
     rcpp_result_gen = Rcpp::wrap(packed_store_stats_cpp(handles));
     return rcpp_result_gen;
@@ -143,7 +132,6 @@ bool packed_validate_handles_cpp(SEXP id_handles, SEXP sequence_handles, SEXP qu
 RcppExport SEXP _rrad_packed_validate_handles_cpp(SEXP id_handlesSEXP, SEXP sequence_handlesSEXP, SEXP quality_handlesSEXP, SEXP comment_handlesSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type id_handles(id_handlesSEXP);
     Rcpp::traits::input_parameter< SEXP >::type sequence_handles(sequence_handlesSEXP);
     Rcpp::traits::input_parameter< SEXP >::type quality_handles(quality_handlesSEXP);
@@ -157,7 +145,6 @@ Rcpp::LogicalVector packed_handle_is_na_cpp(SEXP handles);
 RcppExport SEXP _rrad_packed_handle_is_na_cpp(SEXP handlesSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type handles(handlesSEXP);
     rcpp_result_gen = Rcpp::wrap(packed_handle_is_na_cpp(handles));
     return rcpp_result_gen;
@@ -168,7 +155,6 @@ SEXP packed_fastq_stream_open_cpp(std::string path, int phred_offset, bool keep_
 RcppExport SEXP _rrad_packed_fastq_stream_open_cpp(SEXP pathSEXP, SEXP phred_offsetSEXP, SEXP keep_commentSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< std::string >::type path(pathSEXP);
     Rcpp::traits::input_parameter< int >::type phred_offset(phred_offsetSEXP);
     Rcpp::traits::input_parameter< bool >::type keep_comment(keep_commentSEXP);
@@ -181,7 +167,6 @@ SEXP packed_fastq_stream_next_cpp(SEXP pointer, int chunk_size);
 RcppExport SEXP _rrad_packed_fastq_stream_next_cpp(SEXP pointerSEXP, SEXP chunk_sizeSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type pointer(pointerSEXP);
     Rcpp::traits::input_parameter< int >::type chunk_size(chunk_sizeSEXP);
     rcpp_result_gen = Rcpp::wrap(packed_fastq_stream_next_cpp(pointer, chunk_size));
@@ -193,7 +178,6 @@ Rcpp::LogicalVector packed_fastq_stream_state_cpp(SEXP pointer);
 RcppExport SEXP _rrad_packed_fastq_stream_state_cpp(SEXP pointerSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type pointer(pointerSEXP);
     rcpp_result_gen = Rcpp::wrap(packed_fastq_stream_state_cpp(pointer));
     return rcpp_result_gen;
@@ -203,7 +187,6 @@ END_RCPP
 void packed_fastq_stream_close_cpp(SEXP pointer);
 RcppExport SEXP _rrad_packed_fastq_stream_close_cpp(SEXP pointerSEXP) {
 BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type pointer(pointerSEXP);
     packed_fastq_stream_close_cpp(pointer);
     return R_NilValue;
@@ -213,7 +196,6 @@ END_RCPP
 void packed_write_fastq_cpp(SEXP id_handles, SEXP sequence_handles, SEXP quality_handles, SEXP comment_handles, std::string path, int phred_offset, bool append);
 RcppExport SEXP _rrad_packed_write_fastq_cpp(SEXP id_handlesSEXP, SEXP sequence_handlesSEXP, SEXP quality_handlesSEXP, SEXP comment_handlesSEXP, SEXP pathSEXP, SEXP phred_offsetSEXP, SEXP appendSEXP) {
 BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< SEXP >::type id_handles(id_handlesSEXP);
     Rcpp::traits::input_parameter< SEXP >::type sequence_handles(sequence_handlesSEXP);
     Rcpp::traits::input_parameter< SEXP >::type quality_handles(quality_handlesSEXP);
@@ -230,7 +212,6 @@ Rcpp::List rad_core_info_cpp();
 RcppExport SEXP _rrad_rad_core_info_cpp() {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     rcpp_result_gen = Rcpp::wrap(rad_core_info_cpp());
     return rcpp_result_gen;
 END_RCPP
@@ -240,7 +221,6 @@ bool rad_any_file_equivalent_cpp(Rcpp::CharacterVector candidates, Rcpp::Charact
 RcppExport SEXP _rrad_rad_any_file_equivalent_cpp(SEXP candidatesSEXP, SEXP protected_pathsSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< Rcpp::CharacterVector >::type candidates(candidatesSEXP);
     Rcpp::traits::input_parameter< Rcpp::CharacterVector >::type protected_paths(protected_pathsSEXP);
     rcpp_result_gen = Rcpp::wrap(rad_any_file_equivalent_cpp(candidates, protected_paths));
@@ -252,7 +232,6 @@ Rcpp::List rad_scan_wl_cpp(Rcpp::List options);
 RcppExport SEXP _rrad_rad_scan_wl_cpp(SEXP optionsSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< Rcpp::List >::type options(optionsSEXP);
     rcpp_result_gen = Rcpp::wrap(rad_scan_wl_cpp(options));
     return rcpp_result_gen;
@@ -273,7 +252,6 @@ Rcpp::List rad_demux_cpp(Rcpp::List options);
 RcppExport SEXP _rrad_rad_demux_cpp(SEXP optionsSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< Rcpp::List >::type options(optionsSEXP);
     rcpp_result_gen = Rcpp::wrap(rad_demux_cpp(options));
     return rcpp_result_gen;

@@ -37,3 +37,41 @@ test_that("native demultiplexing is safe when HOME is unset", {
     info = paste(output, collapse = "\n")
   )
 })
+
+test_that("deterministic read operations preserve the user's RNG state", {
+  had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  if (had_seed) previous_seed <- get(".Random.seed", envir = .GlobalEnv)
+  on.exit({
+    if (had_seed) {
+      assign(".Random.seed", previous_seed, envir = .GlobalEnv)
+    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      rm(".Random.seed", envir = .GlobalEnv)
+    }
+  }, add = TRUE)
+
+  work <- tempfile("rrad-rng-")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE), add = TRUE)
+  exercise_reads <- function() {
+    reads <- rad_pack_reads(c("r1", "r2"), c("ACGT", "TTAA"),
+                            c("IIII", "HHHH"))
+    rad_validate(reads, deep = TRUE)
+    rad_materialize(reads)
+    rad_qmean(reads$qual)
+    rad_write_fastq(reads, file.path(work, "reads.fastq"))
+    rad_read_fastq(file.path(work, "reads.fastq"))
+    rad_core_info()
+    invisible(NULL)
+  }
+
+  if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+    rm(".Random.seed", envir = .GlobalEnv)
+  }
+  exercise_reads()
+  expect_false(exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
+
+  set.seed(123)
+  before <- get(".Random.seed", envir = .GlobalEnv)
+  exercise_reads()
+  expect_identical(get(".Random.seed", envir = .GlobalEnv), before)
+})

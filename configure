@@ -12,14 +12,14 @@ if test -z "${rrad_cxx17}"; then
     rrad_cxx17="$("${rrad_r_bin}" CMD config CXX 2>/dev/null || true)"
 fi
 rrad_cxx17std="$("${rrad_r_bin}" CMD config CXX17STD 2>/dev/null || true)"
+rrad_cxx17flags="$("${rrad_r_bin}" CMD config CXX17FLAGS 2>/dev/null || true)"
 rrad_cppflags="$("${rrad_r_bin}" CMD config CPPFLAGS 2>/dev/null || true)"
 rrad_ldflags="$("${rrad_r_bin}" CMD config LDFLAGS 2>/dev/null || true)"
-rrad_openmp_flags='$(SHLIB_OPENMP_CXXFLAGS)'
-if test "$(uname -s 2>/dev/null || true)" = "Darwin"; then
-    # R's bundled libomp may lag the Apple clang runtime ABI. The default
-    # macOS source build remains serial; openmp_compat.hpp supplies stubs.
-    rrad_openmp_flags=""
-fi
+rrad_openmp_mode="${RRAD_OPENMP:-auto}"
+case "${rrad_openmp_mode}" in
+    auto|yes|no) ;;
+    *) echo "configure: error: RRAD_OPENMP must be auto, yes, or no" >&2; exit 1 ;;
+esac
 
 rrad_probe_parent="${TMPDIR:-/tmp}"
 rrad_probe_dir="$(mktemp -d "${rrad_probe_parent%/}/rrad-filesystem.XXXXXX")" || {
@@ -27,29 +27,87 @@ rrad_probe_dir="$(mktemp -d "${rrad_probe_parent%/}/rrad-filesystem.XXXXXX")" ||
     exit 1
 }
 chmod 700 "${rrad_probe_dir}"
-trap 'rm -rf "${rrad_probe_dir}"' EXIT HUP INT TERM
+trap 'rm -rf "${rrad_probe_dir}"' 0
+trap 'exit 1' HUP INT TERM
 
 cat > "${rrad_probe_dir}/filesystem.cpp" <<'EOF'
 #include <filesystem>
 int main() {
-    return std::filesystem::path("rrad").filename().empty() ? 1 : 0;
+    return std::filesystem::current_path().empty() ? 1 : 0;
 }
 EOF
 
 rrad_try_link() {
-    rrad_extra_libs="$1"
-    eval "${rrad_cxx17} ${rrad_cxx17std} ${rrad_cppflags} \"${rrad_probe_dir}/filesystem.cpp\" ${rrad_ldflags} ${rrad_extra_libs} -o \"${rrad_probe_dir}/filesystem\"" \
+    rrad_probe_source="$1"
+    rrad_extra_libs="$2"
+    eval "${rrad_cxx17} ${rrad_cxx17std} ${rrad_cxx17flags} ${rrad_cppflags} \"${rrad_probe_dir}/${rrad_probe_source}.cpp\" ${rrad_ldflags} ${rrad_extra_libs} -o \"${rrad_probe_dir}/${rrad_probe_source}\"" \
         >/dev/null 2>&1
 }
 
 rrad_filesystem_libs=""
-if rrad_try_link ""; then
+if rrad_try_link filesystem ""; then
     :
-elif rrad_try_link "-lstdc++fs"; then
+elif rrad_try_link filesystem "-lstdc++fs"; then
     rrad_filesystem_libs=" -lstdc++fs"
 else
     echo "configure: error: the C++17 compiler cannot link std::filesystem" >&2
     exit 1
+fi
+
+# The streaming writer uses std::thread even when OpenMP is disabled. Link
+# pthread explicitly so serial builds also work on older Linux toolchains.
+cat > "${rrad_probe_dir}/dependencies.cpp" <<'EOF'
+#include <thread>
+#include <zlib.h>
+int main() {
+    std::thread worker([]() {});
+    worker.join();
+    return zlibVersion() == nullptr;
+}
+EOF
+if ! rrad_try_link dependencies "-pthread -lz"; then
+    echo "configure: error: a C++17 compiler, POSIX threads, and zlib headers/library are required" >&2
+    exit 1
+fi
+
+rrad_openmp_flags=""
+if test "${rrad_openmp_mode}" = auto &&
+   test "$(uname -s 2>/dev/null || true)" = Darwin; then
+    # Apple's clang does not ship OpenMP. Use the portable serial backend by
+    # default; an explicitly requested compatible toolchain is probed below.
+    rrad_openmp_mode=no
+fi
+if test "${rrad_openmp_mode}" != no; then
+    # R's OpenMP macro describes its default compiler, which can differ from
+    # CXX17. Build and load a probe with the same Makevars used by the package
+    # before enabling OpenMP; incomplete installations fall back to serial.
+    cat > "${rrad_probe_dir}/Makevars" <<'EOF'
+CXX_STD = CXX17
+PKG_CXXFLAGS = $(SHLIB_OPENMP_CXXFLAGS)
+PKG_LIBS = $(SHLIB_OPENMP_CXXFLAGS)
+EOF
+    cat > "${rrad_probe_dir}/openmp.cpp" <<'EOF'
+#ifndef _OPENMP
+#error OpenMP is not enabled for this C++17 compiler
+#endif
+#include <omp.h>
+extern "C" int rrad_openmp_probe() { return omp_get_max_threads(); }
+EOF
+    rrad_shlib_ext="$("${rrad_r_bin}" CMD config SHLIB_EXT)"
+    if (cd "${rrad_probe_dir}" &&
+        "${rrad_r_bin}" CMD SHLIB openmp.cpp &&
+        RRAD_PROBE_LIBRARY="${rrad_probe_dir}/openmp${rrad_shlib_ext}" \
+        "${rrad_r_bin}" --vanilla --slave \
+            -e 'dyn.load(Sys.getenv("RRAD_PROBE_LIBRARY"))') \
+            >"${rrad_probe_dir}/openmp.log" 2>&1; then
+        rrad_openmp_flags='$(SHLIB_OPENMP_CXXFLAGS)'
+    elif test "${rrad_openmp_mode}" = yes; then
+        cat "${rrad_probe_dir}/openmp.log" >&2
+        echo "configure: error: requested OpenMP support is unavailable for the C++17 compiler" >&2
+        exit 1
+    else
+        echo "configure: OpenMP is unavailable for the C++17 compiler; using serial backend"
+    fi
 fi
 
 sed \
