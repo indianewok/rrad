@@ -2,7 +2,8 @@
 
 `rrad` is the RAD companion R package for SIRUP. It embeds the
 [RAD](https://github.com/indianewok/rad) C++ engines for demultiplexing,
-barcode whitelist discovery, and tagged-read reformatting. Native code is
+layout and barcode whitelist discovery, spatial assignment, and tagged-read
+reformatting. Native code is
 compiled during installation; no separate `rad` executable is required.
 
 The package also provides streaming FASTQ readers and compact read tables for
@@ -28,8 +29,10 @@ Building the vignette also requires Pandoc (available with RStudio or as a
 standalone installation). Omit `build_vignettes = TRUE` to install without
 building the guide.
 
-Source installation requires R >= 4.0.0, a C++17 compiler, GNU make, zlib
-development headers, and POSIX threads. R dependencies are installed by `remotes`.
+Source installation requires R >= 4.0.0, a 64-bit GCC or Clang C++17 compiler
+with unsigned 128-bit integer support, GNU make, zlib development headers,
+and POSIX threads. Configuration verifies the required compiler features.
+R dependencies are installed by `remotes`.
 
 - On macOS, install R and Apple's Command Line Tools (`xcode-select --install`).
   The default build uses one native worker and does not require a separate
@@ -41,7 +44,10 @@ development headers, and POSIX threads. R dependencies are installed by `remotes
 To force a serial installation, set `Sys.setenv(RRAD_OPENMP = "no")` before
 installing. `RRAD_OPENMP=yes` requires a working OpenMP toolchain and fails
 configuration if it is unavailable; it is intended for explicitly configured
-compilers. Unset the variable to return to the platform default.
+compilers. On macOS, the compiler and OpenMP runtime must be compatible; see
+the [R project OpenMP guidance](https://mac.r-project.org/openmp/). The default
+serial installation does not require that setup. Unset the variable to return
+to the platform default.
 
 Check the installed build with `rad_core_info()$build`. A request for more than
 one worker on a serial build produces a warning and runs with one worker;
@@ -107,6 +113,34 @@ example, including whitelist scanning, demultiplexing, pRESTO FASTA export, and
 bounded-memory streaming. After installing with vignettes, open it with
 `vignette("rrad-workflow", package = "rrad")`.
 
+## Development features in 1.3.0
+
+The development package embeds RAD commit `6167540` and adds the following
+interfaces. The published `v1.2.2` release above predates these additions.
+
+| Task | Interface |
+| --- | --- |
+| Segment concatemer reads before barcode assignment | `rad_demux(concat_hmm = TRUE)` |
+| Discover a layout, whitelist, or both | `rad_discover()` |
+| Capture barcode bases from masked adapter positions | `rad_scan_wl(capture_mode = "masked")` |
+| Apply spatial abundance and coordinate-aware scanning | `rad_scan_wl(spatial = TRUE)` and its `spatial_slide` options |
+| Assign corrected barcodes using an explicit slide map | `rad_spatial_reformat()` |
+| Send demultiplexed records to an open R connection | `rad_demux(output_connection = connection)` |
+
+Barcode catalogs support sequences of up to 64 bases. Adapter calibration now
+uses observed chance-hit distributions and may extend its initial read sample.
+HMM segmentation remains opt-in: its cached calibration, abstention decisions,
+and boundary diagnostics are reported with the run. In file-output runs,
+parents with unresolved boundaries are saved separately, so these raw records
+must not be counted as additional demultiplexed molecules.
+
+The explicit spatial exporter requires a validated barcode-to-coordinate map
+or two barcode-axis maps. It supports spot/bin or cell identities, tissue
+filtering, and per-read audit rows. This is separate from the existing
+`rad_reformat(coordinate_mode = "vizHD-v1")` convenience transformation.
+See `?rad_discover`, `?rad_spatial_reformat`, `?rad_scan_wl`, and `?rad_demux`
+for input formats and returned artifacts.
+
 ## Offline operation and reproducibility
 
 Small built-in layouts and whitelists are bundled. The large built-in 10x
@@ -133,8 +167,9 @@ the included examples, vignette, and tests do not download runtime resources.
 ## Development and licensing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for package checks and the source layout.
-The CI workflow checks Linux and macOS; review the completed checks before
-release.
+The CI workflow checks Linux and both macOS architectures, including serial
+and explicit OpenMP builds, native regressions, and Linux sanitizers. Review
+the completed checks for the exact commit before release.
 
 `rrad` is licensed under GPL-3 or later. Vendored components retain their own
 licenses and attribution; see [third-party notices](inst/THIRD_PARTY_NOTICES.md)

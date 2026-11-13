@@ -114,10 +114,48 @@ static inline std::string unpack_scan_barcode(packed_scan_barcode packed) {
 // set and allocates counters only for barcodes actually observed in the input.
 // Canonical barcodes longer than 31 bases use the existing int64_seq lookup
 // path, which supports multiple 64-bit chunks.
+struct scan_long_whitelist {
+    std::unordered_set<packed_barcode<uint64_t>> narrow;
+    std::unordered_set<packed_barcode<uint128_t>> wide;
+
+    bool empty() const noexcept { return narrow.empty() && wide.empty(); }
+    size_t size() const noexcept { return narrow.size() + wide.size(); }
+    void insert(const int64_seq& sequence) {
+        if (!sequence.is_valid()) return;
+        sequence.visit([&](auto word) {
+            using Word = decltype(word);
+            if constexpr (std::is_same_v<Word, uint64_t>)
+                narrow.insert({word, sequence.length});
+            else
+                wide.insert({word, sequence.length});
+        });
+    }
+    template <typename Word>
+    void emplace(Word word, uint16_t length) { insert(int64_seq::from_word(word, length)); }
+    bool contains(const int64_seq& sequence) const {
+        if (!sequence.is_valid()) return false;
+        return sequence.visit([&](auto word) {
+            using Word = decltype(word);
+            if constexpr (std::is_same_v<Word, uint64_t>)
+                return narrow.count({word, sequence.length}) != 0;
+            else
+                return wide.count({word, sequence.length}) != 0;
+        });
+    }
+};
+
+template <typename Set>
+static inline bool scan_whitelist_contains(const Set& set, const int64_seq& sequence) {
+    return set.find(sequence) != set.end();
+}
+static inline bool scan_whitelist_contains(const scan_long_whitelist& set, const int64_seq& sequence) {
+    return set.contains(sequence);
+}
+
 struct scan_whitelist_filter {
     packed_reference_set packed_barcodes;
     packed_observed_count_map observed_counts;
-    std::unordered_set<int64_seq> long_barcodes;
+    scan_long_whitelist long_barcodes;
 
     bool empty() const {
         return packed_barcodes.empty() && long_barcodes.empty();
@@ -188,35 +226,17 @@ static scan_whitelist_filter load_scan_whitelist(
         }
 
         if (is_bitlist) {
-            size_t consumed = 0;
-            uint64_t raw_bits = 0;
-            try {
-                raw_bits = std::stoull(token, &consumed);
-            } catch (...) {
+            int64_seq encoded;
+            if (!parse_packed_decimal(token, default_length, encoded, true)) {
                 ++malformed;
                 continue;
             }
-            if (consumed != token.size() || default_length == 0) {
-                ++malformed;
-                continue;
-            }
-
             if (default_length <= 31) {
-                const uint64_t max_bits =
-                    (uint64_t{1} << (2 * default_length)) - 1;
-                if (raw_bits > max_bits) {
-                    ++malformed;
-                    continue;
-                }
                 const packed_scan_barcode key =
-                    (uint64_t{1} << (2 * default_length)) | raw_bits;
+                    (uint64_t{1} << (2 * default_length)) | encoded.as_uint64();
                 out.packed_barcodes.insert(key);
-            } else if (default_length == 32) {
-                out.long_barcodes.emplace(
-                    static_cast<int64_t>(raw_bits), default_length);
             } else {
-                // A one-column int64 bitlist cannot encode more than 32 bases.
-                ++malformed;
+                out.long_barcodes.insert(encoded);
             }
             continue;
         }
@@ -228,7 +248,7 @@ static scan_whitelist_filter load_scan_whitelist(
         }
 
         if (token.size() > 31 &&
-            token.size() <= std::numeric_limits<uint16_t>::max()) {
+            token.size() <= 64) {
             int64_seq encoded(token);
             if (encoded.is_valid() &&
                 encoded.length == static_cast<uint16_t>(token.size())) {
@@ -276,6 +296,88 @@ static const EdlibEqualityPair kWildcardEqualities[8] = {
                 {'G', 'N'}, 
                 {'T', 'N'}
 };
+
+// Edlib equality pairs are symmetric. Translate pattern-side N/n to a byte
+// that cannot occur in a FASTQ sequence so an ambiguous N in the read does
+// not accidentally become a wildcard for a literal pattern base.
+static constexpr char kScanWildcardSentinel = '\x01';
+static const EdlibEqualityPair kMaskedWildcardEqualities[] = {
+                {kScanWildcardSentinel, 'A'},
+                {kScanWildcardSentinel, 'C'},
+                {kScanWildcardSentinel, 'G'},
+                {kScanWildcardSentinel, 'T'}
+};
+
+static constexpr int kMaskedWildcardEqualityCount =
+    static_cast<int>(sizeof(kMaskedWildcardEqualities) /
+                     sizeof(kMaskedWildcardEqualities[0]));
+
+// Preserve the historical fuzzy-matching treatment of ambiguous read bases
+// for ordinary literal adapters. Masked patterns use the directional sentinel
+// table above instead.
+static const EdlibEqualityPair kLegacyWildcardEqualities[] = {
+                {'N', 'A'},
+                {'N', 'C'},
+                {'N', 'G'},
+                {'N', 'T'}
+};
+
+static constexpr int kLegacyWildcardEqualityCount =
+    static_cast<int>(sizeof(kLegacyWildcardEqualities) /
+                     sizeof(kLegacyWildcardEqualities[0]));
+
+struct scan_wildcard_config {
+    const EdlibEqualityPair* pairs;
+    int count;
+};
+
+static inline scan_wildcard_config scan_wildcard_equalities(
+    std::string_view pattern) {
+    if (pattern.find_first_of("Nn") != std::string_view::npos) {
+        return {
+            kMaskedWildcardEqualities,
+            kMaskedWildcardEqualityCount};
+    }
+    return {
+        kLegacyWildcardEqualities,
+        kLegacyWildcardEqualityCount};
+}
+
+static inline bool is_scan_wildcard(char base) {
+    return base == 'N' || base == 'n';
+}
+
+static inline bool is_canonical_scan_base(char base) {
+    return base == 'A' || base == 'C' || base == 'G' || base == 'T';
+}
+
+static inline std::string scan_alignment_pattern(
+    std::string_view pattern) {
+    std::string alignment_pattern(pattern);
+    std::replace_if(
+        alignment_pattern.begin(), alignment_pattern.end(),
+        [](char base) { return is_scan_wildcard(base); },
+        kScanWildcardSentinel);
+    return alignment_pattern;
+}
+
+// Uppercase N is a wildcard whose aligned read base becomes part of the
+// barcode. Lowercase n participates in matching but is intentionally omitted
+// from the extracted barcode.
+static inline size_t scan_masked_capture_length(std::string_view pattern) {
+    return static_cast<size_t>(
+        std::count(pattern.begin(), pattern.end(), 'N'));
+}
+
+// Wildcards are uninformative matches, so a max-error ratio for a masked
+// pattern is calibrated only on its literal bases. Literal adapter behavior is
+// unchanged.
+static inline size_t scan_adapter_error_basis_length(
+    std::string_view pattern) {
+    return static_cast<size_t>(std::count_if(
+        pattern.begin(), pattern.end(),
+        [](char base) { return !is_scan_wildcard(base); }));
+}
 
 // Compute allowed edit distance for adapter search given a ratio.
 // - Ratio <= 0 -> exact match only (0 edits).
@@ -412,6 +514,7 @@ struct adapter_match {
     int start;
     int end;
     bool is_rc;
+    std::string masked_barcode{};
 };
 
 static inline std::optional<size_t> find_zero_edit_adapter_match(
@@ -565,17 +668,352 @@ static inline std::optional<adapter_match> find_adapter_match(
     return std::nullopt;
 }
 
+static inline std::optional<std::string> extract_masked_barcode_exact(
+    std::string_view sequence,
+    std::string_view pattern,
+    size_t position,
+    bool is_rc) {
+    const size_t capture_length = scan_masked_capture_length(pattern);
+    if (capture_length == 0 || position > sequence.size() ||
+        pattern.size() > sequence.size() - position) {
+        return std::nullopt;
+    }
+
+    std::string barcode;
+    barcode.reserve(capture_length);
+    for (size_t query_position = 0;
+         query_position < pattern.size(); ++query_position) {
+        if (pattern[query_position] != 'N') {
+            continue;
+        }
+        const char base = sequence[position + query_position];
+        if (!is_canonical_scan_base(base)) {
+            return std::nullopt;
+        }
+        barcode.push_back(base);
+    }
+
+    if (is_rc) {
+        barcode = seq_utils::revcomp(barcode);
+    }
+    return barcode;
+}
+
+static inline std::optional<std::string> extract_masked_barcode_alignment(
+    std::string_view sequence,
+    std::string_view pattern,
+    const EdlibAlignResult& result,
+    bool is_rc) {
+    const size_t capture_length = scan_masked_capture_length(pattern);
+    if (capture_length == 0 || result.numLocations <= 0 ||
+        result.startLocations == nullptr || result.alignment == nullptr ||
+        result.alignmentLength <= 0 || result.startLocations[0] < 0) {
+        return std::nullopt;
+    }
+
+    size_t query_position = 0;
+    size_t target_position =
+        static_cast<size_t>(result.startLocations[0]);
+    std::string barcode;
+    barcode.reserve(capture_length);
+
+    // Edlib can place an equally optimal one-base gap anywhere within a
+    // repeated literal run. Treat every equivalent position as a boundary:
+    // otherwise the forward and reverse alignments can report different
+    // captures for the same molecule.
+    auto gap_touches_capture = [&](size_t position, char base, bool deleted_query) {
+        size_t first = position;
+        size_t last = position + (deleted_query ? 1 : 0);
+        while (first > 0 && pattern[first - 1] == base) --first;
+        while (last < pattern.size() && pattern[last] == base) ++last;
+        return (first > 0 && pattern[first - 1] == 'N') ||
+               (last < pattern.size() && pattern[last] == 'N');
+    };
+
+    for (int i = 0; i < result.alignmentLength; ++i) {
+        const unsigned char operation = result.alignment[i];
+        if (operation == EDLIB_EDOP_MATCH ||
+            operation == EDLIB_EDOP_MISMATCH) {
+            if (query_position >= pattern.size() ||
+                target_position >= sequence.size()) {
+                return std::nullopt;
+            }
+            if (pattern[query_position] == 'N') {
+                const char base = sequence[target_position];
+                if (!is_canonical_scan_base(base)) {
+                    return std::nullopt;
+                }
+                barcode.push_back(base);
+            }
+            ++query_position;
+            ++target_position;
+        } else if (operation == EDLIB_EDOP_INSERT) {
+            // A deleted pattern base at a capture boundary can shift a
+            // literal base into the reported barcode. Reject adjacent gaps
+            // in either direction, as for extra target bases below.
+            if (query_position >= pattern.size() ||
+                pattern[query_position] == 'N' ||
+                gap_touches_capture(query_position, pattern[query_position], true)) {
+                return std::nullopt;
+            }
+            ++query_position;
+        } else if (operation == EDLIB_EDOP_DELETE) {
+            // An extra target base next to a captured block makes the capture
+            // boundary ambiguous. Indels wholly within literal/search-only
+            // sequence remain valid.
+            const bool touches_capture = target_position < sequence.size() &&
+                gap_touches_capture(query_position, sequence[target_position], false);
+            if (touches_capture || target_position >= sequence.size()) {
+                return std::nullopt;
+            }
+            ++target_position;
+        } else {
+            return std::nullopt;
+        }
+    }
+
+    if (query_position != pattern.size() ||
+        barcode.size() != capture_length) {
+        return std::nullopt;
+    }
+    if (is_rc) {
+        barcode = seq_utils::revcomp(barcode);
+    }
+    return barcode;
+}
+
+static inline std::optional<size_t> find_masked_zero_edit_adapter_match(
+    std::string_view sequence, std::string_view adapter) {
+    const auto literal_position = sequence.find(adapter);
+    const bool pattern_has_wildcards =
+        adapter.find_first_of("Nn") != std::string_view::npos;
+    if (!pattern_has_wildcards) {
+        if (literal_position == 0) {
+            return 0;
+        }
+        const size_t relevant_prefix =
+            literal_position == std::string_view::npos
+                ? sequence.size()
+                : std::min(
+                      sequence.size(),
+                      literal_position + adapter.size() - 1);
+        if (sequence.substr(0, relevant_prefix).find_first_of("Nn") ==
+            std::string_view::npos) {
+            return literal_position == std::string_view::npos
+                       ? std::nullopt
+                       : std::optional<size_t>(literal_position);
+        }
+    }
+    if (adapter.size() > sequence.size()) {
+        return std::nullopt;
+    }
+
+    auto equal_with_n = [pattern_has_wildcards](
+                            char sequence_base, char pattern_base) {
+        if (is_scan_wildcard(pattern_base)) {
+            return is_canonical_scan_base(sequence_base);
+        }
+        if (sequence_base == pattern_base) {
+            return true;
+        }
+        return !pattern_has_wildcards &&
+               sequence_base == 'N' &&
+               is_canonical_scan_base(pattern_base);
+    };
+
+    const size_t final_start = sequence.size() - adapter.size();
+    for (size_t start = 0; start <= final_start; ++start) {
+        size_t offset = 0;
+        while (offset < adapter.size() &&
+               equal_with_n(sequence[start + offset], adapter[offset])) {
+            ++offset;
+        }
+        if (offset == adapter.size()) {
+            return start;
+        }
+    }
+    return std::nullopt;
+}
+
+static inline std::optional<size_t> find_exact_scan_pattern_match(
+    std::string_view sequence, std::string_view pattern) {
+    if (pattern.find_first_of("Nn") != std::string_view::npos) {
+        return find_masked_zero_edit_adapter_match(sequence, pattern);
+    }
+    const size_t position = sequence.find(pattern);
+    return position == std::string_view::npos
+               ? std::nullopt
+               : std::optional<size_t>(position);
+}
+
+static inline std::optional<adapter_match> find_masked_adapter_match(
+    std::string_view sequence,
+    const std::string& adapter_seq,
+    const std::string& adapter_seq_rc,
+    const std::string& adapter_alignment_seq,
+    const std::string& adapter_alignment_seq_rc,
+    bool exact_match_only,
+    const EdlibAlignConfig& forward_config,
+    const EdlibAlignConfig& rc_config) {
+    // Edlib's HW/LOC empty-target result reports one location but does not
+    // allocate startLocations. Treat an empty read as having no adapter.
+    if (sequence.empty()) {
+        return std::nullopt;
+    }
+
+    const bool capture_masked_bases =
+        scan_masked_capture_length(adapter_seq) > 0;
+    const bool pattern_has_wildcards =
+        adapter_seq.find_first_of("Nn") != std::string::npos;
+
+    auto direct_match = [&](size_t position, const std::string& pattern,
+                            bool is_rc) -> std::optional<adapter_match> {
+        if (position > static_cast<size_t>(
+                           std::numeric_limits<int>::max()) ||
+            pattern.size() > static_cast<size_t>(std::numeric_limits<int>::max()) - position) {
+            return std::nullopt;
+        }
+        if (!capture_masked_bases) {
+            return adapter_match{
+                static_cast<int>(position), static_cast<int>(position + pattern.size()), is_rc, ""};
+        }
+        auto barcode = extract_masked_barcode_exact(
+            sequence, pattern, position, is_rc);
+        if (!barcode) {
+            return std::nullopt;
+        }
+        return adapter_match{
+            static_cast<int>(position), static_cast<int>(position + pattern.size()), is_rc, std::move(*barcode)};
+    };
+
+    // Exact hits are globally optimal. Check both orientations before fuzzy
+    // alignment so a one-edit forward hit cannot hide an exact reverse hit.
+    const auto forward_pos = exact_match_only
+        ? find_exact_scan_pattern_match(sequence, adapter_seq)
+        : find_masked_zero_edit_adapter_match(sequence, adapter_seq);
+    if (forward_pos) {
+        auto match = direct_match(*forward_pos, adapter_seq, false);
+        if (match) {
+            return match;
+        }
+    }
+    if (exact_match_only || pattern_has_wildcards) {
+        const auto rc_pos = exact_match_only
+            ? find_exact_scan_pattern_match(sequence, adapter_seq_rc)
+            : find_masked_zero_edit_adapter_match(sequence, adapter_seq_rc);
+        if (rc_pos) {
+            auto match = direct_match(*rc_pos, adapter_seq_rc, true);
+            if (match) {
+                return match;
+            }
+        }
+    }
+    if (exact_match_only) {
+        return std::nullopt;
+    }
+
+    using scored_adapter_match = std::pair<adapter_match, int>;
+    auto fuzzy_match = [&](const std::string& alignment_pattern,
+                           const std::string& original_pattern,
+                           const EdlibAlignConfig& config,
+                           bool is_rc)
+        -> std::optional<scored_adapter_match> {
+        EdlibAlignResult result = edlibAlign(
+            alignment_pattern.c_str(), alignment_pattern.length(),
+            sequence.data(), sequence.length(), config);
+        std::optional<adapter_match> match;
+        const int edit_distance = result.editDistance;
+        if (result.status == EDLIB_STATUS_OK &&
+            result.numLocations > 0 &&
+            result.startLocations != nullptr && result.endLocations != nullptr &&
+            result.startLocations[0] >= 0 && result.endLocations[0] >= result.startLocations[0] &&
+            result.endLocations[0] < std::numeric_limits<int>::max()) {
+            const int position = result.startLocations[0];
+            if (!capture_masked_bases) {
+                match = adapter_match{position, result.endLocations[0] + 1, is_rc, ""};
+            } else {
+                auto barcode = extract_masked_barcode_alignment(
+                    sequence, original_pattern, result, is_rc);
+                if (barcode) {
+                    match = adapter_match{
+                        position, result.endLocations[0] + 1, is_rc, std::move(*barcode)};
+                }
+            }
+        }
+        edlibFreeAlignResult(result);
+        if (!match) {
+            return std::nullopt;
+        }
+        return scored_adapter_match{
+            std::move(*match), edit_distance};
+    };
+
+    if (!pattern_has_wildcards) {
+        // Preserve the historical forward-first search order for ordinary
+        // literal adapters. The two-strand score comparison below is specific
+        // to masked patterns, where choosing the wrong strand changes the
+        // captured barcode itself.
+        auto forward_match = fuzzy_match(
+            adapter_alignment_seq, adapter_seq,
+            forward_config, false);
+        if (forward_match) {
+            return std::move(forward_match->first);
+        }
+        const auto rc_pos =
+            find_masked_zero_edit_adapter_match(sequence, adapter_seq_rc);
+        if (rc_pos) {
+            auto match = direct_match(*rc_pos, adapter_seq_rc, true);
+            if (match) {
+                return match;
+            }
+        }
+        auto reverse_match = fuzzy_match(
+            adapter_alignment_seq_rc, adapter_seq_rc,
+            rc_config, true);
+        return reverse_match
+                   ? std::optional<adapter_match>(
+                         std::move(reverse_match->first))
+                   : std::nullopt;
+    }
+
+    auto forward_match = fuzzy_match(
+        adapter_alignment_seq, adapter_seq, forward_config, false);
+    auto reverse_match = fuzzy_match(
+        adapter_alignment_seq_rc, adapter_seq_rc, rc_config, true);
+    if (!forward_match) {
+        return reverse_match
+                   ? std::optional<adapter_match>(
+                         std::move(reverse_match->first))
+                   : std::nullopt;
+    }
+    if (!reverse_match ||
+        forward_match->second <= reverse_match->second) {
+        return std::move(forward_match->first);
+    }
+    return std::move(reverse_match->first);
+}
+
+static inline std::optional<adapter_match> find_scan_adapter_match(
+    std::string_view sequence, const std::string& adapter,
+    const std::string& reverse, bool exact, const EdlibAlignConfig& forward,
+    const EdlibAlignConfig& backward, bool masked_capture) {
+    if (!masked_capture) return find_adapter_match(sequence, adapter, reverse, exact, forward, backward);
+    return find_masked_adapter_match(sequence, adapter, reverse,
+        scan_alignment_pattern(adapter), scan_alignment_pattern(reverse), exact, forward, backward);
+}
+
 // Process a chunk of reads while retaining only extracted barcode strings.
 std::vector<std::string> process_read_chunk(const std::vector<read_chunk>& chunk,
                                             const std::string& adapter_seq,
                                             const std::string& adapter_seq_rc,
                                             int bc_length, int m_left, int m_right,
-                                            double max_edit_distance_ratio) {
+                                            double max_edit_distance_ratio, bool masked_capture = false) {
+    const bool capture_bases = masked_capture && scan_masked_capture_length(adapter_seq) > 0;
     std::vector<std::string> chunk_sequences;
     chunk_sequences.reserve(chunk.size() / 5);
 
-    const int max_edits_forward = compute_max_edit_distance(adapter_seq.length(), max_edit_distance_ratio);
-    const int max_edits_rc = compute_max_edit_distance(adapter_seq_rc.length(), max_edit_distance_ratio);
+    const int max_edits_forward = compute_max_edit_distance(masked_capture ? scan_adapter_error_basis_length(adapter_seq) : adapter_seq.length(), max_edit_distance_ratio);
+    const int max_edits_rc = compute_max_edit_distance(masked_capture ? scan_adapter_error_basis_length(adapter_seq_rc) : adapter_seq_rc.length(), max_edit_distance_ratio);
     const bool exact_match_only = (max_edits_forward == 0 && max_edits_rc == 0);
 
     EdlibAlignConfig forward_config{};
@@ -584,15 +1022,15 @@ std::vector<std::string> process_read_chunk(const std::vector<read_chunk>& chunk
         forward_config = edlibNewAlignConfig(
             max_edits_forward,
             EDLIB_MODE_HW,
-            EDLIB_TASK_LOC,
-            kWildcardEqualities,
-            8);
+            masked_capture ? EDLIB_TASK_PATH : EDLIB_TASK_LOC,
+            masked_capture ? kMaskedWildcardEqualities : kWildcardEqualities,
+            masked_capture ? kMaskedWildcardEqualityCount : 8);
         rc_config = edlibNewAlignConfig(
             max_edits_rc,
             EDLIB_MODE_HW,
-            EDLIB_TASK_LOC,
-            kWildcardEqualities,
-            8);
+            masked_capture ? EDLIB_TASK_PATH : EDLIB_TASK_LOC,
+            masked_capture ? kMaskedWildcardEqualities : kWildcardEqualities,
+            masked_capture ? kMaskedWildcardEqualityCount : 8);
     }
 
     const int worker_count = std::max(1, omp_get_max_threads());
@@ -617,12 +1055,12 @@ std::vector<std::string> process_read_chunk(const std::vector<read_chunk>& chunk
             }
             try {
                 const auto& read = chunk[i];
-                const auto match = find_adapter_match(
+                const auto match = find_scan_adapter_match(
                     read.sequence, adapter_seq, adapter_seq_rc,
-                    exact_match_only, forward_config, rc_config);
+                    exact_match_only, forward_config, rc_config, masked_capture);
                 if (!match) continue;
 
-                std::string barcode = extract_barcode(
+                std::string barcode = capture_bases ? match->masked_barcode : extract_barcode(
                     read.sequence, match->start, match->end,
                     bc_length, m_left, m_right, match->is_rc);
                 if (!barcode.empty()) {
@@ -659,14 +1097,15 @@ static packed_chunk_result process_read_chunk_packed(
     const std::string& adapter_seq,
     const std::string& adapter_seq_rc,
     int bc_length, int m_left, int m_right,
-    double max_edit_distance_ratio) {
+    double max_edit_distance_ratio, bool masked_capture = false) {
+    const bool capture_bases = masked_capture && scan_masked_capture_length(adapter_seq) > 0;
     packed_chunk_result out;
     out.barcodes.reserve(chunk.size() / 5);
 
     const int max_edits_forward =
-        compute_max_edit_distance(adapter_seq.length(), max_edit_distance_ratio);
+        compute_max_edit_distance(masked_capture ? scan_adapter_error_basis_length(adapter_seq) : adapter_seq.length(), max_edit_distance_ratio);
     const int max_edits_rc =
-        compute_max_edit_distance(adapter_seq_rc.length(), max_edit_distance_ratio);
+        compute_max_edit_distance(masked_capture ? scan_adapter_error_basis_length(adapter_seq_rc) : adapter_seq_rc.length(), max_edit_distance_ratio);
     const bool exact_match_only =
         max_edits_forward == 0 && max_edits_rc == 0;
 
@@ -674,11 +1113,11 @@ static packed_chunk_result process_read_chunk_packed(
     EdlibAlignConfig rc_config{};
     if (!exact_match_only) {
         forward_config = edlibNewAlignConfig(
-            max_edits_forward, EDLIB_MODE_HW, EDLIB_TASK_LOC,
-            kWildcardEqualities, 8);
+            max_edits_forward, EDLIB_MODE_HW, masked_capture ? EDLIB_TASK_PATH : EDLIB_TASK_LOC,
+            masked_capture ? kMaskedWildcardEqualities : kWildcardEqualities, masked_capture ? kMaskedWildcardEqualityCount : 8);
         rc_config = edlibNewAlignConfig(
-            max_edits_rc, EDLIB_MODE_HW, EDLIB_TASK_LOC,
-            kWildcardEqualities, 8);
+            max_edits_rc, EDLIB_MODE_HW, masked_capture ? EDLIB_TASK_PATH : EDLIB_TASK_LOC,
+            masked_capture ? kMaskedWildcardEqualities : kWildcardEqualities, masked_capture ? kMaskedWildcardEqualityCount : 8);
     }
 
     const int worker_count = std::max(1, omp_get_max_threads());
@@ -704,14 +1143,16 @@ static packed_chunk_result process_read_chunk_packed(
             }
             try {
                 const auto& sequence = chunk[i].sequence;
-                const auto match = find_adapter_match(
+                const auto match = find_scan_adapter_match(
                     sequence, adapter_seq, adapter_seq_rc,
-                    exact_match_only, forward_config, rc_config);
+                    exact_match_only, forward_config, rc_config, masked_capture);
                 if (!match) continue;
 
                 packed_scan_barcode packed = 0;
                 bool extracted = false;
-                const bool packable = extract_packed_barcode(
+                const bool packable = capture_bases
+                    ? (extracted = !match->masked_barcode.empty(), pack_scan_barcode(match->masked_barcode, packed))
+                    : extract_packed_barcode(
                     sequence, match->start, match->end,
                     bc_length, m_left, m_right, match->is_rc,
                     packed, extracted);
@@ -751,7 +1192,13 @@ barcode_count_result process_fastq(const std::string& input_path,
                                    int chunk_size = 10000,
                                    int num_threads = 0,
                                    scan_whitelist_filter* whitelist_filter = nullptr,
-                                   std::function<void()> boundary_poll = {}) {
+                                   std::function<void()> boundary_poll = {},
+                                   bool masked_capture = false) {
+    const bool capture_bases = masked_capture && scan_masked_capture_length(adapter_seq) > 0;
+    if (capture_bases && (scan_masked_capture_length(adapter_seq) != static_cast<size_t>(bc_length) ||
+            bc_length > 64 || m_left != 0 || m_right != 0)) {
+        throw std::invalid_argument("masked capture requires 1..64 uppercase N bases, matching barcode length, and zero margins");
+    }
     barcode_count_result results;
     if (chunk_size <= 0) {
         RAD_CERR << "Error: Chunk size must be greater than zero\n";
@@ -820,9 +1267,9 @@ barcode_count_result process_fastq(const std::string& input_path,
     
     if (use_serial_packed_extraction) {
         const int max_edits_forward = compute_max_edit_distance(
-            adapter_seq.length(), max_edit_distance_ratio);
+            masked_capture ? scan_adapter_error_basis_length(adapter_seq) : adapter_seq.length(), max_edit_distance_ratio);
         const int max_edits_rc = compute_max_edit_distance(
-            adapter_seq_rc.length(), max_edit_distance_ratio);
+            masked_capture ? scan_adapter_error_basis_length(adapter_seq_rc) : adapter_seq_rc.length(), max_edit_distance_ratio);
         const bool exact_match_only =
             max_edits_forward == 0 && max_edits_rc == 0;
 
@@ -830,11 +1277,11 @@ barcode_count_result process_fastq(const std::string& input_path,
         EdlibAlignConfig rc_config{};
         if (!exact_match_only) {
             forward_config = edlibNewAlignConfig(
-                max_edits_forward, EDLIB_MODE_HW, EDLIB_TASK_LOC,
-                kWildcardEqualities, 8);
+                max_edits_forward, EDLIB_MODE_HW, masked_capture ? EDLIB_TASK_PATH : EDLIB_TASK_LOC,
+                masked_capture ? kMaskedWildcardEqualities : kWildcardEqualities, masked_capture ? kMaskedWildcardEqualityCount : 8);
             rc_config = edlibNewAlignConfig(
-                max_edits_rc, EDLIB_MODE_HW, EDLIB_TASK_LOC,
-                kWildcardEqualities, 8);
+                max_edits_rc, EDLIB_MODE_HW, masked_capture ? EDLIB_TASK_PATH : EDLIB_TASK_LOC,
+                masked_capture ? kMaskedWildcardEqualities : kWildcardEqualities, masked_capture ? kMaskedWildcardEqualityCount : 8);
         }
 
         std::vector<packed_scan_barcode> packed_chunk;
@@ -856,13 +1303,15 @@ barcode_count_result process_fastq(const std::string& input_path,
             }
             ++reads_processed;
 
-            const auto match = find_adapter_match(
+            const auto match = find_scan_adapter_match(
                 *sequence, adapter_seq, adapter_seq_rc,
-                exact_match_only, forward_config, rc_config);
+                exact_match_only, forward_config, rc_config, masked_capture);
             if (match) {
                 packed_scan_barcode packed = 0;
                 bool extracted = false;
-                const bool packable = extract_packed_barcode(
+                const bool packable = capture_bases
+                    ? (extracted = !match->masked_barcode.empty(), pack_scan_barcode(match->masked_barcode, packed))
+                    : extract_packed_barcode(
                     *sequence, match->start, match->end,
                     bc_length, m_left, m_right, match->is_rc,
                     packed, extracted);
@@ -923,14 +1372,14 @@ barcode_count_result process_fastq(const std::string& input_path,
         if (use_direct_packed_extraction) {
             auto packed_results = process_read_chunk_packed(
                 chunk, adapter_seq, adapter_seq_rc, bc_length,
-                m_left, m_right, max_edit_distance_ratio);
+                m_left, m_right, max_edit_distance_ratio, masked_capture);
             results.total_extractions += packed_results.total_extractions;
             merge_packed_whitelist_counts(
                 packed_results.barcodes, *whitelist_filter);
         } else {
             auto chunk_results = process_read_chunk(
                 chunk, adapter_seq, adapter_seq_rc, bc_length,
-                m_left, m_right, max_edit_distance_ratio);
+                m_left, m_right, max_edit_distance_ratio, masked_capture);
             results.total_extractions +=
                 static_cast<uint64_t>(chunk_results.size());
 
@@ -962,8 +1411,7 @@ barcode_count_result process_fastq(const std::string& input_path,
                 }
                 for (const auto& kv : long_chunk_counts) {
                     int64_seq encoded(kv.first);
-                    if (whitelist_filter->long_barcodes.find(encoded) !=
-                        whitelist_filter->long_barcodes.end()) {
+                    if (whitelist_filter->long_barcodes.contains(encoded)) {
                         auto inserted =
                             results.counts.try_emplace(kv.first, 0);
                         inserted.first->second += kv.second;
@@ -1043,9 +1491,9 @@ split_whitelist load_split_whitelist_csv(
             "numeric split-barcode whitelist requires an explicit barcode "
             "length: " + path);
     }
-    if (packed_length && (*packed_length == 0 || *packed_length > 32)) {
+    if (packed_length && (*packed_length == 0 || *packed_length > 64)) {
         throw std::invalid_argument(
-            "split-barcode bitlist length must be between 1 and 32");
+            "split-barcode bitlist length must be between 1 and 64");
     }
 
     std::unique_ptr<std::istream> input;
@@ -1120,34 +1568,12 @@ split_whitelist load_split_whitelist_csv(
                     std::to_string(line_number) + " in " + path + ": " +
                     token);
             }
-            size_t consumed = 0;
-            uint64_t raw_bits = 0;
-            try {
-                raw_bits = std::stoull(token, &consumed);
-            } catch (const std::exception&) {
-                throw std::runtime_error(
-                    "invalid packed split-barcode value at line " +
-                    std::to_string(line_number) + " in " + path + ": " +
-                    token);
+            int64_seq encoded;
+            if (!parse_packed_decimal(token, *packed_length, encoded, true)) {
+                throw std::runtime_error("packed split-barcode value exceeds the declared length or is invalid at line " +
+                    std::to_string(line_number) + " in " + path);
             }
-            if (consumed != token.size()) {
-                throw std::runtime_error(
-                    "invalid packed split-barcode value at line " +
-                    std::to_string(line_number) + " in " + path + ": " +
-                    token);
-            }
-            if (*packed_length < 32) {
-                const uint64_t max_bits =
-                    (uint64_t{1} << (2 * *packed_length)) - 1;
-                if (raw_bits > max_bits) {
-                    throw std::runtime_error(
-                        "packed split-barcode value exceeds the declared "
-                        "length at line " + std::to_string(line_number) +
-                        " in " + path);
-                }
-            }
-            barcode = int64_seq(static_cast<int64_t>(raw_bits),
-                                *packed_length).bits_to_sequence();
+            barcode = encoded.bits_to_sequence();
         } else {
             if (!is_canonical_barcode(token)) {
                 throw std::runtime_error(
@@ -1289,19 +1715,21 @@ std::vector<extracted_bc> process_read_chunk_split_barcode(
     const std::vector<int>& bc2_lengths,
     int search_extra_min,
     int search_extra_max,
-    double max_edit_distance_ratio)
+    double max_edit_distance_ratio, bool masked_pattern = false)
 {
     std::vector<extracted_bc> chunk_results;
     chunk_results.reserve(chunk.size() / 5);
 
-    const int max_edits_fwd = compute_max_edit_distance(adapter_seq.size(), max_edit_distance_ratio);
-    const int max_edits_rc  = compute_max_edit_distance(adapter_seq_rc.size(), max_edit_distance_ratio);
+    const int max_edits_fwd = compute_max_edit_distance(masked_pattern ? scan_adapter_error_basis_length(adapter_seq) : adapter_seq.size(), max_edit_distance_ratio);
+    const int max_edits_rc  = compute_max_edit_distance(masked_pattern ? scan_adapter_error_basis_length(adapter_seq_rc) : adapter_seq_rc.size(), max_edit_distance_ratio);
     const bool exact_only   = (max_edits_fwd == 0 && max_edits_rc == 0);
 
+    const auto forward_pattern = masked_pattern ? scan_alignment_pattern(adapter_seq) : adapter_seq;
+    const auto reverse_pattern = masked_pattern ? scan_alignment_pattern(adapter_seq_rc) : adapter_seq_rc;
     EdlibAlignConfig fwd_cfg{}, rc_cfg{};
     if (!exact_only) {
-        fwd_cfg = edlibNewAlignConfig(max_edits_fwd, EDLIB_MODE_HW, EDLIB_TASK_LOC, kWildcardEqualities, 8);
-        rc_cfg  = edlibNewAlignConfig(max_edits_rc,  EDLIB_MODE_HW, EDLIB_TASK_LOC, kWildcardEqualities, 8);
+        fwd_cfg = edlibNewAlignConfig(max_edits_fwd, EDLIB_MODE_HW, EDLIB_TASK_LOC, masked_pattern ? kMaskedWildcardEqualities : kWildcardEqualities, masked_pattern ? kMaskedWildcardEqualityCount : 8);
+        rc_cfg  = edlibNewAlignConfig(max_edits_rc,  EDLIB_MODE_HW, EDLIB_TASK_LOC, masked_pattern ? kMaskedWildcardEqualities : kWildcardEqualities, masked_pattern ? kMaskedWildcardEqualityCount : 8);
     }
 
     const int worker_count = std::max(1, omp_get_max_threads());
@@ -1347,8 +1775,7 @@ std::vector<extracted_bc> process_read_chunk_split_barcode(
                 };
 
                 if (exact_only) {
-                    auto pos = find_zero_edit_adapter_match(
-                        read.sequence, adapter_seq);
+                    auto pos = masked_pattern ? find_exact_scan_pattern_match(read.sequence, adapter_seq) : find_zero_edit_adapter_match(read.sequence, adapter_seq);
                     if (pos &&
                         *pos + adapter_seq.size() <=
                             static_cast<size_t>(
@@ -1357,8 +1784,7 @@ std::vector<extracted_bc> process_read_chunk_split_barcode(
                                  static_cast<int>(*pos + adapter_seq.size()),
                                  false);
                     } else {
-                        pos = find_zero_edit_adapter_match(
-                            read.sequence, adapter_seq_rc);
+                        pos = masked_pattern ? find_exact_scan_pattern_match(read.sequence, adapter_seq_rc) : find_zero_edit_adapter_match(read.sequence, adapter_seq_rc);
                         if (pos && read.sequence.size() <=
                                        static_cast<size_t>(
                                            std::numeric_limits<int>::max())) {
@@ -1375,7 +1801,7 @@ std::vector<extracted_bc> process_read_chunk_split_barcode(
                 // Fuzzy forward
                 bool found = false;
                 EdlibAlignResult res = edlibAlign(
-                    adapter_seq.c_str(), adapter_seq.size(),
+                    forward_pattern.c_str(), forward_pattern.size(),
                     read.sequence.c_str(), read.sequence.size(), fwd_cfg);
                 if (res.status == EDLIB_STATUS_OK && res.numLocations > 0) {
                     found = try_pair(
@@ -1385,7 +1811,7 @@ std::vector<extracted_bc> process_read_chunk_split_barcode(
 
                 if (!found) {
                     res = edlibAlign(
-                        adapter_seq_rc.c_str(), adapter_seq_rc.size(),
+                        reverse_pattern.c_str(), reverse_pattern.size(),
                         read.sequence.c_str(), read.sequence.size(), rc_cfg);
                     if (res.status == EDLIB_STATUS_OK && res.numLocations > 0) {
                         std::string rc_seq =
@@ -1435,9 +1861,11 @@ split_barcode_count_result process_fastq_split_barcode(
     double max_edit_distance_ratio = kDefaultScanWlMaxErrorRatio,
     int chunk_size = 10000,
     int num_threads = 0,
-    std::function<void()> boundary_poll = {})
+    std::function<void()> boundary_poll = {}, bool masked_pattern = false)
 {
     split_barcode_count_result results;
+    if (masked_pattern && scan_masked_capture_length(adapter_seq))
+        throw std::invalid_argument("Split scans use lowercase n for wildcards; uppercase N capture is not supported");
 
     if (chunk_size <= 0) {
         throw std::invalid_argument(
@@ -1509,7 +1937,7 @@ split_barcode_count_result process_fastq_split_barcode(
         auto chunk_res = process_read_chunk_split_barcode(
             chunk, adapter_seq, adapter_seq_rc,
             umi_length, bc1_set, bc1_lengths, bc2_set, bc2_lengths,
-            search_extra_min, search_extra_max, max_edit_distance_ratio);
+            search_extra_min, search_extra_max, max_edit_distance_ratio, masked_pattern);
         results.total_extractions +=
             static_cast<uint64_t>(chunk_res.size());
         for (const auto& hit : chunk_res) {
@@ -1829,6 +2257,7 @@ struct whitelist_scan_stats {
     size_t selected_barcodes = 0;
     scan_whitelist_selection selection =
         scan_whitelist_selection::high_specificity;
+    bool spatial_low_counts = false;
 };
 
 inline bool write_whitelist_scan_log(const std::string& output_path,
@@ -1846,6 +2275,7 @@ inline bool write_whitelist_scan_log(const std::string& output_path,
         << "input=" << input_path << "\n"
         << "selection=" << scan_whitelist_selection_name(stats.selection)
         << "\n"
+        << "calling_profile=" << (stats.spatial_low_counts ? "spatial_low_counts" : "standard") << "\n"
         << "reads_processed=" << stats.reads_processed << "\n"
         << "total_extractions=" << stats.total_extractions << "\n"
         << "unique_sequences=" << stats.unique_sequences << "\n"
@@ -3089,14 +3519,16 @@ evaluate_adaptive_hazard_saddle(
     return result;
 }
 
+template <typename WhitelistSet = std::unordered_set<int64_seq>>
 bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barcodes,
-                                      const std::unordered_set<int64_seq>& whitelist_set,
+                                      const WhitelistSet& whitelist_set,
                                       const std::string& output_csv, const std::string text_out,
                                       bool verbose = false,
                                       scan_whitelist_selection selection =
                                           scan_whitelist_selection::high_specificity,
                                       whitelist_scan_stats* summary = nullptr,
-                                      const std::function<void()>& boundary_poll = {})
+                                      const std::function<void()>& boundary_poll = {},
+                                      bool spatial_low_counts = false)
 {
     constexpr size_t INTERRUPT_POLL_INTERVAL = 4096;
     size_t work_since_poll = 0;
@@ -3152,7 +3584,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         // Skip if whitelist provided and sequence not in whitelist
         if (use_whitelist && !extracted_barcodes.filtered_to_whitelist) {
             int64_seq encoded(seq);
-            if (whitelist_set.find(encoded) == whitelist_set.end()) {
+            if (!scan_whitelist_contains(whitelist_set, encoded)) {
                 continue;
             }
         }
@@ -3200,7 +3632,9 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
     // default.  It moves left only when the upper-tail hazard has the same
     // prominent interior minimum across three bandwidths and that move adds a
     // material, well-supported population.
-    const double LEGACY_FLOOR = 2.0;
+    const double LEGACY_FLOOR = spatial_low_counts && total_reads > 0.0
+        ? std::min(2.0, std::log1p((1.0 / total_reads) * 1e6)) : 2.0;
+    const double hazard_search_min = spatial_low_counts ? std::min(1.0, LEGACY_FLOOR) : 1.0;
     const double ZTPOIS_RULE = 95.0; // fallback percentile if saddle/50% fail
 
     std::vector<double> legacy_af_x;
@@ -3238,7 +3672,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         }
         adaptive_floor = compute_adaptive_hazard_floor(
             hazard_scores, adaptive_bandwidth, LEGACY_FLOOR,
-            /*search_min=*/1.0, /*min_side_barcodes=*/50,
+            /*search_min=*/hazard_search_min, /*min_side_barcodes=*/50,
             /*min_absolute_gain=*/50,
             /*min_fractional_gain=*/0.01,
             /*max_stability_spread_h=*/0.5,
@@ -3416,7 +3850,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         hazard_result = compute_upper_tail_adjusted_hazard(
             hazard_scores, sd.bw, preliminary_floor,
             preliminary_threshold, upper_mode_bound,
-            /*search_min=*/1.0, /*min_survivors=*/50,
+            /*search_min=*/hazard_search_min, /*min_survivors=*/50,
             /*min_prominence=*/0.05);
         poll_now();
     }
@@ -3955,6 +4389,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         summary->floor = FLOOR;
         summary->threshold = threshold;
         summary->threshold_rule = rule;
+        summary->spatial_low_counts = spatial_low_counts;
         summary->above_floor_barcodes = n_above_floor;
         summary->final_barcodes = n_final;
         summary->selected_barcodes = selected_barcodes.size();
@@ -3987,14 +4422,16 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
 // Two-part barcode mode still needs the observed BC1/BC2 pairs for its pair
 // matrix outputs.  Collapse its combined sequences before entering the shared
 // statistics path and, critically, avoid reserving hash buckets for every read.
+template <typename WhitelistSet = std::unordered_set<int64_seq>>
 bool count_perfect_matches_with_stats(const split_barcode_count_result& extracted_barcodes,
-                                      const std::unordered_set<int64_seq>& whitelist_set,
+                                      const WhitelistSet& whitelist_set,
                                       const std::string& output_csv, const std::string text_out,
                                       bool verbose = false,
                                       scan_whitelist_selection selection =
                                           scan_whitelist_selection::high_specificity,
                                       whitelist_scan_stats* summary = nullptr,
-                                      const std::function<void()>& boundary_poll = {})
+                                      const std::function<void()>& boundary_poll = {},
+                                      bool spatial_low_counts = false)
 {
     barcode_count_result counts;
     counts.reads_processed = extracted_barcodes.reads_processed;
@@ -4013,7 +4450,7 @@ bool count_perfect_matches_with_stats(const split_barcode_count_result& extracte
     }
     return count_perfect_matches_with_stats(
         counts, whitelist_set, output_csv, text_out, verbose, selection,
-        summary, boundary_poll);
+        summary, boundary_poll, spatial_low_counts);
 }
 
 struct scan_wl_rescan_input {
@@ -4273,6 +4710,8 @@ inline std::string default_scan_wl_rescan_prefix(std::string input_path) {
     return input_path + "_rescan";
 }
 
+
+#include "spatial_scan.hpp"
 
 void usage_scan_wl(const char* program_name) {
     RAD_COUT << "Usage: " << program_name << " [options]\n"

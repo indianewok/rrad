@@ -321,15 +321,18 @@ test_that("embedded seqspec rejects remote onlists without network access", {
   expect_equal(global$stats$loaded_global_barcodes, 2)
 })
 
-test_that("padded barcode correction works through 32 bases and rejects 33", {
-  work <- tempfile("rad-core-32-base-barcode-")
+test_that("padded barcode correction works through 64 bases and rejects 65", {
+  work <- tempfile("rad-core-64-base-barcode-")
   dir.create(work)
   on.exit(unlink(work, recursive = TRUE), add = TRUE)
-  longest_barcode <- "GACCTAGTTCAGGATCCGTAACGTTCGAGTGC"
+  longest_barcode <- paste0(
+    "GACCTAGTTCAGGATCCGTAACGTTCGAGTGC",
+    "TAGCATCGAGTCCTAGACTGACGATCTGATCG"
+  )
   whitelist <- file.path(work, "barcodes.txt")
   layout <- file.path(work, "layout.csv")
   fastq <- file.path(work, "reads.fastq")
-  for (barcode_length in c(24L, 25L, 32L)) {
+  for (barcode_length in c(24L, 25L, 32L, 33L, 57L, 63L, 64L)) {
     barcode <- substr(longest_barcode, 1L, barcode_length)
     writeLines(barcode, whitelist)
     writeLines(c(
@@ -369,14 +372,14 @@ test_that("padded barcode correction works through 32 bases and rejects 33", {
 
   writeLines(paste0(longest_barcode, "G"), whitelist)
   layout_lines <- readLines(layout)
-  layout_lines[4] <- paste0("barcode,,33,variable,barcode,", whitelist)
+  layout_lines[4] <- paste0("barcode,,65,variable,barcode,", whitelist)
   writeLines(layout_lines, layout)
   expect_error(
     rad_demux(
-      layout, fastq, file.path(work, "too-long"), output = "packed33",
+      layout, fastq, file.path(work, "too-long"), output = "packed65",
       threads = 1L, whitelist_mutation = 0L, generated_mutation = 0L
     ),
-    "barcode length must be between 1 and 32 bases"
+    "64 bases"
   )
 })
 
@@ -1162,9 +1165,9 @@ test_that("rad_demux validates inputs before native execution", {
   expect_error(
     rad_demux(
       layout, fastq, out_dir, auto_whitelist = TRUE,
-      scan_barcode_length = 33L
+      scan_barcode_length = 65L
     ),
-    "scan_barcode_length must be between 1 and 32"
+    "scan_barcode_length must be between 1 and 64"
   )
   expect_error(
     rad_demux(

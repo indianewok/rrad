@@ -386,8 +386,8 @@ test_that("rad_scan_wl rejects invalid and contradictory configurations", {
   expect_error(rad_scan_wl(input, adapter_seq = "ACGT", barcode_length = 0),
                "barcode_length")
   expect_error(
-    rad_scan_wl(input, adapter_seq = "ACGT", barcode_length = 33L),
-    "barcode_length must be between 1 and 32"
+    rad_scan_wl(input, adapter_seq = "ACGT", barcode_length = 65L),
+    "barcode_length must be between 1 and 64"
   )
   expect_error(rad_scan_wl(input, adapter_seq = "ACGT", left_margin = -1),
                "left_margin")
@@ -441,9 +441,9 @@ test_that("rad_scan_wl rejects invalid and contradictory configurations", {
     rad_scan_wl(
       input, adapter_seq = "ACGT",
       bc1_whitelist = "splitseq_bc1", bc2_whitelist = "splitseq_bc2",
-      bc1_length = 33L
+      bc1_length = 65L
     ),
-    "bc1_length must be between 1 and 32"
+    "bc1_length must be between 1 and 64"
   )
   expect_error(
     rad_scan_wl(input, adapter_seq = "ACGT", offset_min = 2L,

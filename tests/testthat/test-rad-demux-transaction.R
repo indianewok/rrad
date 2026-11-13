@@ -270,9 +270,9 @@ test_that("native scan error ratios are bounded before entering Edlib", {
       input = file.path(fixture_dir, "tiny.fastq"),
       output_prefix = tempfile("rrad-scan-length-bound-"),
       adapter_seq = "ACGT",
-      barcode_length = 33L
+      barcode_length = 65L
     )),
-    "`barcode_length` must be between 1 and 32"
+    "`barcode_length` must be between 1 and 64"
   )
   expect_error(
     demux_cpp(list(
@@ -292,9 +292,9 @@ test_that("native scan error ratios are bounded before entering Edlib", {
       output_dir = tempfile("rrad-demux-length-bound-"),
       output_prefix = "bounded",
       auto_whitelist = TRUE,
-      scan_barcode_length = 33L
+      scan_barcode_length = 65L
     )),
-    "`scan_barcode_length` must be between 1 and 32"
+    "`scan_barcode_length` must be between 1 and 64"
   )
   expect_error(
     demux_cpp(list(

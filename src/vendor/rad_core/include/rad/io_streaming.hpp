@@ -939,9 +939,15 @@ public:
 
     inline void pigz_write(FILE* fp, const char* data, size_t n) {
         if (!n) return;
-        size_t w = std::fwrite(data, 1, n, fp);
-        if (w != n) {
-            throw std::runtime_error("pigz_write: partial write");
+        size_t written = 0;
+        while (written < n) {
+            errno = 0;
+            const size_t count = std::fwrite(data + written, 1, n - written, fp);
+            written += count;
+            if (written == n) break;
+            const int error = errno ? errno : EIO;
+            if (error == EINTR) { std::clearerr(fp); continue; }
+            throw std::system_error(error, std::generic_category(), "writing RAD output");
         }
     }
 
@@ -954,67 +960,66 @@ public:
 
 class sigstring_writing {
 public:
-    enum class format { 
-        FASTQA, 
-        SIGSTRING, 
-        CSV 
-    };
+    enum class format { FASTQA, SIGSTRING, CSV };
 
 private:
-    // Common
     format fmt;
     bool compress_;
     bool use_pigz_ = false;
-    bool rc_umi_ = true; // reverse-complement UMIs on reverse reads (FASTQA only)
+    bool rc_umi_ = true;
     bool finalized_ = false;
     std::string output_path_;
-
-    // --- pigz path ---
+    FILE* stream_fp_ = nullptr; // Non-owning: the caller retains its stream.
     pigz_writing pigz_;
     FILE* pigz_fp_ = nullptr;
     std::string pigz_buf_;
-    size_t pigz_flush_threshold_ = (8u << 20); // 8MB
-
-    // --- in-process zlib/plain path ---
+    size_t pigz_flush_threshold_ = (8u << 20);
     std::ofstream file_;
     std::unique_ptr<ogzstream> gzip_file_;
     std::ostream* out_ = nullptr;
 
-    inline void pigz_flush_if_big_() {
-        if (pigz_buf_.size() >= pigz_flush_threshold_) {
-            pigz_.pigz_write(pigz_fp_, pigz_buf_.data(), pigz_buf_.size());
-            pigz_buf_.clear();
+    static void flush_stream(FILE* stream) {
+        while (true) {
+            errno = 0;
+            if (std::fflush(stream) == 0) return;
+            const int error = errno ? errno : EIO;
+            if (error == EINTR) { std::clearerr(stream); continue; }
+            throw std::system_error(error, std::generic_category(), "flushing RAD output");
         }
     }
 
-    template <typename T>
-    inline void write_one_(const T& item) {
+    void write_bytes(const std::string& text) {
+        if (finalized_) throw std::logic_error("write attempted after finalizing: " + output_path_);
+        if (text.empty()) return;
+        if (stream_fp_) {
+            pigz_.pigz_write(stream_fp_, text.data(), text.size());
+        } else if (use_pigz_) {
+            pigz_buf_.append(text);
+            if (pigz_buf_.size() >= pigz_flush_threshold_) {
+                pigz_.pigz_write(pigz_fp_, pigz_buf_.data(), pigz_buf_.size());
+                pigz_buf_.clear();
+            }
+        } else {
+            out_->write(text.data(), static_cast<std::streamsize>(text.size()));
+            if (!*out_) throw std::runtime_error("output write failed: " + output_path_);
+        }
+    }
+
+    template <typename T> void write_one(const T& item) {
         switch (fmt) {
-            case format::FASTQA:
-                if (use_pigz_) { pigz_buf_.append(item.to_fastqa(rc_umi_)); pigz_flush_if_big_(); }
-                else           { (*out_) << item.to_fastqa(rc_umi_); }
-                break;
-            case format::SIGSTRING:
-                if (use_pigz_) { pigz_buf_.append(item.to_sigstring()); pigz_buf_.push_back('\n'); pigz_flush_if_big_(); }
-                else           { (*out_) << item.to_sigstring() << "\n"; }
-                break;
-            case format::CSV:
-                if (use_pigz_) { pigz_buf_.append(item.to_csv()); pigz_flush_if_big_(); }
-                else           { (*out_) << item.to_csv(); }
-                break;
+            case format::FASTQA: write_bytes(item.to_fastqa(rc_umi_)); break;
+            case format::SIGSTRING: write_bytes(item.to_sigstring() + "\n"); break;
+            case format::CSV: write_bytes(item.to_csv()); break;
         }
     }
 
 public:
-    /// @param output_path   base filename ("myout"), will add ".gz" if compress==true and it isn't present
-    /// @param output_format which of the three formats to emit
-    /// @param compress      if true, writes gzipped output (pigz if available; else zlib/boost)
-    /// @param append        if true, opens in append mode; otherwise truncates
-    /// @param pigz_threads  pigz worker threads (ignored if not using pigz)
-    /// @param level         gzip compression level [1..9]
     sigstring_writing(std::string output_path, format output_format, bool compress, bool append, int pigz_threads, int level=1)
         : fmt(output_format), compress_(compress)
     {
+        if (compress_ && append) {
+            throw std::invalid_argument("Appending compressed RAD output is not supported by the embedded backend");
+        }
         std::ios_base::openmode mode =
             std::ios::out | std::ios::binary | (append ? std::ios::app : std::ios::trunc);
 
@@ -1053,127 +1058,81 @@ public:
         }
     }
 
-    /// FASTQA only: if false, UMIs are written exactly as extracted (minus-strand
-    /// on reverse reads) instead of being flipped to plus-strand. Mirrors the
-    /// primary buffered path (SigString::to_fastqa_append) so --no-umi-rc is
-    /// honored by the debug FASTQA output too.
-    void set_rc_umi(bool v) { rc_umi_ = v; }
-
-    template<typename T>
-    void operator()(const std::vector<T>& chunk) {
-        if (chunk.empty()) return;
-        if (finalized_) {
-            throw std::runtime_error("write attempted after finalizing: " +
-                                     output_path_);
-        }
-        if (use_pigz_) {
-            // Build big uncompressed buffer for pigz (few syscalls, fewer context switches)
-            for (auto const& item : chunk) write_one_(item);
-        } else {
-            // Direct standard/gzip ostream path.
-            for (auto const& item : chunk) write_one_(item);
-            if (!out_ || !*out_) {
-                throw std::runtime_error("output write failed: " +
-                                         output_path_);
-            }
-        }
+    sigstring_writing(FILE* stream, format output_format)
+        : fmt(output_format), compress_(false), output_path_("[stream]"), stream_fp_(stream) {
+        if (!stream_fp_) throw std::invalid_argument("null sequence output stream");
     }
 
-    // Optional: adjust pigz flush size (in bytes)
+    void set_rc_umi(bool value) { rc_umi_ = value; }
     void set_pigz_flush_threshold(size_t bytes) { pigz_flush_threshold_ = bytes; }
 
+    template <typename T> void operator()(const std::vector<T>& chunk) {
+        for (const auto& item : chunk) write_one(item);
+        if (stream_fp_ && !chunk.empty()) flush_stream(stream_fp_);
+    }
+    void operator()(const std::string& text) {
+        write_bytes(text);
+        if (stream_fp_ && !text.empty()) flush_stream(stream_fp_);
+    }
+    void operator()(const std::vector<std::string>& texts) {
+        for (const auto& text : texts) write_bytes(text);
+        if (stream_fp_ && !texts.empty()) flush_stream(stream_fp_);
+    }
+
+    // Explicit finalization reports write/flush/close errors. Destruction
+    // performs fallback cleanup only, including after an interrupted caller.
     void finalize() {
         if (finalized_) return;
         finalized_ = true;
+        if (stream_fp_) { flush_stream(stream_fp_); return; }
         std::exception_ptr failure;
-
+        const auto remember = [&]() { if (!failure) failure = std::current_exception(); };
         if (use_pigz_) {
-            try {
-                if (!pigz_buf_.empty()) {
-                    pigz_.pigz_write(pigz_fp_, pigz_buf_.data(),
-                                     pigz_buf_.size());
-                    pigz_buf_.clear();
-                }
-            } catch (...) {
-                failure = std::current_exception();
-            }
-            if (pigz_fp_) {
-                if (std::fflush(pigz_fp_) != 0 && !failure) {
-                    failure = std::make_exception_ptr(std::runtime_error(
-                        "output flush failed: " + output_path_));
-                }
-                const int status = pclose(pigz_fp_);
-                pigz_fp_ = nullptr;
-                if (status != 0 && !failure) {
-                    failure = std::make_exception_ptr(std::runtime_error(
-                        "pigz close failed for " + output_path_ +
-                        " (status " + std::to_string(status) + ")"));
-                }
-            }
+            FILE* pipe = pigz_fp_;
+            pigz_fp_ = nullptr;
             use_pigz_ = false;
-        } else {
-            if (out_) {
-                out_->flush();
-                if (!*out_) {
-                    failure = std::make_exception_ptr(std::runtime_error(
-                        "output flush failed: " + output_path_));
-                }
+            try {
+                if (!pigz_buf_.empty()) pigz_.pigz_write(pipe, pigz_buf_.data(), pigz_buf_.size());
+            } catch (...) { remember(); }
+            pigz_buf_.clear();
+            try { flush_stream(pipe); } catch (...) { remember(); }
+            errno = 0;
+            const int status = pclose(pipe);
+            const int error = errno;
+            if (status != 0) {
+                try {
+                    if (status == -1) throw std::system_error(error ? error : EIO,
+                        std::generic_category(), "closing RAD output compressor");
+                    throw std::runtime_error("pigz close failed for " + output_path_ +
+                                             " (status " + std::to_string(status) + ")");
+                } catch (...) { remember(); }
             }
-            if (gzip_file_) {
-                gzip_file_->close();
-                if (!*gzip_file_ && !failure) {
-                    failure = std::make_exception_ptr(std::runtime_error(
-                        "gzip close failed: " + output_path_));
+        } else {
+            try {
+                if (out_) {
+                    out_->flush();
+                    if (!*out_) throw std::runtime_error("output flush failed: " + output_path_);
                 }
+            } catch (...) { remember(); }
+            if (gzip_file_) {
+                try {
+                    gzip_file_->close();
+                    if (!*gzip_file_) throw std::runtime_error("gzip close failed: " + output_path_);
+                } catch (...) { remember(); }
                 gzip_file_.reset();
             }
             if (file_.is_open()) {
-                file_.close();
-                if (file_.fail() && !failure) {
-                    failure = std::make_exception_ptr(std::runtime_error(
-                        "output close failed: " + output_path_));
-                }
+                try {
+                    file_.close();
+                    if (file_.fail()) throw std::runtime_error("output close failed: " + output_path_);
+                } catch (...) { remember(); }
             }
             out_ = nullptr;
         }
-
         if (failure) std::rethrow_exception(failure);
     }
-
-    ~sigstring_writing() noexcept {
-        try {
-            finalize();
-        } catch (...) {
-        }
-    }
-
-    // in sigstring_writing (public)
-    void operator()(const std::string& slab) {
-        if (slab.empty()) return;
-        if (finalized_) {
-            throw std::runtime_error("write attempted after finalizing: " +
-                                     output_path_);
-        }
-        if (use_pigz_) {
-            pigz_buf_.append(slab);
-            pigz_flush_if_big_();
-        } else {
-            out_->write(slab.data(), slab.size());
-            if (!*out_) {
-                throw std::runtime_error("output write failed: " +
-                                         output_path_);
-            }
-        }
-    }
-
-     // reuses the existing std::string overload
-    void operator()(const std::vector<std::string>& slabs) {
-        if (slabs.empty()) return;
-        for (auto const& s : slabs) {
-            (*this)(s); 
-        }
-    }
-
+    void finish() { finalize(); }
+    ~sigstring_writing() noexcept { try { finalize(); } catch (...) {} }
 };
 
 /**
@@ -1216,6 +1175,7 @@ public:
     void write(sigstring_writing& fastqa_writer, std::vector<T>& data) {
         if (data.empty()) return;
         
+        const size_t data_size = data.size();
         auto job_function = [
             fastq_ptr=&fastqa_writer,
             data_vec=std::move(data)
@@ -1224,13 +1184,13 @@ public:
             std::vector<T>().swap(data_vec);
         };
         
-        auto* job = new WriteJob();
+        auto job = std::make_unique<WriteJob>();
         job->func = std::move(job_function);
         job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
-        job->size = data.size();
+        job->size = data_size;
         job->queued_time = std::chrono::high_resolution_clock::now();
         
-        enqueue(job);
+        enqueue(std::move(job));
     }
     
     /**
@@ -1243,7 +1203,7 @@ public:
         for (auto const& s : slabs) total_bytes += s.size();
         if (total_bytes == 0) return;
         
-        auto* job = new WriteJob();
+        auto job = std::make_unique<WriteJob>();
         job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
         job->size = total_bytes;
         job->queued_time = std::chrono::high_resolution_clock::now();
@@ -1252,7 +1212,7 @@ public:
             std::vector<std::string>().swap(slabs_vec);
         };
         
-        enqueue(job);
+        enqueue(std::move(job));
     }
     
     /**
@@ -1273,13 +1233,13 @@ public:
             std::string().swap(data_str);
         };
         
-        auto* job = new WriteJob();
+        auto job = std::make_unique<WriteJob>();
         job->func = std::move(job_function);
         job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
         job->size = data_size;
         job->queued_time = std::chrono::high_resolution_clock::now();
         
-        enqueue(job);
+        enqueue(std::move(job));
     }
 
     /**
@@ -1293,6 +1253,7 @@ public:
     void write_debug(sigstring_writing* sig_writer, sigstring_writing* csv_writer, sigstring_writing* fastqa_writer, std::vector<T>& data) {
         if (data.empty()) return;
         
+        const size_t data_size = data.size();
         auto job_function = [
             sig_ptr=sig_writer,
             csv_ptr=csv_writer,
@@ -1305,17 +1266,27 @@ public:
             std::vector<T>().swap(data_vec);
         };
         
-        auto* job = new WriteJob();
+        auto job = std::make_unique<WriteJob>();
         job->func = std::move(job_function);
         job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
-        job->size = data.size();
+        job->size = data_size;
         job->queued_time = std::chrono::high_resolution_clock::now();
         
-        enqueue(job);
+        enqueue(std::move(job));
+    }
+
+    bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
+
+    void rethrow_if_failed() const {
+        if (!failed()) return;
+        std::exception_ptr error;
+        { std::lock_guard<std::mutex> lock(queue_mutex); error = writer_error; }
+        if (error) std::rethrow_exception(error);
     }
 
     void stop() {
-        if (stop_completed) return;
+        std::lock_guard<std::mutex> stop_lock(stop_mutex);
+        if (stop_completed) { rethrow_if_failed(); return; }
         running.store(false, std::memory_order_release);
         queue_not_empty.notify_all();
         queue_not_full.notify_all();
@@ -1325,7 +1296,6 @@ public:
         }
         stop_completed = true;
         std::exception_ptr error = writer_error;
-        writer_error = nullptr;
         
         RAD_COUT << "\n[Writer Thread] Statistics:" << std::endl;
         RAD_COUT << "  Total jobs processed: " << jobs_processed.load() << std::endl;
@@ -1362,7 +1332,9 @@ private:
     
     static constexpr size_t max_queued_jobs = 64;
     std::queue<WriteJob*> write_queue;
-    std::mutex queue_mutex;
+    mutable std::mutex queue_mutex;
+    std::mutex stop_mutex;
+    std::atomic<bool> failed_{false};
     std::condition_variable queue_not_empty;
     std::condition_variable queue_not_full;
     std::exception_ptr writer_error;
@@ -1378,18 +1350,18 @@ private:
     /**
      * @brief writer function per thread to process queued jobs
      */
-    void enqueue(WriteJob* job) {
+    void enqueue(std::unique_ptr<WriteJob> job) {
         std::unique_lock<std::mutex> lock(queue_mutex);
         queue_not_full.wait(lock, [this]() {
             return write_queue.size() < max_queued_jobs ||
                    !running.load(std::memory_order_acquire);
         });
         if (!running.load(std::memory_order_acquire)) {
-            delete job;
             if (writer_error) std::rethrow_exception(writer_error);
             throw std::runtime_error("RAD output writer stopped unexpectedly");
         }
-        write_queue.push(job);
+        write_queue.push(job.get());
+        job.release();
         lock.unlock();
         queue_not_empty.notify_one();
     }
@@ -1444,6 +1416,7 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(queue_mutex);
                     writer_error = std::current_exception();
+                    failed_.store(true, std::memory_order_release);
                     running.store(false, std::memory_order_release);
                 }
                 queue_not_empty.notify_all();
