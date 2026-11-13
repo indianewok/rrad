@@ -138,7 +138,7 @@
   "remote_asset_origin": "https://github.com/indianewok/rad/tree/24d5ce47e172222c96cd7dd19e94758d32aa5009/resources/wl",
   "remote_fetch_policy": "runtime on demand; exact byte count and SHA-256 required before use",
   "upstream_include_tree_sha256": "6f5b1a523ce3a1a60bfc6fe3553e290a0633f8b49261481e7116f8a9bd8b6f6f",
-  "embedded_source_digest": "5d156b87723902666c3974366dff6ff4fc7218aed9b11f1e1de8e049e4406bcc",
+  "embedded_source_digest": "a51704c7d29fa67592dc9817fc589d4ac894a5bd2be28b312d104100f0189b58",
   "embedded_source_digest_algorithm": "sha256 of sorted lines: lowercase file sha256, two spaces, POSIX path relative to include/, LF",
   "resource_tree_sha256": "b3081d5fd40d2d9309108fa79dd591d286e3ec1422582b0c520712659ffec4fb",
   "resource_tree_sha256_algorithm": "sha256 of sorted lines: lowercase file sha256, two spaces, POSIX path relative to inst/rad/resources/, LF",
@@ -188,7 +188,8 @@
     "calibrate the HMM only after adapter-driven layout pruning; preserve one-strand structural tables on existing rows and mirrored-anchor emissions on parameter-only rows for lossless position-map cache round trips",
     "prefer an exact opposite-strand static anchor over an overlapping imperfect match before masking so reverse-read cDNA excludes adapter sequence",
     "reject capture-boundary gaps including equally optimal homopolymer placements and preserve directional lowercase-n discovery matching",
-    "protect publication-lock aliases of discovery and spatial inputs before acquiring output locks"
+    "protect publication-lock aliases of discovery and spatial inputs before acquiring output locks",
+    "configure Boost with BOOST_NO_AUTO_PTR before its headers so C++17 builds do not instantiate obsolete unused std::auto_ptr compatibility overloads"
   ],
   "excluded": [
     "resources/wl/visium_hd_coordinates.csv.gz (ignored and not tracked upstream)",

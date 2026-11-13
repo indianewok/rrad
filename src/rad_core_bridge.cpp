@@ -45,7 +45,7 @@ constexpr int kResourceSchema = 1;
 constexpr const char* kSourceCommit =
     "616754007313ecb6fb875beb3a3fecfd3d83a267";
 constexpr const char* kEmbeddedSourceDigest =
-    "5d156b87723902666c3974366dff6ff4fc7218aed9b11f1e1de8e049e4406bcc";
+    "a51704c7d29fa67592dc9817fc589d4ac894a5bd2be28b312d104100f0189b58";
 constexpr const char* kResourceDigest =
     "b3081d5fd40d2d9309108fa79dd591d286e3ec1422582b0c520712659ffec4fb";
 

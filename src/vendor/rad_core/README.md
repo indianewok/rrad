@@ -150,6 +150,10 @@ Embedding adaptations are deliberately limited to the vendored copy:
     the bridge on the main thread. It does not redirect process stdout or
     replace process signal handlers. Report artifacts remain staged; primary,
     debug and unresolved-read sequence files are suppressed in stream mode.
+26. The umbrella header sets Boost's `BOOST_NO_AUTO_PTR` configuration before
+    its includes. RAD uses modern smart pointers; C++17 builds therefore omit
+    obsolete `std::auto_ptr` compatibility overloads without disabling compiler
+    warnings.
 
 The bridge resolves the installed `rrad` resource bundle through
 `system.file("rad/resources", package = "rrad")`. For an unchanged built-in

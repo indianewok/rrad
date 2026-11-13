@@ -20,6 +20,13 @@ if [[ -n "${RRAD_NATIVE_FLAGS:-}" ]]; then
   read -r -a extra_flags <<< "$RRAD_NATIVE_FLAGS"
   flags+=("${extra_flags[@]}")
 fi
+# Link-only options (such as a macOS OpenMP dylib) must not reach -c commands.
+# Keep this array nonempty for macOS Bash 3.2 with nounset enabled.
+link_flags=(-lz)
+if [[ -n "${RRAD_NATIVE_LIBS:-}" ]]; then
+  read -r -a extra_libs <<< "$RRAD_NATIVE_LIBS"
+  link_flags+=("${extra_libs[@]}")
+fi
 "${compiler[@]}" "${flags[@]}" -x c++ -c "$vendor_dir/ssw/ssw.c" -o "$build_dir/ssw.o"
 "${compiler[@]}" "${flags[@]}" -c "$vendor_dir/ssw/ssw_cpp.cpp" -o "$build_dir/ssw_cpp.o"
 "${compiler[@]}" "${flags[@]}" -c "$vendor_dir/edlib/src/edlib.cpp" -o "$build_dir/edlib.o"
@@ -28,6 +35,6 @@ for source in "$@"; do
   name="$(basename "$source" .cpp)"
   echo "Building $name"
   "${compiler[@]}" "${flags[@]}" "$source" "$build_dir/ssw.o" "$build_dir/ssw_cpp.o" \
-    "$build_dir/edlib.o" -lz -o "$build_dir/$name"
+    "$build_dir/edlib.o" "${link_flags[@]}" -o "$build_dir/$name"
   "$build_dir/$name"
 done

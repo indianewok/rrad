@@ -67,6 +67,12 @@
 // ————————————————————————————————————————————————————————————————
 // Boost
 // ————————————————————————————————————————————————————————————————
+// std::auto_ptr was removed in C++17. RAD uses modern smart pointers only;
+// tell Boost not to instantiate its obsolete compatibility overloads, even
+// when libstdc++ still exposes auto_ptr as a deprecated extension.
+#ifndef BOOST_NO_AUTO_PTR
+#define BOOST_NO_AUTO_PTR
+#endif
 #include <boost/bimap.hpp>
 #include <boost/optional.hpp>
 #include <boost/functional/hash.hpp>

@@ -78,7 +78,8 @@ The runner uses R's C++17 compiler and installed BH headers, compiles in a
 private temporary directory, and executes suites sequentially. The sanitizer
 command requires a compiler/runtime that supports those flags; CI supplies
 that environment on Linux. On Linux, `RRAD_NATIVE_FLAGS="-fopenmp"` also tests
-native parallel branches. Errors must fail the job; do not suppress sanitizer
+native parallel branches. Use `RRAD_NATIVE_LIBS` for link-only runtime options,
+such as the macOS OpenMP library. Errors must fail the job; do not suppress sanitizer
 findings or mark a failing platform optional to obtain a passing matrix.
 The `/dev/full` output-failure fixture is Linux-specific; other stream error
 and cancellation checks run on both operating systems.
