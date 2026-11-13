@@ -37,10 +37,36 @@ rad_demux(
   min_read_length = NULL,
   write_debug = FALSE,
   verbose = FALSE,
-  reuse_cache = FALSE
+  reuse_cache = FALSE,
+  concat_hmm = FALSE,
+  concat_hmm_abstain = c("drop", "legacy"),
+  calibration_reads = 50000L,
+  output_connection = NULL,
+  scan_capture_mode = c("after_adapter", "masked"),
+  scan_spatial = FALSE
 )
 }
 \arguments{
+  \item{concat_hmm}{Enable the optional concatemer hidden Markov model.
+  Confident repeated constructs are split; unresolved parents are preserved
+  separately in file-output mode. Default is \code{FALSE}.}
+  \item{concat_hmm_abstain}{Drop uncertain HMM classifications or route them
+  through the legacy path. Explicitly unresolved physical boundaries remain
+  unresolved with either policy.}
+  \item{calibration_reads}{Positive initial calibration sample size. Additional
+  blocks can be sampled to obtain enough chance hits, up to the greater of one
+  million records and this initial size. Cached maps preserve their thresholds;
+  missing HMM parameters are calibrated when HMM processing is requested.}
+  \item{output_connection}{Optional open writable R connection. Primary FASTA/Q
+  records are written incrementally in input order on the R thread. The caller
+  owns and closes the connection. Primary, debug, and unresolved-parent sequence
+  files are suppressed; run reports are still written. Bytes already emitted
+  cannot be rolled back if a later error or interrupt occurs.}
+  \item{scan_capture_mode}{For automatic whitelist scanning, preserve ordinary
+  adapter matching or explicitly enable uppercase \code{N} capture and lowercase
+  \code{n} noncapturing wildcards.}
+  \item{scan_spatial}{Use the low-count spatial abundance profile during
+  automatic whitelist scanning. Requires \code{auto_whitelist = TRUE}.}
   \item{layout}{A built-in RAD layout key or path to a layout CSV or seqspec.}
   \item{fastq}{Path to an input FASTQ or gzip-compressed FASTQ.}
   \item{out_dir}{Output directory, created recursively when necessary.}
@@ -61,7 +87,7 @@ rad_demux(
   \item{scan_adapter}{Optional adapter sequence for automatic whitelist
   scanning. By default RAD derives the nearest upstream static element from
   the read layout.}
-  \item{scan_barcode_length}{Optional positive barcode length for automatic
+  \item{scan_barcode_length}{Optional barcode length from 1 to 64 for automatic
   scanning. By default RAD derives it from the layout's barcode element.}
   \item{scan_max_error}{Non-negative maximum adapter edit-distance ratio used
   during automatic whitelist scanning.}

@@ -1,7 +1,7 @@
 {
   "upstream": "https://github.com/indianewok/rad",
   "version": "1.0.2",
-  "commit": "24d5ce47e172222c96cd7dd19e94758d32aa5009",
+  "commit": "616754007313ecb6fb875beb3a3fecfd3d83a267",
   "license": "MIT",
   "copied_paths": [
     "include/",
@@ -41,6 +41,30 @@
       "destination": "include/rad/barcode_correction.hpp"
     },
     {
+      "source": "include/rad/barcode_storage.hpp",
+      "destination": "include/rad/barcode_storage.hpp"
+    },
+    {
+      "source": "include/rad/concat_hmm.hpp",
+      "destination": "include/rad/concat_hmm.hpp"
+    },
+    {
+      "source": "include/rad/discovery.hpp",
+      "destination": "include/rad/discovery.hpp"
+    },
+    {
+      "source": "src/discovery_layout.cpp",
+      "destination": "include/rad/discovery_layout.hpp"
+    },
+    {
+      "source": "src/discovery_cli.cpp",
+      "destination": "include/rad/discovery_run.hpp"
+    },
+    {
+      "source": "src/discovery_whitelist.cpp",
+      "destination": "include/rad/discovery_whitelist.hpp"
+    },
+    {
       "source": "generated for rrad",
       "section": "package-safe captured console",
       "destination": "include/rad/embedded_console.hpp"
@@ -57,6 +81,10 @@
       "source": "generated for rrad",
       "section": "portable serial/OpenMP compatibility layer",
       "destination": "include/rad/openmp_compat.hpp"
+    },
+    {
+      "source": "include/rad/packed_sequence.hpp",
+      "destination": "include/rad/packed_sequence.hpp"
     },
     {
       "source": "include/rad/rad_headers.h",
@@ -80,6 +108,18 @@
       "destination": "include/rad/sigstring.hpp"
     },
     {
+      "source": "include/rad/spatial.hpp",
+      "destination": "include/rad/spatial.hpp"
+    },
+    {
+      "source": "src/spatial.cpp",
+      "destination": "include/rad/spatial_reformat.hpp"
+    },
+    {
+      "source": "include/rad/spatial_scan.hpp",
+      "destination": "include/rad/spatial_scan.hpp"
+    },
+    {
       "source": "include/rad/whitelist_generator.hpp",
       "destination": "include/rad/whitelist_generator.hpp"
     },
@@ -97,8 +137,8 @@
   "remote_asset_set": "rad-1.0.2-24d5ce47",
   "remote_asset_origin": "https://github.com/indianewok/rad/tree/24d5ce47e172222c96cd7dd19e94758d32aa5009/resources/wl",
   "remote_fetch_policy": "runtime on demand; exact byte count and SHA-256 required before use",
-  "upstream_include_tree_sha256": "a43f5384c8c8d48a92fa98c1868c36bbce2f1ba082ce7c589a17bff581f70267",
-  "embedded_source_digest": "80a6bf5631e5cd45fb122c087e5d6de7d79428513d26cc0799fd40e8b6eb62d5",
+  "upstream_include_tree_sha256": "6f5b1a523ce3a1a60bfc6fe3553e290a0633f8b49261481e7116f8a9bd8b6f6f",
+  "embedded_source_digest": "5d156b87723902666c3974366dff6ff4fc7218aed9b11f1e1de8e049e4406bcc",
   "embedded_source_digest_algorithm": "sha256 of sorted lines: lowercase file sha256, two spaces, POSIX path relative to include/, LF",
   "resource_tree_sha256": "b3081d5fd40d2d9309108fa79dd591d286e3ec1422582b0c520712659ffec4fb",
   "resource_tree_sha256_algorithm": "sha256 of sorted lines: lowercase file sha256, two spaces, POSIX path relative to inst/rad/resources/, LF",
@@ -129,8 +169,8 @@
     "adapt the RAD reformat command into a reusable in-process API with parallel ordered transformation, bounded split writers, opt-in collapsed and canonical pRESTO identifiers, spatial BC-to-cell-CB fallback with CB-keyed splitting, reserved-delimiter validation, preserved empty records and FASTQ plus-line data, FASTA-aware names, direct FASTQ-to-FASTA output, non-destructive coordinate metadata rewriting, coordinate-input integrity checks, safe barcode filenames, prepublication host-result construction, allocation-safe split rollback bookkeeping, and atomic no-clobber installation",
     "guard optional HOME-based diagnostic output paths so ordinary embedded runs remain safe when HOME is unset",
     "recognize barcode and UMI annotations only as complete SAM-style header fields",
-    "constrain packed barcodes to unsigned two-bit values of at most 32 bases and reject malformed compound specifications",
-    "keep padded barcode-correction windows as strings when they exceed the 32-base packed representation while retaining full sliding-kmer search",
+    "constrain packed barcodes to unsigned two-bit values of at most 64 bases and reject malformed compound specifications",
+    "keep padded barcode-correction windows as strings when they exceed the 64-base packed representation while retaining full sliding-kmer search",
     "validate spatial masks and axes strictly before native execution",
     "treat local seqspec onlists as authoritative, reject arbitrary remote onlists in embedded mode, and use secure temporary translation files",
     "publish demultiplex and whitelist-scan artifact sets under persistent per-prefix locks with same-filesystem staging and recoverable rollback",
@@ -140,12 +180,22 @@
     "copy each verified on-demand whitelist into a private permission-restricted per-call overlay before native use",
     "route embedded RAD and SSW diagnostics through a package-owned thread-safe capture stream instead of process stdout or stderr",
     "modernize vendored literal and allocator syntax and replace warning-suppressed undefined SIMD values with explicit zero initialization",
-    "replace the remaining layout-parser assertion with a recoverable exception, order member initialization consistently, and remove unused native diagnostics without suppressing compiler warnings"
+    "replace the remaining layout-parser assertion with a recoverable exception, order member initialization consistently, and remove unused native diagnostics without suppressing compiler warnings",
+    "adapt optional concatemer HMM models, calibration and cached parameters to the package namespace; report invalid internal indices as exceptions and propagate main-thread cancellation through calibration with join-safe worker cleanup",
+    "retain strict serial sequence dispatch, bounded standard output queues and gzstream while adding non-owning output streams, interrupted-write retries and explicit finish compatibility",
+    "adapt discovery and explicit-map spatial export into in-process APIs with host validation, cancellation and transactional output publication",
+    "use compiler-supported unsigned 128-bit packed barcodes on 64-bit GCC/Clang Unix targets and verify support during configure without disabling compiler diagnostics",
+    "calibrate the HMM only after adapter-driven layout pruning; preserve one-strand structural tables on existing rows and mirrored-anchor emissions on parameter-only rows for lossless position-map cache round trips",
+    "prefer an exact opposite-strand static anchor over an overlapping imperfect match before masking so reverse-read cDNA excludes adapter sequence",
+    "reject capture-boundary gaps including equally optimal homopolymer placements and preserve directional lowercase-n discovery matching",
+    "protect publication-lock aliases of discovery and spatial inputs before acquiring output locks"
   ],
   "excluded": [
     "resources/wl/visium_hd_coordinates.csv.gz (ignored and not tracked upstream)",
     "three large 3M whitelist payloads (catalogued by inst/rad/resources/REMOTE_RESOURCES.tsv and fetched on demand)",
     "unused sciplot and kdepp headers",
     "unused parallel_hashmap btree, dump, and memory-info headers"
-  ]
+  ],
+  "upstream_ref": "dev",
+  "resource_commit": "24d5ce47e172222c96cd7dd19e94758d32aa5009"
 }

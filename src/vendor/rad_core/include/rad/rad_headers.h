@@ -5,6 +5,7 @@
 // ————————————————————————————————————————————————————————————————
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <cctype>
 #include <cerrno>
 #include <climits>
@@ -48,6 +49,10 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #include <sys/resource.h>
 #if defined(__linux__)
 #include <unistd.h>
@@ -89,6 +94,7 @@
 // Keep upstream's normal terminal streams for the CLI, while allowing an
 // embedding host to provide a package-safe captured stream.
 #include "embedded_console.hpp"
+#include "concat_hmm.hpp"
 
 // ————————————————————————————————————————————————————————————————
 //  rad headers
@@ -100,7 +106,6 @@ namespace rrad_rad_core {
 #include "misc_utils.hpp"
 #include "io_streaming.hpp"
 #include "barcode_correction.hpp"
-#include "adapter_thresholds.hpp"
 #include "read_layout.hpp"
 #include "sigstring.hpp"
 #include "whitelist_generator.hpp"

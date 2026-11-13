@@ -93,3 +93,11 @@ rad_demux_cpp <- function(options) {
     .Call(`_rrad_rad_demux_cpp`, options)
 }
 
+
+.rad_discover_cpp <- function(options) {
+    .Call(`_rrad_rad_discover_cpp`, options)
+}
+
+.rad_spatial_reformat_cpp <- function(options) {
+    .Call(`_rrad_rad_spatial_reformat_cpp`, options)
+}

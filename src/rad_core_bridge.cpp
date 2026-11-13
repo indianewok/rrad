@@ -25,6 +25,15 @@ extern "C" {
 
 #include "vendor/rad_core/include/rad/rad_headers.h"
 
+namespace rrad_rad_core {
+#include "vendor/rad_core/include/rad/discovery.hpp"
+#include "vendor/rad_core/include/rad/discovery_layout.hpp"
+#include "vendor/rad_core/include/rad/discovery_whitelist.hpp"
+#include "vendor/rad_core/include/rad/discovery_run.hpp"
+#include "vendor/rad_core/include/rad/spatial.hpp"
+#include "vendor/rad_core/include/rad/spatial_reformat.hpp"
+}
+
 namespace fs = std::filesystem;
 namespace core = rrad_rad_core;
 
@@ -34,9 +43,9 @@ constexpr const char* kCoreVersion = "1.0.2";
 constexpr int kCoreApiVersion = 1;
 constexpr int kResourceSchema = 1;
 constexpr const char* kSourceCommit =
-    "24d5ce47e172222c96cd7dd19e94758d32aa5009";
+    "616754007313ecb6fb875beb3a3fecfd3d83a267";
 constexpr const char* kEmbeddedSourceDigest =
-    "80a6bf5631e5cd45fb122c087e5d6de7d79428513d26cc0799fd40e8b6eb62d5";
+    "5d156b87723902666c3974366dff6ff4fc7218aed9b11f1e1de8e049e4406bcc";
 constexpr const char* kResourceDigest =
     "b3081d5fd40d2d9309108fa79dd591d286e3ec1422582b0c520712659ffec4fb";
 
@@ -474,7 +483,8 @@ public:
     const fs::path& stage_base() const { return stage_base_; }
     const fs::path& lock_path() const { return lock_path_; }
 
-    void commit(const std::vector<TransactionOutput>& outputs) {
+    void commit(const std::vector<TransactionOutput>& outputs,
+                bool overwrite = true) {
         struct Backup {
             fs::path target;
             fs::path path;
@@ -527,6 +537,14 @@ public:
         // Generation may take hours, so repeat target validation while holding
         // the publication lock before moving any existing pathname.
         preflight_transaction_targets(targets);
+        if (!overwrite) {
+            for (const auto& output : outputs) {
+                if (fs::exists(output.target) || fs::is_symlink(output.target)) {
+                    throw std::invalid_argument("output already exists: " +
+                                                output.target.string());
+                }
+            }
+        }
 
         std::exception_ptr original_error;
         // Until either commit or rollback completes, the staging directory is
@@ -534,6 +552,7 @@ public:
         preserve_stage_ = true;
         try {
             for (std::size_t index = 0; index < outputs.size(); ++index) {
+                if (!overwrite) continue;
                 std::error_code error;
                 if (!fs::exists(outputs[index].target, error)) {
                     if (error) {
@@ -556,6 +575,13 @@ public:
             for (std::size_t index = 0; index < outputs.size(); ++index) {
                 const auto& output = outputs[index];
                 if (!output.publish) continue;
+                if (!overwrite) {
+                    // Link publication refuses even a target created after
+                    // preflight. Staging cleanup removes the other link.
+                    fs::create_hard_link(output.staged, output.target);
+                    installed[index] = 1;
+                    continue;
+                }
                 if (std::rename(output.staged.string().c_str(),
                                 output.target.string().c_str()) != 0) {
                     throw std::runtime_error(
@@ -779,7 +805,7 @@ AutoWhitelistResult run_auto_whitelist(
     double max_error, size_t max_reads, size_t chunk_size,
     int requested_threads, int effective_threads,
     core::scan_whitelist_selection selection, bool verbose,
-    std::function<void()> boundary_poll) {
+    std::function<void()> boundary_poll, bool masked_capture = false, bool spatial = false) {
     const core::ReadElement* barcode = nullptr;
     int barcode_count = 0;
     for (const auto& element : layout.by_order()) {
@@ -840,6 +866,15 @@ AutoWhitelistResult run_auto_whitelist(
     config.adapter_seq = adapter;
     config.whitelist = reference;
     config.barcode_length = barcode_length;
+    config.masked_capture = masked_capture;
+    config.spatial = spatial;
+    if (masked_capture) {
+        const size_t captured = core::scan_masked_capture_length(adapter);
+        if (captured == 0 || captured > 64 ||
+            (barcode_length_override && captured != static_cast<size_t>(*barcode_length_override)))
+            throw std::invalid_argument("masked auto-scan capture length is invalid");
+        config.barcode_length = static_cast<int>(captured);
+    }
     config.max_reads = scan_limit;
     config.max_error = max_error;
     config.requested_threads = requested_threads;
@@ -938,7 +973,9 @@ Rcpp::List core_info_impl() {
             "custom-layout", "custom-whitelist", "auto-whitelist",
             "debug-output", "seqspec", "scan-wl", "reformat",
             "reformat-fasta", "reformat-presto-header",
-            "remote-resource-cache"),
+            "remote-resource-cache", "barcodes-64", "masked-capture",
+            "concat-hmm", "connection-output", "discover", "spatial-scan",
+            "spatial-export"),
         Rcpp::_["build"] = Rcpp::List::create(
             Rcpp::_["platform"] = platform,
             Rcpp::_["compiler"] = __VERSION__,
@@ -1020,7 +1057,6 @@ bool rad_any_file_equivalent_cpp(Rcpp::CharacterVector candidates,
 Rcpp::List rad_scan_wl_cpp(Rcpp::List options) {
     const std::string input = string_option(options, "input");
     const std::string output_prefix = string_option(options, "output_prefix");
-    if (input.empty()) Rcpp::stop("`input` is required");
     if (output_prefix.empty()) Rcpp::stop("`output_prefix` is required");
 
     try {
@@ -1046,6 +1082,7 @@ Rcpp::List rad_scan_wl_cpp(Rcpp::List options) {
         config.offset_min = int_option(options, "offset_min", 0);
         config.offset_max = int_option(options, "offset_max", 3);
         config.verbose = bool_option(options, "verbose", false);
+        parse_scan_extensions(options, config);
 
         const std::string selection =
             string_option(options, "selection", "high_specificity");
@@ -1059,9 +1096,9 @@ Rcpp::List rad_scan_wl_cpp(Rcpp::List options) {
                 "`selection` must be 'high_specificity' or 'above_floor'");
         }
 
-        if (config.barcode_length < 1 || config.barcode_length > 32) {
+        if (config.barcode_length < 1 || config.barcode_length > 64) {
             throw std::invalid_argument(
-                "`barcode_length` must be between 1 and 32");
+                "`barcode_length` must be between 1 and 64");
         }
         if (config.left_margin < 0 || config.right_margin < 0) {
             throw std::invalid_argument(
@@ -1081,10 +1118,10 @@ Rcpp::List rad_scan_wl_cpp(Rcpp::List options) {
         if (config.chunk_size < 1) {
             throw std::invalid_argument("`chunk_size` must be >= 1");
         }
-        if (config.bc1_length < 0 || config.bc1_length > 32 ||
-            config.bc2_length < 0 || config.bc2_length > 32) {
+        if (config.bc1_length < 0 || config.bc1_length > 64 ||
+            config.bc2_length < 0 || config.bc2_length > 64) {
             throw std::invalid_argument(
-                "split-barcode packed lengths must be between 1 and 32");
+                "split-barcode packed lengths must be between 1 and 64");
         }
         if (config.umi_length < 0 || config.offset_min < 0 ||
             config.offset_max < config.offset_min) {
@@ -1097,7 +1134,7 @@ Rcpp::List rad_scan_wl_cpp(Rcpp::List options) {
             throw std::invalid_argument(
                 "`bc1_whitelist` and `bc2_whitelist` must be supplied together");
         }
-        if (config.rescan && config.split_mode()) {
+        if (config.rescan && config.split_mode() && !config.slide_mode()) {
             throw std::invalid_argument(
                 "rescan is not compatible with split-barcode options");
         }
@@ -1105,7 +1142,7 @@ Rcpp::List rad_scan_wl_cpp(Rcpp::List options) {
             throw std::invalid_argument(
                 "rescan is not compatible with a reference whitelist");
         }
-        if (!config.rescan && config.adapter_seq.empty()) {
+        if (!config.rescan && !config.slide_mode() && config.adapter_seq.empty()) {
             throw std::invalid_argument(
                 "`adapter_seq` is required for a FASTQ/FASTA scan");
         }
@@ -1329,7 +1366,25 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
 
         const bool verbose = bool_option(options, "verbose", false);
         const bool max_verbose = bool_option(options, "max_verbose", false);
-        const bool write_debug = bool_option(options, "write_debug", false);
+        const bool stream_output = has_value(options, "output_callback");
+        if (stream_output && !Rf_isFunction(options["output_callback"]))
+            throw std::invalid_argument("output_callback must be a function");
+        std::function<void(const std::string&)> output_callback;
+        if (stream_output) {
+            Rcpp::Function callback(options["output_callback"]);
+            output_callback = [callback](const std::string& text) { callback(text); };
+        }
+        const bool write_debug = bool_option(options, "write_debug", false) && !stream_output;
+        const bool concat_hmm = bool_option(options, "concat_hmm", false);
+        const std::string hmm_abstain = string_option(options, "concat_hmm_abstain", "drop");
+        if (hmm_abstain != "drop" && hmm_abstain != "legacy")
+            throw std::invalid_argument("concat_hmm_abstain must be drop or legacy");
+        const int calibration_reads = int_option(options, "calibration_reads", 50000);
+        if (calibration_reads < 1) throw std::invalid_argument("calibration_reads must be positive");
+        const std::string scan_capture = string_option(options, "scan_capture_mode", "after_adapter");
+        if (scan_capture != "after_adapter" && scan_capture != "masked")
+            throw std::invalid_argument("invalid scan_capture_mode");
+        const bool scan_spatial = bool_option(options, "scan_spatial", false);
         const bool reuse_cache = bool_option(options, "reuse_cache", false);
         const bool auto_whitelist =
             bool_option(options, "auto_whitelist", false);
@@ -1358,9 +1413,9 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
         const std::optional<int> scan_barcode_length =
             optional_int(options, "scan_barcode_length");
         if (scan_barcode_length &&
-            (*scan_barcode_length < 1 || *scan_barcode_length > 32)) {
+            (*scan_barcode_length < 1 || *scan_barcode_length > 64)) {
             throw std::invalid_argument(
-                "`scan_barcode_length` must be between 1 and 32");
+                "`scan_barcode_length` must be between 1 and 64");
         }
         const double scan_max_error = double_option(
             options, "scan_max_error", core::kDefaultScanWlMaxErrorRatio);
@@ -1444,6 +1499,7 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
             core::path_utils::get_fastqa_type(input_path.string());
         const fs::path fastq_output =
             outbase.string() + fastq_suffix + ".gz";
+        const fs::path unresolved_output = outbase.string() + "_boundary_unresolved" + fastq_suffix + ".gz";
         const fs::path layout_cache = outbase.string() + "_layout.csv";
         const fs::path position_cache =
             outbase.string() + "_position_map.csv";
@@ -1475,6 +1531,7 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
 
         std::vector<NamedPath> output_paths{
             {"primary FASTQ", fastq_output},
+            {"unresolved parents", unresolved_output},
             {"layout cache", layout_cache},
             {"position-map cache", position_cache},
             {"true-whitelist summary", true_whitelist},
@@ -1498,6 +1555,7 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
         const fs::path staged_outbase = publication.stage_base();
         const fs::path staged_fastq =
             staged_outbase.string() + fastq_suffix + ".gz";
+        const fs::path staged_unresolved = staged_outbase.string() + "_boundary_unresolved" + fastq_suffix + ".gz";
         const fs::path staged_layout =
             staged_outbase.string() + "_layout.csv";
         const fs::path staged_position =
@@ -1689,11 +1747,20 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
             read_layout.write_to_csv(staged_outbase.string(), "layout");
             core::Misalignment_Setup misalignment(read_layout);
             misalignment.generate_misalignment_data(
-                input_path.string(), read_layout, threads, 50000,
-                interrupt_poll);
+                input_path.string(), read_layout, threads, static_cast<size_t>(calibration_reads),
+                interrupt_poll, concat_hmm);
             read_layout.write_to_csv(staged_outbase.string(), "both");
         } else if (imported_companion) {
             read_layout.write_to_csv(staged_outbase.string(), "both");
+        }
+        if (concat_hmm) {
+            read_layout.concat_abstain_legacy = hmm_abstain == "legacy";
+            if (read_layout.concat_params.empty()) {
+                core::concat_hmm_cal::calibrate_from_fastq(input_path.string(), read_layout,
+                    threads, static_cast<size_t>(calibration_reads), interrupt_poll);
+                read_layout.write_to_csv(staged_outbase.string(), "pos_map");
+            }
+            read_layout.build_concat_model(verbose);
         }
         require_nonempty_regular_file(staged_layout,
                                       "generated layout cache");
@@ -1711,7 +1778,7 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
                     : static_cast<size_t>(scan_max_reads_value),
                 static_cast<size_t>(scan_chunk_value),
                 scan_requested_threads, scan_effective_threads,
-                scan_selection, verbose, interrupt_poll);
+                scan_selection, verbose, interrupt_poll, scan_capture == "masked", scan_spatial);
             read_layout.load_wl(std::nullopt, whitelist_mutation, verbose,
                                 threads,
                                 auto_result->reference_spec.empty()
@@ -1748,7 +1815,7 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
             max_reads_value < 0 ? static_cast<size_t>(-1)
                                 : static_cast<size_t>(max_reads_value),
             write_debug, correction_mode, joint_mode, rc_umi,
-            min_read_length, interrupt_poll);
+            min_read_length, interrupt_poll, nullptr, output_callback);
         stats.wall_time_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           demux_started)
@@ -1757,7 +1824,8 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
             0.0, stats.wall_time_seconds - stats.process_time_seconds -
                      stats.output_staging_time_seconds);
 
-        verify_primary_gzip(staged_fastq, stats.records_serialized > 0);
+        if (!stream_output) verify_primary_gzip(staged_fastq, stats.records_serialized > 0);
+        if (fs::exists(staged_unresolved)) verify_primary_gzip(staged_unresolved, stats.hmm_boundary_unresolved_parents > 0);
 
         const std::string whitelist_base =
             staged_outbase.string() + "_whitelist.csv";
@@ -1790,11 +1858,19 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
                 << "threads_requested=" << requested_threads << "\n"
                 << "threads_effective=" << threads << "\n"
                 << "reuse_cache=" << (reuse_cache ? "true" : "false") << "\n"
+                << "concat_hmm=" << (concat_hmm ? "true" : "false") << "\n"
+                << "concat_hmm_abstain=" << hmm_abstain << "\n"
+                << "calibration_reads=" << calibration_reads << "\n"
+                << "streamed=" << (stream_output ? "true" : "false") << "\n"
+                << "hmm_boundary_unresolved_parents="
+                << stats.hmm_boundary_unresolved_parents << "\n"
                 << "auto_whitelist=" << (auto_whitelist ? "true" : "false")
                 << "\n";
             if (auto_result) {
                 log << "scan_adapter=" << auto_result->config.adapter_seq
                     << "\n"
+                    << "scan_capture_mode=" << scan_capture << "\n"
+                    << "scan_spatial=" << (scan_spatial ? "true" : "false") << "\n"
                     << "scan_barcode_length="
                     << auto_result->config.barcode_length << "\n"
                     << "scan_reference="
@@ -1877,6 +1953,7 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
 
         Rcpp::List files = Rcpp::List::create(
             Rcpp::_["fastq"] = published_path(staged_fastq, fastq_output),
+            Rcpp::_["boundary_unresolved"] = published_path(staged_unresolved, unresolved_output),
             Rcpp::_["layout"] = published_path(staged_layout, layout_cache),
             Rcpp::_["position_map"] =
                 published_path(staged_position, position_cache),
@@ -1929,6 +2006,9 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
             Rcpp::_["overhead_time_seconds"] = stats.overhead_time_seconds,
             Rcpp::_["total_wall_time_seconds"] = total_wall_time);
 
+        stats_output["concat_hmm"] = concat_hmm;
+        stats_output["streamed"] = stream_output;
+        stats_output["hmm_boundary_unresolved_parents"] = static_cast<double>(stats.hmm_boundary_unresolved_parents);
         Rcpp::RObject scan_output = R_NilValue;
         if (auto_result) {
             auto_result->scan.output_prefix = outbase.string() + "_scanwl";
@@ -1967,8 +2047,9 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
             Rcpp::_["scan"] = scan_output,
             Rcpp::_["log"] = public_log);
 
-        const std::vector<TransactionOutput> transaction_outputs{
-            {"primary FASTQ", staged_fastq, fastq_output, true},
+        std::vector<TransactionOutput> transaction_outputs{
+            {"primary FASTQ", staged_fastq, fastq_output, !stream_output},
+            {"unresolved parents", staged_unresolved, unresolved_output, fs::exists(staged_unresolved)},
             {"layout cache", staged_layout, layout_cache, true},
             {"position-map cache", staged_position, position_cache, true},
             {"true-whitelist summary", staged_true_whitelist, true_whitelist,
@@ -1987,6 +2068,13 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
             {"debug FASTQ", staged_debug_fastq, debug_fastq, write_debug},
             {"debug metrics", staged_debug_metrics, debug_metrics,
              write_debug}};
+        if (stream_output) {
+            transaction_outputs.erase(std::remove_if(transaction_outputs.begin(), transaction_outputs.end(),
+                [](const TransactionOutput& output) {
+                    return output.label == "primary FASTQ" || output.label == "unresolved parents" ||
+                           output.label.rfind("debug ", 0) == 0;
+                }), transaction_outputs.end());
+        }
         publication.commit(transaction_outputs);
         return result;
     } catch (const std::exception& error) {
@@ -1994,3 +2082,5 @@ Rcpp::List rad_demux_cpp(Rcpp::List options) {
     }
     return Rcpp::List::create();  // unreachable; placates some compilers
 }
+
+#include "rad_discovery_bridge.hpp"

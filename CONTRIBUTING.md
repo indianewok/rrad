@@ -10,14 +10,18 @@ in `NEWS.md`.
   streaming, quality summaries, and persistence.
 - `R/rad_core.R`, `R/rad_scan_wl.R`, and `R/rad_reformat.R`: public native
   workflow interfaces and argument validation.
+- `R/rad_discovery.R`: layout/whitelist discovery and explicit-map spatial export.
 - `R/rad_resources.R`: verified resource downloads and cache management.
 - `src/rad_core_bridge.cpp` and `src/rad_scan_wl_bridge.hpp`: the R/native
   boundary, result contracts, host interrupts, and native execution context.
+  `src/rad_discovery_bridge.hpp` adapts discovery and spatial exports.
 - `src/vendor/rad_core/`: pinned RAD source, embedding adaptations, and
   provenance. `inst/rad/` holds the matching resource manifest and small data.
 - `man/`: maintained Rd documentation; `vignettes/`: executable user guide.
 - `tests/testthat/`: offline regression tests, including malformed inputs,
   failed writes, native interfaces, and provenance checks.
+- `tests/native/`: standalone C++ regression suites for packed barcodes,
+  storage, matching, HMM boundaries/routing/calibration, and output streams.
 
 The Rd files and `NAMESPACE` are maintained explicitly. The source's roxygen
 comments are useful API notes but are not a complete regeneration specification;
@@ -50,19 +54,44 @@ download runtime data. Keep examples and tests to at most two native threads.
 Run the committed GitHub Actions matrix on Linux and macOS, inspect all results,
 and retain the logs for the exact release commit. The Linux release job with
 OpenMP builds the PDF manual; all matrix jobs build and check the vignette.
-Include R release, development, and old-release checks where practical.
+The matrix includes R release, development, and old-release checks. Release
+jobs run the standalone native suites in both serial and OpenMP modes on
+Linux, Apple Silicon, and Intel macOS. A separate Linux job runs the native
+suites with AddressSanitizer and UndefinedBehaviorSanitizer. The macOS OpenMP
+jobs install a compiler-matched R-project runtime on the ephemeral runner;
+ordinary macOS package installation remains serial by default.
 Platform support must be based on
 completed installation and checks, not solely on the presence of a workflow.
 Review the current [CRAN repository policy](https://cran.r-project.org/web/packages/policies.html)
 and [Writing R Extensions](https://cran.r-project.org/doc/manuals/r-release/R-exts.html)
 before an actual submission. CRAN acceptance is a separate review.
 
+Run the native regressions from the package root:
+
+```sh
+bash tests/native/run-tests.sh
+RRAD_NATIVE_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+  bash tests/native/run-tests.sh
+```
+
+The runner uses R's C++17 compiler and installed BH headers, compiles in a
+private temporary directory, and executes suites sequentially. The sanitizer
+command requires a compiler/runtime that supports those flags; CI supplies
+that environment on Linux. On Linux, `RRAD_NATIVE_FLAGS="-fopenmp"` also tests
+native parallel branches. Errors must fail the job; do not suppress sanitizer
+findings or mark a failing platform optional to obtain a passing matrix.
+The `/dev/full` output-failure fixture is Linux-specific; other stream error
+and cancellation checks run on both operating systems.
+
 ## Updating the RAD snapshot
 
 Record the upstream version, commit, copied files, and local adaptations in
 `src/vendor/rad_core/RAD_VENDOR.json` and its README. Keep the source and resource
 digests synchronized with `inst/rad/RAD_RESOURCES.json` and the native metadata;
-the vendored README specifies the canonical hashing algorithm. The provenance
+the vendored README specifies the canonical hashing algorithm. The source
+commit and resource commit may differ when an upstream code update leaves
+the bundled resources unchanged; retain immutable remote whitelist URLs and
+record that distinction explicitly. The provenance
 tests verify these identities. Review new or changed dependencies against
 `inst/THIRD_PARTY_NOTICES.md` and preserve their complete license texts under
 `inst/licenses/`.

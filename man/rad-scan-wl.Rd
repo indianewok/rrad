@@ -25,13 +25,23 @@ rad_scan_wl(
   umi_length = 9L,
   offset_min = 0L,
   offset_max = 3L,
-  verbose = FALSE
+  verbose = FALSE,
+  capture_mode = c("after_adapter", "masked"),
+  spatial = FALSE,
+  spatial_slide = NULL,
+  spatial_platform = NULL,
+  slide_map = NULL,
+  slide_dir = NULL,
+  bc1_axis = NULL,
+  bc2_axis = NULL,
+  spatial_selection = c("abundance", "legacy")
 )
 }
 \arguments{
   \item{input}{Input FASTQ, FASTA, or gzip-compressed FASTQ/FASTA path. With
   \code{rescan = TRUE}, a CSV, TSV, or whitespace-delimited barcode/count
-  table instead. Supply exactly one of \code{input} and \code{batch_csv}.}
+  table instead. Supply exactly one of \code{input} and \code{batch_csv},
+  or omit both to export a slide coordinate catalog.}
 
   \item{output_prefix}{Prefix for generated files. The default is
   \code{"barcodes"} for sequence scans and \code{<input>_rescan} for
@@ -42,9 +52,11 @@ rad_scan_wl(
   validated before the first native scan begins.}
 
   \item{adapter_seq}{Adapter or primer immediately upstream of the barcode.
-  Required for sequence scans and unused for statistical rescans.}
+  Required for sequence scans and unused for statistical rescans. Slide scans
+  provide defaults for Visium, Visium HD, and Curio Seeker.}
 
-  \item{barcode_length}{Positive number of barcode bases to extract.}
+  \item{barcode_length}{Number of barcode bases to extract, from 1 through 64.
+  Masked capture infers this from the pattern when the argument is omitted.}
 
   \item{left_margin, right_margin}{Non-negative RAD extraction offsets. For a
   forward adapter, \code{left_margin} skips bases before extraction and
@@ -54,7 +66,7 @@ rad_scan_wl(
   \item{max_reads}{Optional positive maximum number of reads to inspect;
   \code{NULL} scans the entire input.}
 
-  \item{max_error}{Non-negative maximum adapter edit-distance ratio.}
+  \item{max_error}{Maximum adapter edit-distance ratio from 0 to 1.}
 
   \item{whitelist}{Optional built-in whitelist key or whitelist file used to
   restrict and validate single-barcode observations.}
@@ -73,10 +85,11 @@ rad_scan_wl(
 
   \item{bc1_whitelist, bc2_whitelist}{Optional built-in keys or files for a
   two-part barcode scan. Supply both or neither. Two-part mode is an
-  alternative to \code{whitelist} and is unavailable for rescans.}
+  alternative to \code{whitelist}. For HD slide rescans these catalogs can
+  translate native spot IDs; other rescans do not use split catalogs.}
 
   \item{bc1_length, bc2_length}{Optional packed-whitelist barcode lengths,
-  each from 1 through 32. They are needed for custom numeric bit-lists, which
+  each from 1 through 64. They are needed for custom numeric bit-lists, which
   do not encode sequence length; bundled SPLiT-seq keys infer 8.}
 
   \item{umi_length}{Non-negative UMI length between the adapter and BC1 in
@@ -87,6 +100,37 @@ rad_scan_wl(
 
   \item{verbose}{Whether to print native progress captured during each
   completed run.}
+
+  \item{capture_mode}{With \code{"after_adapter"}, N retains its legacy
+  wildcard meaning and the barcode follows the adapter. With \code{"masked"},
+  uppercase N positions are concatenated into the barcode and lowercase n
+  matches a base without capturing it. Margins must be zero. Split scans use
+  lowercase n only; component catalogs define their barcodes.}
+
+  \item{spatial}{Use the spatial low-count abundance profile. Supported for
+  single, split, batch, and rescan input without coordinate data.}
+
+  \item{spatial_slide}{Slide map path or registered slide ID. Supply
+  \code{spatial_platform} as well. Omit input to export the coordinate catalog.
+  Slide scans do not accept batch input.}
+
+  \item{spatial_platform}{One of \code{"visium"}, \code{"visium-hd"},
+  \code{"curio-seeker"}, \code{"curio-trekker"}, or \code{"stereo-seq"}.}
+
+  \item{slide_map}{Explicit sequence-to-coordinate CSV/TSV map, optionally gzip.}
+
+  \item{slide_dir}{Registry directory containing
+  \code{<platform>/<slide>.tsv.gz} (or .csv.gz, .tsv, .csv). Defaults to
+  \env{RAD_SLIDE_DIR} or packaged resources.}
+
+  \item{bc1_axis, bc2_axis}{Alternative HD axis tables with \code{barcode} and
+  \code{array_col} or \code{array_row} columns, in native 2-micrometre indices.}
+
+  \item{spatial_selection}{\code{"abundance"} applies the low-count abundance
+  caller before slide membership and HD occupancy filtering. \code{"legacy"}
+  retains the historical slide route: ordinary Visium uses the standard caller,
+  HD uses occupancy alone, and other platforms use the low-count caller.}
+
 }
 \value{
 A \code{rad_scan_wl_result} containing the embedded-core provenance, the
@@ -106,6 +150,36 @@ A sequence scan writes \code{<prefix>.txt}, \code{<prefix>.csv}, and
 \code{<prefix>_scan_wl.log}. The text file contains the selected barcode set;
 the CSV retains per-barcode counts and call annotations. A two-part scan also
 writes valid-pair counts and a spatial mask.
+
+Masked patterns can capture separate blocks, for example
+\code{"NNNNACGTnnNN"} captures six bases. Reads are searched in both
+orientations and reverse hits are returned in adapter orientation. Only A, C,
+G, and T can be captured. An alignment gap within or next to a captured block
+is rejected. In masked mode, the edit-distance budget uses the number of
+literal pattern positions, excluding both kinds of wildcard.
+
+A slide map contains nucleotide \code{barcode}, \code{x}, and \code{y}
+columns; native Curio three-column bead files without a header are also read.
+HD maps must supply native \code{array_row}/\code{array_col},
+\code{x_um}/\code{y_um}, or exported coordinates with
+\code{coordinate_units}. Separate \code{bc1}/\code{bc2} columns and native
+\code{s_002um_ROW_COL} identifiers are supported. HD axis tables or ordered
+component catalogs avoid expanding their Cartesian product in memory. A bare
+whitelist cannot supply physical coordinates for other platforms.
+
+HD selection requires at least 32 distinct native 2-micrometre spots in each
+aligned 16-micrometre region (64 possible spots). Repeated observations of one
+spot do not increase occupancy. The abundance route retains pre-filter calls
+in \code{<prefix>_rad.csv} and \code{<prefix>_rad.txt}; selected slide
+coordinates are in \code{<prefix>_coordinates.tsv.gz}, and HD occupancy is in
+\code{<prefix>_regions.tsv}. With no input, only the complete coordinate catalog
+and a log are written. Native spot-ID rescans require a map or catalogs that
+resolve the IDs. Coordinate files are loaded locally; rrad does not download
+slide maps.
+
+All files for one run are staged privately and published together after a
+successful scan. A failed scan preserves the previous published files. A batch
+is validated before scanning, but its completed runs are separate transactions.
 
 The selected whitelist can be passed directly to
 \code{rad_demux(custom_whitelist = result$artifacts$whitelist)}. No standalone

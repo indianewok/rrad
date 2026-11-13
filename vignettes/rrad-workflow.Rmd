@@ -118,6 +118,89 @@ barcode tags. The `artifacts` list gives exact paths; use those paths instead
 of reconstructing output filenames. For a single discovery-and-demultiplexing
 call, use `auto_whitelist = TRUE` instead of `custom_whitelist`.
 
+## Compare reference catalogs and inspect a layout
+
+`rad_discover()` samples reads and compares their captured barcodes with reference
+catalogs. It reports ties and missing matches. A successful analysis can still
+have an incomplete layout; check `complete` before using the inferred layout.
+Explicit local catalogs keep this example offline.
+
+```{r discover}
+discovered <- rad_discover(
+  input = fastq,
+  out_dir = file.path(work, "discover"),
+  pattern = "ACGTACGT",
+  barcode_length = 4L,
+  catalogs = c(example = scan$artifacts$whitelist),
+  max_error = 0
+)
+discovered$complete
+discovered$whitelist_match
+```
+
+For a barcode split by known sequence, use an explicit capture pattern such as
+`NNNNACGTACGTNNNN`. Uppercase `N` captures a base; lowercase `n` skips a base.
+`rad_scan_wl(capture_mode = "masked", ...)` uses the same `N`/`n` capture notation. Its
+default, `capture_mode = "after_adapter"`, keeps the earlier scan behavior.
+Barcodes can contain up to 64 captured bases.
+
+## Export reads with spatial coordinates
+
+`rad_spatial_reformat()` assigns tagged reads to an explicit barcode map. It
+creates a new output directory with reads, an assignment audit, and a summary.
+The map below uses zero-based positions on a two-micrometre grid. Real analyses
+must supply a map that describes the experimental slide.
+
+```{r spatial-export}
+spatial_map <- file.path(work, "spatial-map.tsv")
+write.table(data.frame(
+  barcode = c("AACC", "TTGA"), array_row = c(0L, 1L),
+  array_col = c(0L, 1L), in_tissue = c(1L, 1L)
+), spatial_map, sep = "\t", quote = FALSE, row.names = FALSE)
+spatial <- rad_spatial_reformat(
+  fastq = run$artifacts$fastq,
+  out_dir = file.path(work, "spatial"),
+  sample = "example", map = spatial_map
+)
+spatial$counts
+```
+
+Use `strict = TRUE` to exclude unassigned reads from the output FASTQ. The audit
+still records every input read. Cell-level output requires a `cell_id` map
+column. See `?rad_spatial_reformat` for axis maps and other assignment options.
+
+## Select concatemer processing and connection output
+
+`rad_demux(concat_hmm = TRUE, ...)` enables the optional hidden Markov model
+(HMM) for concatemer boundaries. Calibration uses up to `calibration_reads`
+input reads. It stores the fitted parameters with the layout and position map.
+The default remains `concat_hmm = FALSE`. With the HMM enabled, uncertain
+boundaries go to a separate unresolved file by default; use
+`concat_hmm_abstain = "legacy"` only when the earlier fallback is appropriate
+for the analysis. Inspect the logs and unresolved counts, especially with a
+small calibration sample.
+
+To send primary output to an open R connection, use `output_connection`.
+The caller must close the connection. Reports still go to `out_dir`, but no
+primary, debug, or unresolved sequence files are created. Bytes already sent
+to a connection cannot be withdrawn if a later operation fails.
+
+```{r connection-output}
+demux_to_connection <- function() {
+  connection <- rawConnection(raw(), "wb")
+  on.exit(close(connection))
+  result <- rad_demux(
+    layout = layout, fastq = fastq,
+    out_dir = file.path(work, "connection"),
+    custom_whitelist = scan$artifacts$whitelist,
+    min_read_length = 0L, output_connection = connection
+  )
+  list(records = result$stats$records_serialized,
+       bytes = length(rawConnectionValue(connection)))
+}
+demux_to_connection()
+```
+
 ## Export pRESTO FASTA for IgBLAST
 
 `rad_reformat()` accepts a demultiplexing result directly. An explicit output

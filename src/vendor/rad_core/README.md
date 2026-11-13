@@ -1,16 +1,21 @@
 # Vendored RAD core
 
 This directory contains the C++ headers required by rrad's embedded RAD
-demultiplexing, whitelist-discovery, and reformatting backends.
+demultiplexing, concatemer HMM, layout/whitelist discovery, spatial assignment,
+and reformatting backends.
 
 - Upstream: <https://github.com/indianewok/rad>
-- RAD version: `1.0.2`
-- Source commit: `24d5ce47e172222c96cd7dd19e94758d32aa5009`
+- Upstream declared version: `1.0.2` (development snapshot)
+- Source commit: `616754007313ecb6fb875beb3a3fecfd3d83a267` (`dev`)
+- Resource commit: `24d5ce47e172222c96cd7dd19e94758d32aa5009`; resource
+  bytes are unchanged by this source update
 - Copied path: upstream `include/`
 - Adapted paths: the complete machine-readable list is in
   `RAD_VENDOR.json`. It covers modified headers under `include/`, the new
-  portable OpenMP compatibility header, and the `reformat` section of
-  upstream `src/main.cpp` exposed as `include/rad/reformat.hpp`.
+  portable OpenMP compatibility header, the `reformat` section of upstream
+  `src/main.cpp`, and typed adaptations of `src/discovery_*.cpp` and
+  `src/spatial.cpp`. The standalone command parser and process-wide stdout
+  redirection are not part of the R API.
 - Upstream RAD license: MIT; see `LICENSE`
 - Bundled dependency licenses: see the installed
   `THIRD_PARTY_NOTICES.md` and `licenses/` files
@@ -119,10 +124,32 @@ Embedding adaptations are deliberately limited to the vendored copy:
     order, and leaves split-file selection keyed by `CB:Z:`. It omits absent
     annotations and rejects whitespace plus pRESTO's reserved field,
     assignment, and list delimiters before transactional output publication.
-21. Barcode correction keeps its padded search region as a string whenever it
-    is wider than the 32-base packed representation. Sliding barcode-length
-    k-mers still search the complete region, while later packed fallback
-    scoring conservatively uses the original barcode instead of overflowing.
+21. Packed barcode catalogs support up to 64 bases using narrow or wide
+    storage. Search regions wider than the packed representation remain
+    strings; wide alignment uses Edlib instead of overflowing fixed-width
+    alignment state. Native unsigned 128-bit support is checked at configure.
+22. The concatemer HMM is included in the package namespace with standard and
+    SIMD headers outside that namespace. Its internal index assertion is a
+    recoverable exception. Calibration workers capture failures and join
+    safely on cancellation; host callbacks run only on the calling thread.
+    Adapter calibration completes first, then a bounded second input pass
+    calibrates the HMM on the final layout topology. Reverse-model parameters
+    use existing rows when a layout has only one explicit strand; implicit
+    mirrored-anchor and poly-tail states use parameter-only rows without
+    positional fields. Cache import preserves those tables without creating
+    layout elements.
+23. Adaptive misalignment calibration retains strict FASTQ/gzip error
+    reporting and polls host interrupts while reading and processing blocks.
+    Its chance-hit histogram controls calibrated thresholds; insufficient
+    observations retain the documented fallback threshold.
+24. Layout/whitelist discovery and explicit-map spatial export are typed
+    in-process APIs with input validation, cancellation and checked staged
+    publication. Spatial identities come from the supplied slide map or axis
+    tables rather than inferred whitelist order.
+25. Optional demultiplexed streaming uses caller-owned R connections through
+    the bridge on the main thread. It does not redirect process stdout or
+    replace process signal handlers. Report artifacts remain staged; primary,
+    debug and unresolved-read sequence files are suppressed in stream mode.
 
 The bridge resolves the installed `rrad` resource bundle through
 `system.file("rad/resources", package = "rrad")`. For an unchanged built-in
@@ -140,7 +167,9 @@ enables cache reuse.
 Package configuration link-probes C++17 `std::filesystem` and adds
 `-lstdc++fs` only for older toolchains that require it. It also checks zlib and
 POSIX threads, which the asynchronous streaming writer needs even in serial
-builds. OpenMP is optional and is enabled only after compiling and loading a
+builds, and unsigned 128-bit arithmetic for 64-base packed barcodes. Supported
+64-bit GCC and Clang toolchains provide this type; an unsupported compiler
+fails configuration with a specific diagnostic. OpenMP is optional and is enabled only after compiling and loading a
 probe with R's selected C++17 compiler. The default macOS build is deliberately
 serial because Apple's compiler does not include an OpenMP runtime. Set
 `RRAD_OPENMP=no` before installation to force a serial build on any platform,
