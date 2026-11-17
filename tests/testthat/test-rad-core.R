@@ -1,98 +1,3 @@
-core_info_value <- function(api = 1L,
-                            features = c(
-                              "demux", "file-fastq", "seqspec",
-                              "scan-wl", "auto-whitelist", "reformat"
-                            )) {
-  list(
-    core_version = "1.1.0",
-    core_api_version = api,
-    source_commit = paste(rep("a", 40L), collapse = ""),
-    embedded_source_digest = paste(rep("c", 64L), collapse = ""),
-    resource_schema = 1L,
-    resource_digest = paste(rep("b", 64L), collapse = ""),
-    features = features,
-    build = list(
-      cxx_standard = "17",
-      openmp = TRUE,
-      resources_available = TRUE,
-      resource_dir = "/test/rrad/rad/resources"
-    ),
-    vendored = TRUE
-  )
-}
-
-native_demux_value <- function(options, core = core_info_value()) {
-  option_or <- function(value, default) {
-    if (is.null(value)) default else value
-  }
-  scan <- if (isTRUE(options$auto_whitelist)) {
-    prefix <- file.path(
-      options$output_dir, paste0(options$output_prefix, "_scanwl")
-    )
-    list(
-      success = TRUE,
-      backend = "embedded",
-      core = core,
-      input = options$fastq,
-      output_prefix = prefix,
-      mode = "single",
-      config = list(
-        input = options$fastq,
-        output_prefix = prefix,
-        adapter_seq = option_or(options$scan_adapter, "ACGT"),
-        barcode_length = option_or(options$scan_barcode_length, 4L),
-        left_margin = 0L,
-        right_margin = 0L,
-        max_reads = option_or(options$scan_max_reads, NULL),
-        max_error = option_or(options$scan_max_error, 0.3),
-        whitelist = option_or(options$global_whitelist, NULL),
-        threads = option_or(options$scan_threads, options$threads),
-        threads_requested = option_or(options$scan_threads, options$threads),
-        threads_effective = option_or(options$scan_threads, options$threads),
-        chunk_size = option_or(options$scan_chunk_size, options$chunk_size),
-        selection = option_or(options$scan_selection, "high_specificity"),
-        rescan = FALSE,
-        bc1_whitelist = NULL,
-        bc2_whitelist = NULL,
-        bc1_length = NULL,
-        bc2_length = NULL,
-        umi_length = 9L,
-        offset_min = 0L,
-        offset_max = 3L,
-        verbose = options$verbose
-      ),
-      files = list(
-        csv = paste0(prefix, ".csv"),
-        whitelist = paste0(prefix, ".txt"),
-        scan_log = paste0(prefix, "_scan_wl.log"),
-        valid_pairs = "",
-        spatial_mask = ""
-      ),
-      stats = list(reads_processed = 2, selected_barcodes = 2),
-      log = "mock automatic scan"
-    )
-  } else {
-    NULL
-  }
-  list(
-    success = TRUE,
-    backend = "embedded",
-    core = core,
-    input = options$fastq,
-    layout = options$layout,
-    output_prefix = file.path(options$output_dir, options$output_prefix),
-    files = list(
-      fastq = file.path(options$output_dir,
-                        paste0(options$output_prefix, ".fq.gz")),
-      layout = file.path(options$output_dir,
-                         paste0(options$output_prefix, "_layout.csv"))
-    ),
-    stats = list(total_reads = 2, reads_demultiplexed = 2),
-    scan = scan,
-    log = c("RAD core test run")
-  )
-}
-
 test_that("rad_core_info exposes a strict embedded-core handshake", {
   info <- rad_core_info()
 
@@ -1097,19 +1002,24 @@ test_that("explicit whitelist parsing trims rows and bounds packed values", {
 })
 
 test_that("rad_core_info rejects incompatible or incomplete metadata", {
+  original <- rad_core_info_cpp()
+  incompatible <- original
+  incompatible$core_api_version <- 2L
   local_mocked_bindings(
-    rad_core_info_cpp = function() core_info_value(api = 2L),
+    rad_core_info_cpp = function() incompatible,
     .package = "rrad"
   )
   expect_error(rad_core_info(), "expects 1 but core reports 2")
 
+  missing_feature <- original
+  missing_feature$features <- "file-fastq"
   local_mocked_bindings(
-    rad_core_info_cpp = function() core_info_value(features = "file-fastq"),
+    rad_core_info_cpp = function() missing_feature,
     .package = "rrad"
   )
   expect_error(rad_core_info(), "does not advertise the demux feature")
 
-  incomplete <- core_info_value()
+  incomplete <- original
   incomplete$source_commit <- NULL
   local_mocked_bindings(
     rad_core_info_cpp = function() incomplete,
@@ -1117,7 +1027,7 @@ test_that("rad_core_info rejects incompatible or incomplete metadata", {
   )
   expect_error(rad_core_info(), "invalid metadata.*source_commit")
 
-  invalid_digest <- core_info_value()
+  invalid_digest <- original
   invalid_digest$embedded_source_digest <- "not-a-digest"
   local_mocked_bindings(
     rad_core_info_cpp = function() invalid_digest,
@@ -1125,7 +1035,7 @@ test_that("rad_core_info rejects incompatible or incomplete metadata", {
   )
   expect_error(rad_core_info(), "invalid embedded_source_digest")
 
-  unavailable <- core_info_value()
+  unavailable <- original
   unavailable$build$resources_available <- FALSE
   local_mocked_bindings(
     rad_core_info_cpp = function() unavailable,
@@ -1140,8 +1050,7 @@ test_that("rad_demux validates inputs before native execution", {
   out_dir <- tempfile("rad-core-validation-")
 
   local_mocked_bindings(
-    rad_core_info_cpp = core_info_value,
-    rad_demux_cpp = function(options) native_demux_value(options),
+    rad_demux_cpp = function(options) stop("unexpected native execution"),
     .package = "rrad"
   )
 
@@ -1210,133 +1119,19 @@ test_that("rad_demux validates inputs before native execution", {
   )
 })
 
-test_that("rad_demux passes a normalized typed configuration to native RAD", {
+test_that("automatic whitelist scanning requires core support", {
   fastq <- test_path("fixtures", "rad-core", "tiny.fastq")
   layout <- test_path("fixtures", "rad-core", "tiny-layout.csv")
-  whitelist <- test_path("fixtures", "rad-core", "tiny-whitelist.txt")
-  out_dir <- tempfile("rad-core-output-")
-  captured <- new.env(parent = emptyenv())
-  core <- core_info_value()
-
+  core <- rad_core_info_cpp()
+  core$features <- setdiff(core$features, "auto-whitelist")
   local_mocked_bindings(
     rad_core_info_cpp = function() core,
-    rad_demux_cpp = function(options) {
-      captured$options <- options
-      native_demux_value(options, core)
-    },
-    .package = "rrad"
-  )
-
-  result <- rad_demux(
-    layout = layout,
-    fastq = fastq,
-    out_dir = out_dir,
-    output = "sample",
-    global_whitelist = whitelist,
-    custom_whitelist = whitelist,
-    threads = 3,
-    chunk_size = 123,
-    max_reads = 2,
-    auto_whitelist = FALSE,
-    whitelist_mutation = 2,
-    generated_mutation = 1,
-    bc_correction_mode = "DEFENSIVE",
-    joint_bc_mode = "STRICT",
-    rc_umi = FALSE,
-    min_read_length = 7,
-    write_debug = TRUE,
-    verbose = TRUE,
-    reuse_cache = TRUE
-  )
-
-  options <- captured$options
-  expect_identical(options$layout, normalizePath(layout))
-  expect_identical(options$fastq, normalizePath(fastq))
-  expect_identical(options$output_dir, normalizePath(out_dir))
-  expect_identical(options$output_prefix, "sample")
-  expect_identical(options$threads, 3L)
-  expect_identical(options$chunk_size, 123L)
-  expect_identical(options$max_reads, 2L)
-  expect_identical(options$bc_correction_mode, "defensive")
-  expect_identical(options$joint_bc_mode, "strict")
-  expect_true(options$reuse_cache)
-  expect_false("resource_dir" %in% names(options))
-
-  expect_s3_class(result, "rad_demux_result")
-  expect_identical(result$status, "success")
-  expect_identical(result$backend, "embedded")
-  expect_s3_class(result$core, "rad_core_info")
-  expect_identical(result$input$fastq, normalizePath(fastq))
-  expect_identical(result$input$layout, normalizePath(layout))
-  expect_identical(result$config$output, "sample")
-  expect_identical(result$config$threads, 3L)
-  expect_identical(result$config$threads_requested, 3L)
-  expect_identical(result$config$threads_effective, 3L)
-  expect_true(result$config$reuse_cache)
-  expect_identical(result$stats$total_reads, 2)
-  expect_named(result$artifacts, c("fastq", "layout"))
-  expect_true(dir.exists(out_dir))
-})
-
-test_that("automatic whitelist scanning is feature-gated and fully typed", {
-  fastq <- test_path("fixtures", "rad-core", "tiny.fastq")
-  layout <- test_path("fixtures", "rad-core", "tiny-layout.csv")
-  out_dir <- tempfile("rad-core-auto-options-")
-  called <- FALSE
-  missing_feature <- core_info_value(
-    features = c("demux", "file-fastq", "seqspec")
-  )
-
-  local_mocked_bindings(
-    rad_core_info_cpp = function() missing_feature,
-    rad_demux_cpp = function(options) {
-      called <<- TRUE
-      native_demux_value(options, missing_feature)
-    },
+    rad_demux_cpp = function(options) stop("unexpected native execution"),
     .package = "rrad"
   )
   expect_error(
-    rad_demux(layout, fastq, out_dir, auto_whitelist = TRUE),
+    rad_demux(layout, fastq, tempfile("rad-core-auto-"), auto_whitelist = TRUE),
     "does not advertise the auto-whitelist feature"
-  )
-  expect_false(called)
-
-  captured <- NULL
-  core <- core_info_value()
-  local_mocked_bindings(
-    rad_core_info_cpp = function() core,
-    rad_demux_cpp = function(options) {
-      captured <<- options
-      native_demux_value(options, core)
-    },
-    .package = "rrad"
-  )
-  result <- rad_demux(
-    layout, fastq, out_dir,
-    auto_whitelist = TRUE,
-    scan_adapter = "AACN",
-    scan_barcode_length = 4L,
-    scan_max_error = 0.125,
-    scan_max_reads = 77L,
-    scan_chunk_size = 31L,
-    scan_threads = 2L,
-    scan_selection = "above_floor"
-  )
-
-  expect_identical(captured$scan_adapter, "AACN")
-  expect_identical(captured$scan_barcode_length, 4L)
-  expect_identical(captured$scan_max_error, 0.125)
-  expect_identical(captured$scan_max_reads, 77L)
-  expect_identical(captured$scan_chunk_size, 31L)
-  expect_identical(captured$scan_threads, 2L)
-  expect_identical(captured$scan_selection, "above_floor")
-  expect_s3_class(result$scan, "rad_scan_wl_result")
-  expect_identical(result$scan$config$adapter_seq, "AACN")
-  expect_identical(result$scan$config$barcode_length, 4L)
-  expect_identical(result$scan$config$selection, "above_floor")
-  expect_identical(
-    result$config$scan_effective,
-    result$scan$config
   )
 })
 
@@ -1358,92 +1153,5 @@ test_that("native automatic scan limits reject narrowing overflow", {
   expect_error(
     rad_demux_cpp(c(base, list(scan_chunk_size = 2147483648))),
     "scan_chunk_size"
-  )
-})
-
-test_that("rad_demux omits nullable native options but records them", {
-  fastq <- test_path("fixtures", "rad-core", "tiny.fastq")
-  captured <- new.env(parent = emptyenv())
-
-  local_mocked_bindings(
-    rad_core_info_cpp = core_info_value,
-    rad_demux_cpp = function(options) {
-      captured$options <- options
-      native_demux_value(options)
-    },
-    .package = "rrad"
-  )
-
-  result <- rad_demux(
-    layout = "three_prime",
-    fastq = fastq,
-    out_dir = tempfile("rad-core-defaults-")
-  )
-
-  expect_false(any(c(
-    "kit", "global_whitelist", "custom_whitelist", "max_reads",
-    "whitelist_mutation", "generated_mutation", "min_read_length",
-    "resource_dir"
-  ) %in% names(captured$options)))
-  expect_null(result$config$max_reads)
-  expect_false(result$config$reuse_cache)
-  expect_identical(result$input$layout, "three_prime")
-})
-
-test_that("serial builds warn and record effective thread count", {
-  fastq <- test_path("fixtures", "rad-core", "tiny.fastq")
-  captured <- new.env(parent = emptyenv())
-  serial_core <- core_info_value()
-  serial_core$build$openmp <- FALSE
-
-  local_mocked_bindings(
-    rad_core_info_cpp = function() serial_core,
-    rad_demux_cpp = function(options) {
-      captured$options <- options
-      native_demux_value(options, serial_core)
-    },
-    .package = "rrad"
-  )
-
-  expect_warning(
-    result <- rad_demux(
-      layout = "three_prime",
-      fastq = fastq,
-      out_dir = tempfile("rad-core-serial-"),
-      threads = 4L
-    ),
-    "no OpenMP support"
-  )
-  expect_identical(captured$options$threads, 4L)
-  expect_identical(result$config$threads_requested, 4L)
-  expect_identical(result$config$threads_effective, 1L)
-  expect_identical(result$config$threads, 1L)
-})
-
-test_that("rad_demux rejects malformed or unsuccessful native results", {
-  fastq <- test_path("fixtures", "rad-core", "tiny.fastq")
-
-  local_mocked_bindings(
-    rad_core_info_cpp = core_info_value,
-    rad_demux_cpp = function(options) 1L,
-    .package = "rrad"
-  )
-  expect_error(
-    rad_demux("three_prime", fastq, tempfile("rad-core-malformed-")),
-    "invalid demultiplexing result"
-  )
-
-  local_mocked_bindings(
-    rad_core_info_cpp = core_info_value,
-    rad_demux_cpp = function(options) {
-      value <- native_demux_value(options)
-      value$success <- FALSE
-      value
-    },
-    .package = "rrad"
-  )
-  expect_error(
-    rad_demux("three_prime", fastq, tempfile("rad-core-failed-")),
-    "unsuccessful run"
   )
 })

@@ -1,4 +1,4 @@
-hmm_port_read <- function(path) {
+hmm_read_lines <- function(path) {
   connection <- gzfile(path, "rt")
   on.exit(close(connection), add = TRUE)
   readLines(connection, warn = FALSE)
@@ -17,7 +17,7 @@ test_that("HMM stays opt-in and preserves calibrated columns on cache reuse", {
     concat_hmm = TRUE, reuse_cache = TRUE
   )
   first <- run()
-  first_output <- hmm_port_read(first$artifacts$fastq)
+  first_output <- hmm_read_lines(first$artifacts$fastq)
   parameters <- utils::read.csv(first$artifacts$position_map,
                                 check.names = FALSE, stringsAsFactors = FALSE)
   hmm_columns <- startsWith(names(parameters), "hmm_")
@@ -27,9 +27,9 @@ test_that("HMM stays opt-in and preserves calibrated columns on cache reuse", {
   # One calibration read must not claim a reliable fitted HMM. Its guarded
   # fallback still retains the ordinary extractor's output.
   expect_match(first$log, "calibration guard failed", ignore.case = TRUE)
-  expect_identical(first_output, hmm_port_read(ordinary$artifacts$fastq))
+  expect_identical(first_output, hmm_read_lines(ordinary$artifacts$fastq))
   expect_equal(first$stats$hmm_boundary_unresolved_parents, 0)
-  expect_length(hmm_port_read(first$artifacts$boundary_unresolved), 0L)
+  expect_length(hmm_read_lines(first$artifacts$boundary_unresolved), 0L)
   expect_false(grepl("different layout topology|has no layout element", first$log))
 
   cached <- run()
@@ -37,7 +37,7 @@ test_that("HMM stays opt-in and preserves calibrated columns on cache reuse", {
                                        check.names = FALSE, stringsAsFactors = FALSE)
   expect_identical(cached_parameters[, hmm_columns, drop = FALSE],
                    parameters[, hmm_columns, drop = FALSE])
-  expect_identical(hmm_port_read(cached$artifacts$fastq), first_output)
+  expect_identical(hmm_read_lines(cached$artifacts$fastq), first_output)
   expect_false(grepl("Calibration on", cached$log, fixed = TRUE))
   expect_false(grepl("different layout topology|has no layout element", cached$log))
 })
@@ -71,7 +71,7 @@ test_that("a fitted HMM runs through the R demux interface", {
   expect_false(grepl("CALIBRATION GUARD FAILED", result$log, fixed = TRUE))
   expect_false(grepl("different layout topology|has no layout element", result$log))
   expect_match(result$log, "guard=0", fixed = TRUE)
-  output <- hmm_port_read(result$artifacts$fastq)
+  output <- hmm_read_lines(result$artifacts$fastq)
   expect_equal(length(output), result$stats$records_serialized * 4)
   expect_gte(result$stats$records_serialized, 200)
   headers <- output[seq.int(1L, length(output), 4L)]

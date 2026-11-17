@@ -23,14 +23,17 @@ real sequencing chemistry or a statistical benchmark.
 
 ## Pack and inspect reads
 
-Each synthetic read has an eight-base adapter, a four-base cell barcode, an
-eight-base poly-T segment, and a short cDNA sequence. Quality strings must have
+Each synthetic read has an adapter, a sixteen-base cell barcode, an eight-base
+UMI, a second adapter, and a short cDNA sequence. Quality strings must have
 exactly the same lengths as their sequences. Phred offsets are explicit; they
 are never guessed from input.
 
 ```{r pack}
-sequences <- c("ACGTACGTAACCTTTTTTTTGATTACA",
-               "ACGTACGTTTGATTTTTTTTCAGTCA")
+adapter <- "AATGTACTTCGTTCAGTTACGTATTGCTAAGGTTAA"
+adapter2 <- "CAGCACCTGATTACAAGGTGCTG"
+barcodes <- c("GACCTAGTTCAGGATC", "CAGTTCGATGACCTGA")
+umis <- c("CGTATGCA", "TAGCATCG")
+sequences <- paste0(adapter, barcodes, umis, adapter2, c("GATTACA", "CAGTCA"))
 reads <- rad_pack_reads(
   seq_id = c("read-1", "read-2"),
   seq = sequences,
@@ -70,9 +73,10 @@ layout <- file.path(work, "layout.csv")
 writeLines(c(
   "Read Layout,,,,,",
   "id,seq,expected_length,type,class,whitelist",
-  "anchor,ACGTACGT,,static,linker,",
-  "barcode,,4,variable,barcode,",
-  "poly_t,TTTTTTTT,,static,poly_t,",
+  paste0("anchor,", adapter, ",,static,linker,"),
+  "barcode,,16,variable,barcode,",
+  "umi,,8,variable,umi,",
+  paste0("anchor2,", adapter2, ",,static,linker,"),
   "read,,,variable,read,"
 ), layout)
 ```
@@ -87,8 +91,8 @@ intended for data sets with enough observations to estimate a count distribution
 scan <- rad_scan_wl(
   input = fastq,
   output_prefix = file.path(work, "cells"),
-  adapter_seq = "ACGTACGT",
-  barcode_length = 4L,
+  adapter_seq = adapter,
+  barcode_length = 16L,
   max_error = 0,
   selection = "above_floor",
   threads = 1L
@@ -129,8 +133,8 @@ Explicit local catalogs keep this example offline.
 discovered <- rad_discover(
   input = fastq,
   out_dir = file.path(work, "discover"),
-  pattern = "ACGTACGT",
-  barcode_length = 4L,
+  pattern = adapter,
+  barcode_length = 16L,
   catalogs = c(example = scan$artifacts$whitelist),
   max_error = 0
 )
@@ -154,7 +158,7 @@ must supply a map that describes the experimental slide.
 ```{r spatial-export}
 spatial_map <- file.path(work, "spatial-map.tsv")
 write.table(data.frame(
-  barcode = c("AACC", "TTGA"), array_row = c(0L, 1L),
+  barcode = barcodes, array_row = c(0L, 1L),
   array_col = c(0L, 1L), in_tissue = c(1L, 1L)
 ), spatial_map, sep = "\t", quote = FALSE, row.names = FALSE)
 spatial <- rad_spatial_reformat(
@@ -220,7 +224,7 @@ readLines(fasta$artifacts$fasta)
 
 pRESTO output uses `QNAME|BARCODE=...|UMI=...`, omitting annotations absent
 from the input. `BARCODE` prefers a spatial `BC:Z:` tag and otherwise uses
-`CB:Z:`. This toy layout has no UMI, so its output has no UMI annotation.
+`CB:Z:`. This example includes both barcode and UMI annotations.
 `header_format = "preserve"` retains the original tags, while `"collapsed"`
 uses RAD's legacy positional header. To split output by cell barcode, use
 `split_bc = TRUE` with `out_dir`; splitting is always keyed by `CB:Z:`.

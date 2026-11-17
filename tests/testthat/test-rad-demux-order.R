@@ -51,6 +51,9 @@ test_that("multithreaded demux preserves input FASTQ order", {
   output_headers <- parallel_output[seq.int(1L, length(parallel_output), 4L)]
   output_ids <- sub("-[FR].*$", "", sub("^@", "", output_headers))
 
+  expect_identical(parallel$config$threads_requested, 2L)
+  expect_identical(parallel$config$threads_effective,
+                   if (isTRUE(rad_core_info()$build$openmp)) 2L else 1L)
   expect_identical(output_ids, ids)
   expect_identical(parallel_output, serial_output)
 })

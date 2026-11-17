@@ -137,7 +137,7 @@ must not be counted as additional demultiplexed molecules.
 The explicit spatial exporter requires a validated barcode-to-coordinate map
 or two barcode-axis maps. It supports spot/bin or cell identities, tissue
 filtering, and per-read audit rows. This is separate from the existing
-`rad_reformat(coordinate_mode = "vizHD-v1")` convenience transformation.
+`rad_reformat(coordinate = "vizHD-v1")` convenience transformation.
 See `?rad_discover`, `?rad_spatial_reformat`, `?rad_scan_wl`, and `?rad_demux`
 for input formats and returned artifacts.
 
@@ -164,12 +164,37 @@ source digest, and resource digest. These distinguish the embedded code from
 an independently installed RAD executable. Package installation, loading, and
 the included examples, vignette, and tests do not download runtime resources.
 
+## Use RRAD with an AI agent
+
+The package includes a portable [RRAD skill](inst/skills/rrad/SKILL.md) for
+agents that can run R. It covers the native workflow, packed-read storage,
+output handling, and installed help. It adds no R dependencies or services.
+
+After installing this version of rrad, copy its skill to your agent's skill
+directory. For Codex, run once in R:
+
+```r
+skill_source <- system.file("skills", "rrad", package = "rrad")
+stopifnot(nzchar(skill_source))
+skill_home <- Sys.getenv("CODEX_HOME")
+if (!nzchar(skill_home)) skill_home <- path.expand("~/.codex")
+skill_root <- file.path(skill_home, "skills")
+dir.create(skill_root, recursive = TRUE, showWarnings = FALSE)
+file.copy(skill_source, skill_root, recursive = TRUE)
+```
+
+Use `$rrad`, for example: "Use $rrad to filter these FASTQ files by mean quality,
+keep the inputs, and save the retained reads." The agent uses the installed R
+package and its help files. Replace an older skill copy when updating rrad.
+Other agents can use the same `SKILL.md` in their own skill directory.
+
 ## Development and licensing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for package checks and the source layout.
-The CI workflow checks Linux and both macOS architectures, including serial
-and explicit OpenMP builds, native regressions, and Linux sanitizers. Review
-the completed checks for the exact commit before release.
+Routine CI checks Linux release/devel, both macOS architectures, and native
+memory safety. The manual extended run adds Linux ARM, old-release and serial
+builds, macOS OpenMP, native suites on each release platform, and the PDF
+manual. Review the extended results before release.
 
 `rrad` is licensed under GPL-3 or later. Vendored components retain their own
 licenses and attribution; see [third-party notices](inst/THIRD_PARTY_NOTICES.md)

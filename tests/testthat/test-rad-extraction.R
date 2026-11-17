@@ -1,9 +1,9 @@
-port_reverse_complement <- function(sequence) {
+extraction_reverse_complement <- function(sequence) {
   paste(rev(strsplit(chartr("ACGT", "TGCA", sequence), "", fixed = TRUE)[[1L]]),
         collapse = "")
 }
 
-port_write_fastq <- function(path, sequences) {
+extraction_write_fastq <- function(path, sequences) {
   lines <- unlist(lapply(seq_along(sequences), function(i) {
     sequence <- sequences[[i]]
     c(paste0("@", names(sequences)[[i]]), sequence, "+",
@@ -12,7 +12,7 @@ port_write_fastq <- function(path, sequences) {
   writeLines(lines, path)
 }
 
-port_read_fastq <- function(path) {
+extraction_read_fastq <- function(path) {
   connection <- gzfile(path, "rt")
   on.exit(close(connection), add = TRUE)
   readLines(connection, warn = FALSE)
@@ -42,12 +42,12 @@ test_that("barcode positioning moves a chained UMI in both orientations", {
   # This inserted base moves the real barcode and its adjacent UMI one base
   # beyond the layout prediction. Sequence and quality must move together.
   sequence <- paste0(anchor, "C", barcode, umi, anchor2, cdna)
-  port_write_fastq(fastq, c(forward = sequence,
-                          reverse = port_reverse_complement(sequence)))
+  extraction_write_fastq(fastq, c(forward = sequence,
+                          reverse = extraction_reverse_complement(sequence)))
   result <- rad_demux(layout, fastq, file.path(work, "out"), threads = 1L,
                       chunk_size = 2L, min_read_length = 0L,
                       whitelist_mutation = 0L, generated_mutation = 0L)
-  records <- port_read_fastq(result$artifacts$fastq)
+  records <- extraction_read_fastq(result$artifacts$fastq)
   headers <- records[c(1L, 5L)]
   expect_equal(result$stats$records_serialized, 2)
   expect_true(all(grepl(paste0("CB:Z:", barcode), headers, fixed = TRUE)))
@@ -56,7 +56,7 @@ test_that("barcode positioning moves a chained UMI in both orientations", {
   expect_match(headers[[2L]], "TS:A:-", fixed = TRUE)
   expect_equal(nchar(records[c(2L, 6L)]), nchar(records[c(4L, 8L)]))
   expect_identical(records[[2L]], cdna)
-  expect_identical(records[[6L]], port_reverse_complement(cdna))
+  expect_identical(records[[6L]], extraction_reverse_complement(cdna))
   counts <- utils::read.csv(result$artifacts$whitelist_true)
   expect_named(counts, c("class_id", "true_barcode", "raw_count", "total_count",
                         "corrected_count", "forw_count", "rev_count",
@@ -86,7 +86,7 @@ test_that("minimum read length counts cleaned cDNA", {
   sequence <- paste0(anchor, barcode, substr(cdna, 1L, 20L),
                      paste(rep("N", 20L), collapse = ""),
                      substr(cdna, 21L, nchar(cdna)), anchor2)
-  port_write_fastq(fastq, c(trim = sequence))
+  extraction_write_fastq(fastq, c(trim = sequence))
   run <- function(minimum) rad_demux(
     layout, fastq, file.path(work, paste0("min-", minimum)),
     threads = 1L, chunk_size = 1L, min_read_length = minimum
@@ -94,9 +94,9 @@ test_that("minimum read length counts cleaned cDNA", {
   kept <- run(nchar(cdna))
   removed <- run(nchar(cdna) + 1L)
   expect_equal(kept$stats$records_serialized, 1)
-  expect_identical(port_read_fastq(kept$artifacts$fastq)[[2L]], cdna)
+  expect_identical(extraction_read_fastq(kept$artifacts$fastq)[[2L]], cdna)
   expect_equal(removed$stats$reads_passing_filter, 0)
-  expect_length(port_read_fastq(removed$artifacts$fastq), 0L)
+  expect_length(extraction_read_fastq(removed$artifacts$fastq), 0L)
 })
 
 test_that("joint barcode mask violations cannot fall back to independent calls", {
@@ -124,13 +124,13 @@ test_that("joint barcode mask violations cannot fall back to independent calls",
   allowed <- paste0(anchor, axis1[[1L]], axis2[[1L]], "CGTATGCA", anchor2,
                     "GACTCGACTAGCTACGATCGTAGCATGCTAGCTGACTAGCA")
   forbidden <- sub(axis2[[1L]], axis2[[2L]], allowed, fixed = TRUE)
-  port_write_fastq(fastq, c(allowed_f = allowed, forbidden_f = forbidden,
-                          allowed_r = port_reverse_complement(allowed),
-                          forbidden_r = port_reverse_complement(forbidden)))
+  extraction_write_fastq(fastq, c(allowed_f = allowed, forbidden_f = forbidden,
+                          allowed_r = extraction_reverse_complement(allowed),
+                          forbidden_r = extraction_reverse_complement(forbidden)))
   result <- rad_demux(layout, fastq, file.path(work, "out"), threads = 1L,
                       chunk_size = 4L, min_read_length = 0L,
                       whitelist_mutation = 0L, generated_mutation = 0L)
-  output <- port_read_fastq(result$artifacts$fastq)
+  output <- extraction_read_fastq(result$artifacts$fastq)
   headers <- output[seq.int(1L, length(output), 4L)]
   expect_equal(result$stats$records_serialized, 2)
   expect_true(all(grepl("@allowed_", headers, fixed = TRUE)))

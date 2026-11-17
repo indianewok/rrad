@@ -1,0 +1,4 @@
+interface:
+  display_name: "RRAD"
+  short_description: "Process sequencing reads with native RRAD R functions"
+  default_prompt: "Use $rrad to process my sequencing reads with the installed R package."

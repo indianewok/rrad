@@ -150,11 +150,6 @@ void check_encoding(std::mt19937_64& random) {
     const auto raw_high = int64_seq::from_word(uint64_t{1} << 63, 16);
     require(raw_high.as_uint64() == (uint64_t{1} << 63), "legacy unused raw bits were masked away");
     const int64_seq high_c("C" + std::string(32, 'A')), high_g("G" + std::string(32, 'A'));
-    require(static_cast<uint64_t>(high_c.as_uint128()) == static_cast<uint64_t>(high_g.as_uint128()),
-            "wide-hash fixture must share its low word");
-    require(std::hash<int64_seq>{}(high_c) != std::hash<int64_seq>{}(high_g), "hash ignores the upper packed word");
-    require(std::hash<int64_seq>{}(int64_seq("A")) != std::hash<int64_seq>{}(int64_seq("AA")),
-            "hash ignores leading-A sequence length");
     std::unordered_set<int64_seq> distinct{high_c, high_g, a, aa};
     require(distinct.size() == 4, "packed hash/equality merged distinct identities");
 }

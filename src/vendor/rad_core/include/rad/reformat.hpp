@@ -726,27 +726,6 @@ struct split_writer_state {
     uint64_t gzip_members = 0;
 };
 
-inline size_t split_commit_fail_after_install() noexcept {
-#ifdef RRAD_EMBEDDED
-    // Test-only allocation failpoint. Parsing is deliberately allocation-free
-    // because it is consulted while preparing transactional bookkeeping.
-    const char* raw = std::getenv(
-        "RRAD_TEST_REFORMAT_FAIL_AFTER_SPLIT_INSTALL");
-    if (!raw || !*raw) return 0;
-    char* end = nullptr;
-    errno = 0;
-    const unsigned long long value = std::strtoull(raw, &end, 10);
-    if (errno != 0 || end == raw || *end != '\0' || value == 0 ||
-        value > static_cast<unsigned long long>(
-                    std::numeric_limits<size_t>::max())) {
-        return 0;
-    }
-    return static_cast<size_t>(value);
-#else
-    return 0;
-#endif
-}
-
 inline void close_split_writers(
     std::unordered_map<std::string, std::unique_ptr<split_writer_state>>& states) {
     std::exception_ptr first_error;
@@ -777,7 +756,6 @@ inline void commit_split_outputs(
     };
     std::vector<split_commit_state> commit_states;
     commit_states.reserve(ordered.size());
-    const size_t fail_after_install = split_commit_fail_after_install();
 
     // Preflight the full set and allocate every path and rollback slot before
     // moving any existing output. Once publication starts, bookkeeping is
@@ -831,7 +809,6 @@ inline void commit_split_outputs(
             }
         }
 
-        size_t installed_count = 0;
         for (auto& state : commit_states) {
             if (overwrite) {
                 fs::rename(state.output->staged_path, state.final_path);
@@ -840,10 +817,6 @@ inline void commit_split_outputs(
                     state.output->staged_path, state.final_path);
             }
             state.output_installed = true;
-            ++installed_count;
-            if (fail_after_install == installed_count) {
-                throw std::bad_alloc();
-            }
         }
     } catch (...) {
         for (auto it = commit_states.rbegin();

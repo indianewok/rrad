@@ -1,5 +1,10 @@
 # rrad 1.3.0
 
+* Include a portable RRAD agent skill with native R workflow guidance.
+* Simplify mocked tests and routine CI, retain behavioral regressions and
+  optional full release checks, and remove test-only runtime failure switches.
+* Use a complete synthetic scaffold in the workflow vignette so its demux,
+  spatial assignment, and pRESTO examples produce reads.
 * Update the embedded RAD engine to development commit
   `616754007313ecb6fb875beb3a3fecfd3d83a267`, retaining rrad's validated input,
   captured diagnostics, cancellation, and transactional output protections.

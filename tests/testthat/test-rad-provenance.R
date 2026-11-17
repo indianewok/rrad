@@ -1,59 +1,11 @@
-rad_provenance_command <- function(command, args = character(),
-                                   env = character()) {
-  output <- suppressWarnings(system2(
-    command, args, stdout = TRUE, stderr = TRUE, env = env
-  ))
-  status <- attr(output, "status", exact = TRUE)
-  if (!is.null(status) && status != 0L) {
-    stop(paste(output, collapse = "\n"), call. = FALSE)
-  }
-  output
-}
-
-rad_canonical_tree_sha256 <- function(root, commands) {
-  old_dir <- setwd(root)
-  on.exit(setwd(old_dir), add = TRUE)
-
-  paths <- rad_provenance_command(
-    commands[["find"]], c(".", "-type", "f", "-print"), env = "LC_ALL=C"
-  )
-  if (length(paths) == 0L || any(!startsWith(paths, "./"))) {
-    stop("canonical digest input must be a non-empty relative file tree",
-         call. = FALSE)
-  }
-  paths <- substring(paths, 3L)
-
-  path_manifest <- tempfile("rad-provenance-paths-")
-  hash_manifest <- tempfile("rad-provenance-hashes-")
-  on.exit(unlink(c(path_manifest, hash_manifest)), add = TRUE)
-  writeLines(enc2utf8(paths), path_manifest, useBytes = TRUE)
-  paths <- rad_provenance_command(
-    commands[["sort"]], shQuote(path_manifest), env = "LC_ALL=C"
-  )
-
-  hash_file <- function(path) {
-    hash_command <- commands[["hash"]]
-    args <- if (identical(basename(hash_command), "shasum")) {
-      c("-a", "256", shQuote(path))
-    } else {
-      shQuote(path)
-    }
-    output <- rad_provenance_command(hash_command, args)
-    if (length(output) != 1L ||
-        !grepl("^[0-9a-f]{64}[ *]", output, perl = TRUE)) {
-      stop("unexpected SHA-256 output while building canonical manifest",
-           call. = FALSE)
-    }
-    substring(output, 1L, 64L)
-  }
-
-  hashes <- vapply(paths, function(path) {
-    hash_file(path)
-  }, character(1L), USE.NAMES = FALSE)
-
+rad_canonical_tree_sha256 <- function(root) {
+  paths <- list.files(root, recursive = TRUE, all.files = TRUE, no.. = TRUE)
+  paths <- sort(paths, method = "radix")
+  hashes <- vapply(file.path(root, paths), digest::digest, character(1),
+                   algo = "sha256", file = TRUE, serialize = FALSE,
+                   USE.NAMES = FALSE)
   manifest <- paste0(hashes, "  ", enc2utf8(paths), "\n", collapse = "")
-  writeBin(charToRaw(manifest), hash_manifest)
-  hash_file(hash_manifest)
+  digest::digest(manifest, algo = "sha256", serialize = FALSE)
 }
 
 rad_json_sha256 <- function(path, field) {
@@ -102,20 +54,8 @@ test_that("RAD source and resource provenance digests stay synchronized", {
     skip("RAD provenance source trees are unavailable in this test context")
   }
 
-  commands <- Sys.which(c("find", "sort", "shasum", "sha256sum"))
-  if (!nzchar(commands[["find"]]) || !nzchar(commands[["sort"]]) ||
-      (!nzchar(commands[["shasum"]]) &&
-       !nzchar(commands[["sha256sum"]]))) {
-    skip("RAD provenance check requires find, sort, and a SHA-256 utility")
-  }
-  commands[["hash"]] <- if (nzchar(commands[["shasum"]])) {
-    commands[["shasum"]]
-  } else {
-    commands[["sha256sum"]]
-  }
-
-  source_digest <- rad_canonical_tree_sha256(include_dir, commands)
-  resource_digest <- rad_canonical_tree_sha256(resource_dir, commands)
+  source_digest <- rad_canonical_tree_sha256(include_dir)
+  resource_digest <- rad_canonical_tree_sha256(resource_dir)
   vendor_source <- rad_json_sha256(vendor_json, "embedded_source_digest")
   vendor_resource <- rad_json_sha256(vendor_json, "resource_tree_sha256")
   bridge_source <- rad_bridge_sha256(bridge, "kEmbeddedSourceDigest")
@@ -125,35 +65,4 @@ test_that("RAD source and resource provenance digests stay synchronized", {
   expect_identical(bridge_source, source_digest)
   expect_identical(vendor_resource, resource_digest)
   expect_identical(bridge_resource, resource_digest)
-})
-
-test_that("reformat bridge returns its prepared SEXP without wrapping", {
-  root <- normalizePath(test_path("..", ".."), mustWork = FALSE)
-  exports <- file.path(root, "src", "RcppExports.cpp")
-  if (!file.exists(exports)) {
-    skip("generated native bridge source is unavailable in this test context")
-  }
-
-  lines <- readLines(exports, warn = FALSE, encoding = "UTF-8")
-  start <- grep(
-    "^RcppExport SEXP _rrad_rad_reformat_cpp\\(SEXP optionsSEXP\\) \\{$",
-    lines
-  )
-  expect_length(start, 1L)
-  if (length(start) != 1L) {
-    return(invisible(NULL))
-  }
-  following <- which(seq_along(lines) > start & lines == "}")
-  expect_true(length(following) > 0L)
-  if (!length(following)) {
-    return(invisible(NULL))
-  }
-  wrapper <- lines[start:following[[1L]]]
-
-  expect_true(any(grepl(
-    "^[[:space:]]*return rad_reformat_cpp\\(options\\);$", wrapper
-  )))
-  expect_false(any(grepl(
-    "Rcpp::wrap|Rcpp::RObject|Rcpp::RNGScope", wrapper
-  )))
 })

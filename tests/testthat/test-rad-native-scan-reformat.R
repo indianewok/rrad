@@ -100,11 +100,11 @@ test_that("native whitelist rescan accepts a barcode count table", {
 
   result <- rad_scan_wl(
     counts,
-    file.path(work, "recalled"),
     rescan = TRUE,
     selection = "high_specificity"
   )
 
+  expect_identical(basename(result$artifacts$whitelist), "counts_rescan.txt")
   expect_identical(result$stats$input_rows, 4)
   expect_equal(result$stats$total_extractions, 183)
   expect_setequal(native_read_lines(result$artifacts$whitelist),

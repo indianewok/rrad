@@ -45,7 +45,7 @@ constexpr int kResourceSchema = 1;
 constexpr const char* kSourceCommit =
     "616754007313ecb6fb875beb3a3fecfd3d83a267";
 constexpr const char* kEmbeddedSourceDigest =
-    "a51704c7d29fa67592dc9817fc589d4ac894a5bd2be28b312d104100f0189b58";
+    "f6d785a431cdc6d068e5f8a743f2e03d1b0b12a9459f3b4c9dbc95e4251cd185";
 constexpr const char* kResourceDigest =
     "b3081d5fd40d2d9309108fa79dd591d286e3ec1422582b0c520712659ffec4fb";
 
@@ -943,12 +943,6 @@ Rcpp::CharacterVector reformat_split_paths(
     return paths;
 }
 
-bool fail_reformat_result_construction() noexcept {
-    const char* value = std::getenv(
-        "RRAD_TEST_REFORMAT_FAIL_RESULT_CONSTRUCTION");
-    return value && std::strcmp(value, "1") == 0;
-}
-
 Rcpp::List core_info_impl() {
     const std::string resources = canonical_bundled_resource_dir();
 #if defined(__APPLE__)
@@ -1292,9 +1286,6 @@ SEXP rad_reformat_cpp(Rcpp::List options) {
                     Rcpp::_["stats"] = reformat_stats_as_list(
                         run, requested_threads, effective_threads),
                     Rcpp::_["log"] = capture.str());
-                if (fail_reformat_result_construction()) {
-                    throw std::bad_alloc();
-                }
                 // `result` protects the complete SEXP until this callback
                 // returns. Publication performs no R allocation, and the
                 // direct .Call wrapper returns this SEXP without wrapping it.

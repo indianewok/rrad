@@ -1,72 +1,55 @@
 # Maintaining rrad
 
-`rrad` is the RAD companion package used by SIRUP. Keep its public `rad_*` API
-compatible when updating the embedded C++ code, and record user-visible changes
-in `NEWS.md`.
+`rrad` is the RAD companion package used by SIRUP. Keep the public `rad_*` API
+compatible and record user-visible changes in `NEWS.md`.
 
 ## Source layout
 
-- `R/packed_reads.R` and `src/packed_reads.cpp`: compact read tables, FASTQ
-  streaming, quality summaries, and persistence.
-- `R/rad_core.R`, `R/rad_scan_wl.R`, and `R/rad_reformat.R`: public native
-  workflow interfaces and argument validation.
-- `R/rad_discovery.R`: layout/whitelist discovery and explicit-map spatial export.
+- `R/packed_reads.R`, `src/packed_reads.cpp`: compact read tables, streaming,
+  quality summaries, and persistence.
+- `R/rad_core.R`, `R/rad_scan_wl.R`, `R/rad_reformat.R`, `R/rad_discovery.R`:
+  native workflow interfaces.
 - `R/rad_resources.R`: verified resource downloads and cache management.
-- `src/rad_core_bridge.cpp` and `src/rad_scan_wl_bridge.hpp`: the R/native
-  boundary, result contracts, host interrupts, and native execution context.
-  `src/rad_discovery_bridge.hpp` adapts discovery and spatial exports.
-- `src/vendor/rad_core/`: pinned RAD source, embedding adaptations, and
-  provenance. `inst/rad/` holds the matching resource manifest and small data.
-- `man/`: maintained Rd documentation; `vignettes/`: executable user guide.
-- `tests/testthat/`: offline regression tests, including malformed inputs,
-  failed writes, native interfaces, and provenance checks.
-- `tests/native/`: standalone C++ regression suites for packed barcodes,
-  storage, matching, HMM boundaries/routing/calibration, and output streams.
+- `src/rad_core_bridge.cpp`, `src/rad_scan_wl_bridge.hpp`,
+  `src/rad_discovery_bridge.hpp`: R/native bindings, interrupts, and output
+  publication.
+- `src/vendor/rad_core/`: pinned RAD source and embedding adaptations.
+  `inst/rad/` contains the resource manifest and small reference data.
+- `man/`, `vignettes/`: API documentation and the executable workflow guide.
+- `tests/testthat/`, `tests/native/`: R workflows and native algorithm,
+  memory, and I/O regressions.
 
-The Rd files and `NAMESPACE` are maintained explicitly. The source's roxygen
-comments are useful API notes but are not a complete regeneration specification;
-do not run `roxygen2::roxygenise()` blindly over the package. Update the R
-signature, matching Rd usage and arguments, and relevant examples together.
+Rd files and `NAMESPACE` are maintained explicitly; the roxygen comments are
+not a complete regeneration specification. `RcppExports` also contains manual
+RAD registrations. Update matching R signatures, Rd entries, and native
+registrations together, and review any generator output before replacing them.
 
-Likewise, inspect changes from `Rcpp::compileAttributes()` carefully. The
-`RcppExports` files contain package-specific native registrations and bridge
-wrappers as well as generated packed-read bindings; replacing them wholesale
-can remove the embedded RAD entry points.
+## Validation
 
-## Checks before release
+Use local synthetic fixtures, keep tests offline, and limit native test runs
+to two threads. Add tests for observable behavior or a reproduced failure;
+source spelling, exact diagnostic prose, and incidental object layout are not
+API contracts.
 
-Install the package's `Depends`, `Imports`, `LinkingTo`, and `Suggests`
-dependencies, plus Pandoc to render the HTML vignette and a LaTeX toolchain to
-build the PDF reference manual. From the package checkout's parent directory:
+From the checkout's parent directory, with package dependencies, Pandoc, and
+LaTeX installed:
 
 ```sh
 R CMD build rrad
 R CMD check --as-cran rrad_<version>.tar.gz
 ```
 
-Replace `<version>` with the version in `DESCRIPTION`. If LaTeX is unavailable,
-`--no-manual` permits a partial local check, but report that limitation and run
-the full check in an environment that can build the manual before submission.
-Do not skip vignettes, examples, suggested dependencies, or tests for the final
-release check. Tests and examples use local synthetic fixtures and must not
-download runtime data. Keep examples and tests to at most two native threads.
+Use the version in `DESCRIPTION`. `--no-manual` allows a local check without
+LaTeX; the release check also builds the PDF manual.
 
-Run the committed GitHub Actions matrix on Linux and macOS, inspect all results,
-and retain the logs for the exact release commit. The Linux release job with
-OpenMP builds the PDF manual; all matrix jobs build and check the vignette.
-The matrix includes R release, development, and old-release checks. Release
-jobs run the standalone native suites in both serial and OpenMP modes on
-Linux, Apple Silicon, and Intel macOS. A separate Linux job runs the native
-suites with AddressSanitizer and UndefinedBehaviorSanitizer. The macOS OpenMP
-jobs install a compiler-matched R-project runtime on the ephemeral runner;
-ordinary macOS package installation remains serial by default.
-Platform support must be based on
-completed installation and checks, not solely on the presence of a workflow.
-Review the current [CRAN repository policy](https://cran.r-project.org/web/packages/policies.html)
-and [Writing R Extensions](https://cran.r-project.org/doc/manuals/r-release/R-exts.html)
-before an actual submission. CRAN acceptance is a separate review.
+Normal CI runs four package configurations: Linux R release/devel and Mac
+ARM/Intel release. Linux also runs the native suites with address and
+undefined-behavior sanitizers. Before a release, run the workflow manually with
+`extended` enabled. It adds Linux oldrel, serial and ARM builds, Mac OpenMP,
+PDF manual validation, and native suites on each release configuration.
+Inspect results for the release commit before submission.
 
-Run the native regressions from the package root:
+The standalone native runner uses R's C++17 compiler and installed BH headers:
 
 ```sh
 bash tests/native/run-tests.sh
@@ -74,30 +57,24 @@ RRAD_NATIVE_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
   bash tests/native/run-tests.sh
 ```
 
-The runner uses R's C++17 compiler and installed BH headers, compiles in a
-private temporary directory, and executes suites sequentially. The sanitizer
-command requires a compiler/runtime that supports those flags; CI supplies
-that environment on Linux. On Linux, `RRAD_NATIVE_FLAGS="-fopenmp"` also tests
-native parallel branches. Use `RRAD_NATIVE_LIBS` for link-only runtime options,
-such as the macOS OpenMP library. Errors must fail the job; do not suppress sanitizer
-findings or mark a failing platform optional to obtain a passing matrix.
-The `/dev/full` output-failure fixture is Linux-specific; other stream error
-and cancellation checks run on both operating systems.
+It builds in a temporary directory. Compiler/runtime support is required for
+sanitizers or `RRAD_NATIVE_FLAGS="-fopenmp"`; use `RRAD_NATIVE_LIBS` for link-only
+options. The disk-full fixture uses Linux's `/dev/full`; other output failure
+and cancellation checks run on both systems.
 
-## Updating the RAD snapshot
+## Updating RAD
 
-Record the upstream version, commit, copied files, and local adaptations in
-`src/vendor/rad_core/RAD_VENDOR.json` and its README. Keep the source and resource
-digests synchronized with `inst/rad/RAD_RESOURCES.json` and the native metadata;
-the vendored README specifies the canonical hashing algorithm. The source
-commit and resource commit may differ when an upstream code update leaves
-the bundled resources unchanged; retain immutable remote whitelist URLs and
-record that distinction explicitly. The provenance
-tests verify these identities. Review new or changed dependencies against
-`inst/THIRD_PARTY_NOTICES.md` and preserve their complete license texts under
-`inst/licenses/`.
+Record upstream commits, adapted paths, and patches in
+`src/vendor/rad_core/RAD_VENDOR.json`. Its [README](src/vendor/rad_core/README.md)
+describes embedding and the canonical source/resource hashes. Update native
+metadata and `inst/rad/RAD_RESOURCES.json` when their corresponding inputs change.
+Source and resource commits may differ if an update leaves resource bytes
+unchanged.
 
-For remote whitelists, pin an immutable HTTPS URL, exact byte count, and SHA-256
-digest in `inst/rad/resources/REMOTE_RESOURCES.tsv`. Avoid adding large payloads
-to the package archive. Exercise offline mode, corrupted-cache recovery, and
-failure cleanup without depending on a live network service.
+Preserve dependency licenses in `inst/licenses/` and update
+`inst/THIRD_PARTY_NOTICES.md` for dependency changes. Large whitelists belong in
+`inst/rad/resources/REMOTE_RESOURCES.tsv`, with an immutable HTTPS URL, byte
+count, and SHA-256, rather than in the package archive.
+
+For submission requirements, consult the [CRAN policy](https://cran.r-project.org/web/packages/policies.html)
+and [Writing R Extensions](https://cran.r-project.org/doc/manuals/r-release/R-exts.html).

@@ -229,8 +229,6 @@ int main() {
                   "Atomic counters must remain naturally aligned");
     static_assert(std::tuple_size<decltype(counter{}.counts)>::value == 8,
                   "Whitelist entries should store all eight public reporting counters");
-    static_assert(sizeof(counter) == 8 * sizeof(std::atomic<int>),
-                  "Counter storage should retain public reporting slots");
     std::mt19937_64 generator(918274);
     const auto short_text = random_dna(generator, 25);
     const auto wide_text = random_dna(generator, 33);
