@@ -33,6 +33,7 @@ struct seq_element {
     // Resolved during barcode correction — avoids redundant lookups in update_bc_counts.
     counter* resolved_counter = nullptr;       // pointer to the matched whitelist entry's counter
     bool     resolved_corrected = false;       // true if barcode was error-corrected (not just RC)
+    bool query_complete = true;               // static-query coverage; independent of legacy acceptance
 
     seq_element(
         std::string class_id,
@@ -73,12 +74,17 @@ struct seq_element {
  */
 struct static_alignments {
     std::vector<std::pair<int, int>> positions;
-    int edit_distance;
-    bool success;
+    int edit_distance = -1;
+    bool success = false;
+    bool query_complete = false;
+    int query_clip_left = 0;
+    int query_clip_right = 0;
     std::string seq;
     std::string cigar; 
-    int score;
-    std::pair<int,int> pos; 
+    int score = 0;
+    std::pair<int,int> pos{0, 0};
+    int ref_begin = -1;   // SSW: aligned adapter offsets (clipping); -1 when not from SSW
+    int ref_end = -1;
 };
 
 // Tags for the multi-index container
@@ -376,9 +382,12 @@ public:
     static_alignments align_static_elements(
         const std::string& query, const std::string& target, bool verbose, int max_edit_distance = -1, 
         const std::string& masked_query = "", bool primary = true, int expected_start = 1, 
-        int expected_end = -1) {
+        int expected_end = -1, static_alignments* additional_hits = nullptr,
+        int search_lo = 1, int search_hi = -1, bool allow_ssw = true,
+        bool target_at_read_start = true, bool target_at_read_end = true) {
 
         static_alignments alignment;
+        if (additional_hits) *additional_hits = static_alignments{};
         alignment.success = false;
         alignment.edit_distance = -1;
         // Our threshold for a “good” alignment
@@ -388,6 +397,15 @@ public:
         if (expected_end < 0){
                 expected_end = target.size();
         }
+
+        // Search window [search_lo, search_hi], 1-based inclusive; positions stay in target coordinates.
+        // target_at_read_start / _end: false when that target edge is an HMM cut, not a physical read end.
+        const bool windowed = search_lo > 1 || search_hi >= 0;
+        const int win_off = windowed ? std::max(0, search_lo - 1) : 0;
+        const int win_end = (search_hi < 0 || search_hi > static_cast<int>(target.size()))
+            ? static_cast<int>(target.size()) : search_hi;
+        const int win_len = windowed ? win_end - win_off : static_cast<int>(target.size());
+        if (windowed && win_len <= 0) return alignment;
 
         // Custom equality rules:
         // Uppercase A, C, T, G match their lowercase forms and also the pad character 'x'.
@@ -409,7 +427,7 @@ public:
                                                     customEqualities, numEq);
 
         EdlibAlignResult edlibResult = edlibAlign(query_to_use.c_str(), query_to_use.size(),
-                                                target.c_str(), target.size(),
+                                                target.c_str() + win_off, win_len,
                                                 config);
 
         std::vector<std::pair<int,int>> candidates;
@@ -418,8 +436,8 @@ public:
             edlibResult.editDistance > -1) {
             std::vector<std::pair<int,int>> intervals;
             for (int i = 0; i < edlibResult.numLocations; ++i) {
-                int start = edlibResult.startLocations[i] + 1;  // Convert to 1-indexed
-                int end   = edlibResult.endLocations[i] + 1;
+                int start = edlibResult.startLocations[i] + 1 + win_off;  // Convert to 1-indexed
+                int end   = edlibResult.endLocations[i] + 1 + win_off;
                 intervals.push_back({start, end});
             }
             std::sort(intervals.begin(), intervals.end(),
@@ -439,6 +457,15 @@ public:
                 }
                 candidates.push_back(current);
             }
+            // Retain the already allocated, actual LOC intervals rather than
+            // copying them or treating an overlap union as a real alignment.
+            // All share editDistance; primary/SSW selection stays unchanged.
+            if (additional_hits) {
+                additional_hits->positions = std::move(intervals);
+                additional_hits->edit_distance = edlibResult.editDistance;
+                additional_hits->success = true;
+                additional_hits->query_complete = true;
+            }
         }
 
         // --- early out: If Edlib returned exactly one candidate and it is within the expected region, use it
@@ -447,6 +474,7 @@ public:
             if (cand.first >= expected_start && cand.second <= expected_end) {
                 alignment.positions.push_back(cand);
                 alignment.success = true;
+                alignment.query_complete = true;
                 alignment.edit_distance = edlibResult.editDistance;
                 // Optionally set alignment.seq, alignment.cigar, etc.
                 alignment.seq = target.substr(cand.first - 1, cand.second - cand.first + 1);
@@ -455,11 +483,28 @@ public:
                 return alignment;
             }
         }
+        if (!allow_ssw) {
+            if (!candidates.empty()) {
+                const double centre = win_off + 1 + (win_len - 1) / 2.0;
+                auto dist = [centre](const std::pair<int,int>& c) {
+                    return std::fabs((c.first + c.second) / 2.0 - centre);
+                };
+                auto best = std::min_element(candidates.begin(), candidates.end(),
+                    [&](const std::pair<int,int>& a, const std::pair<int,int>& b) { return dist(a) < dist(b); });
+                alignment.positions.push_back(*best);
+                alignment.success = true;
+                alignment.query_complete = true;
+                alignment.edit_distance = edlibResult.editDistance;
+                alignment.seq = target.substr(best->first - 1, best->second - best->first + 1);
+            }
+            edlibFreeAlignResult(edlibResult);
+            return alignment;
+        }
         edlibFreeAlignResult(edlibResult);
         // --- run SSW on the entire target (for no candidate or multiple candidates) ---
         // Prepare uppercase strings for SSW.
         std::string query_ssw = query;
-        std::string target_ssw = target;
+        std::string target_ssw = windowed ? target.substr(win_off, win_len) : target;
         std::transform(query_ssw.begin(), query_ssw.end(), query_ssw.begin(), ::toupper);
         std::transform(target_ssw.begin(), target_ssw.end(), target_ssw.begin(), ::toupper);
 
@@ -477,8 +522,8 @@ public:
                         ssw_filter, &sswAlign, maskLen);
 
         if (sswAlign.query_begin >= 0 && sswAlign.query_end >= sswAlign.query_begin) {
-            int ssw_start = sswAlign.query_begin + 1; // Convert to 1-indexed
-            int ssw_end = sswAlign.query_end + 1;
+            int ssw_start = sswAlign.query_begin + 1 + win_off; // Convert to 1-indexed
+            int ssw_end = sswAlign.query_end + 1 + win_off;
             int ssw_length = ssw_end - ssw_start + 1;
             int ssw_max_matches_ind = get_max_consecutive_matches_with_indels(sswAlign.cigar_string.c_str());
             int ssw_max_matches = get_max_consecutive_matches(sswAlign.cigar_string.c_str());
@@ -520,9 +565,49 @@ public:
             )) {
                 alignment.positions.push_back({ssw_start, ssw_end});
                 alignment.edit_distance = compute_edit_distance(sswAlign.cigar_string.c_str());
-                alignment.success = alignment.edit_distance < max_edit_distance + 1 ? true : false;
+                // RAD passes the adapter as SSW's reference, not its query.
+                // Read-span/edit-distance consistency cannot detect all clipping.
+                alignment.query_complete = sswAlign.ref_begin == 0 &&
+                    sswAlign.ref_end == static_cast<int>(query.size()) - 1;
+                alignment.query_clip_left = sswAlign.ref_begin;
+                alignment.query_clip_right = static_cast<int>(query.size()) - 1 - sswAlign.ref_end;
+                alignment.ref_begin = sswAlign.ref_begin;
+                alignment.ref_end = sswAlign.ref_end;
+                // Clipped adapter bases are free only within read_end_slack of a physical read end.
+                constexpr int read_end_slack = 3;
+                const bool clipping_at_read_ends =
+                    (sswAlign.ref_begin == 0 ||
+                     (target_at_read_start && win_off + sswAlign.query_begin <= read_end_slack)) &&
+                    (sswAlign.ref_end == static_cast<int>(query.size()) - 1 ||
+                     (target_at_read_end &&
+                      static_cast<int>(target.size()) - 1 - (win_off + sswAlign.query_end) <= read_end_slack));
+                // Windowed calls: the caller applies its own clipped-hit rule.
+                const bool read_end_rule = !windowed;
+                alignment.success = alignment.edit_distance <= max_edit_distance &&
+                    (clipping_at_read_ends || !read_end_rule);
                 alignment.cigar = sswAlign.cigar_string;
                 alignment.seq = target.substr(ssw_start - 1, ssw_end - ssw_start + 1);
+                if (read_end_rule && !clipping_at_read_ends) {
+                    // Internal hit: verify the whole adapter on the same interval, missing bases
+                    // charged to the same edit budget (the interval must not grow into a barcode/UMI).
+                    auto verified = edlibAlign(query_to_use.c_str(), query_to_use.size(),
+                        alignment.seq.c_str(), alignment.seq.size(),
+                        edlibNewAlignConfig(max_edit_distance, EDLIB_MODE_NW,
+                                            EDLIB_TASK_PATH, customEqualities, numEq));
+                    if (verified.status == EDLIB_STATUS_OK && verified.editDistance >= 0 &&
+                        verified.alignment) {
+                        char* cigar = edlibAlignmentToCigar(verified.alignment,
+                            verified.alignmentLength, EDLIB_CIGAR_EXTENDED);
+                        if (cigar) {
+                            alignment.edit_distance = verified.editDistance;
+                            alignment.query_complete = true;
+                            alignment.cigar = cigar;
+                            alignment.success = true;
+                            free(cigar);
+                        }
+                    }
+                    edlibFreeAlignResult(verified);
+                }
             }
         }
     return alignment;
@@ -629,6 +714,98 @@ public:
         }
         return result;
     }
+
+/**
+ * @brief Longest adapter prefix ending at the read end (at_3prime) or suffix starting at the read start.
+ * @return 1-based positions in target coordinates
+ */
+    static_alignments align_read_end_fragment(const std::string& adapter, const std::string& target,
+                                              bool at_3prime, int max_keep = -1, int min_keep = 9) const {
+        static_alignments out;
+        const int m = static_cast<int>(adapter.size());
+        const int n = static_cast<int>(target.size());
+        const EdlibEqualityPair eq[13] = {
+            {'A','a'}, {'C','c'}, {'T','t'}, {'G','g'},
+            {'A','x'}, {'C','x'}, {'T','x'}, {'G','x'},
+            {'N','A'}, {'N','C'}, {'N','T'}, {'N','G'}, {'N','x'}};
+        const int t_hi = std::min({m, n, max_keep > 0 ? max_keep : m});
+        for (int t = t_hi; t >= min_keep; --t) {
+            const int k = std::max(1, t / 6);
+            const int span = std::min(n, t + 4);
+            const int off = at_3prime ? n - span : 0;
+            const char* q = adapter.c_str() + (at_3prime ? 0 : m - t);
+            EdlibAlignResult r = edlibAlign(q, t, target.c_str() + off, span,
+                                            edlibNewAlignConfig(k, EDLIB_MODE_HW, EDLIB_TASK_LOC, eq, 13));
+            int best = -1;
+            if (r.status == EDLIB_STATUS_OK && r.editDistance >= 0 && r.numLocations > 0) {
+                for (int i = 0; i < r.numLocations; ++i) {
+                    const int s0 = off + r.startLocations[i], e0 = off + r.endLocations[i];
+                    const bool anchored = at_3prime ? (e0 >= n - 3) : (s0 <= 2);
+                    if (!anchored) continue;
+                    if (best < 0 || (at_3prime ? e0 > off + r.endLocations[best] : s0 < off + r.startLocations[best]))
+                        best = i;
+                }
+            }
+            if (best >= 0) {
+                const int s0 = off + r.startLocations[best], e0 = off + r.endLocations[best];
+                out.positions.push_back({s0 + 1, e0 + 1});
+                out.edit_distance = r.editDistance;
+                out.success = true;
+                out.query_complete = (t == m);
+                out.ref_begin = at_3prime ? 0 : m - t;
+                out.ref_end = at_3prime ? t - 1 : m - 1;
+                out.seq = target.substr(s0, e0 - s0 + 1);
+                edlibFreeAlignResult(r);
+                return out;
+            }
+            edlibFreeAlignResult(r);
+        }
+        return out;
+    }
+
+/**
+ * @brief Best adapter prefix (prefix=true) or suffix fragment inside the 1-based inclusive window [lo, hi],
+ * scored t - 3*ED.
+ * @return 1-based positions in target coordinates; query_complete is false
+ */
+    static_alignments align_adapter_fragment(const std::string& adapter, const std::string& target, int lo, int hi,
+                                             bool prefix, int min_keep = 12, int max_keep = -1, bool strict = false) const {
+        static_alignments out;
+        const int m = static_cast<int>(adapter.size());
+        const int n = static_cast<int>(target.size());
+        const int off = std::max(0, lo - 1), end = std::min(n, hi);
+        const int span = end - off;
+        if (span < min_keep || m <= min_keep) return out;
+        const EdlibEqualityPair eq[13] = {
+            {'A','a'}, {'C','c'}, {'T','t'}, {'G','g'},
+            {'A','x'}, {'C','x'}, {'T','x'}, {'G','x'},
+            {'N','A'}, {'N','C'}, {'N','T'}, {'N','G'}, {'N','x'}};
+        int best_sc = -(1 << 30);
+        for (int t = std::min({m - 1, span, max_keep > 0 ? max_keep : m - 1}); t >= min_keep; --t) {
+            const int k = strict ? (t >= 20 ? 1 : 0) : std::max(1, t / 8);
+            if (t <= best_sc) break;  // no shorter t can beat the best score
+            const char* q = adapter.c_str() + (prefix ? 0 : m - t);
+            EdlibAlignResult r = edlibAlign(q, t, target.c_str() + off, span,
+                                            edlibNewAlignConfig(k, EDLIB_MODE_HW, EDLIB_TASK_LOC, eq, 13));
+            if (r.status == EDLIB_STATUS_OK && r.editDistance >= 0 && r.numLocations > 0 && t - 3 * r.editDistance > best_sc) {
+                int best = 0;  // the hit at the inward edge
+                for (int i = 1; i < r.numLocations; ++i)
+                    if (prefix ? r.startLocations[i] < r.startLocations[best] : r.endLocations[i] > r.endLocations[best]) best = i;
+                const int s0 = off + r.startLocations[best], e0 = off + r.endLocations[best];
+                best_sc = t - 3 * r.editDistance;
+                out = static_alignments{};
+                out.positions.push_back({s0 + 1, e0 + 1});
+                out.edit_distance = r.editDistance;
+                out.success = true;
+                out.query_complete = false;
+                out.ref_begin = prefix ? 0 : m - t;
+                out.ref_end = prefix ? t - 1 : m - 1;
+                out.seq = target.substr(s0, e0 - s0 + 1);
+            }
+            edlibFreeAlignResult(r);
+        }
+        return out;
+    }
 };
 
 /**
@@ -636,6 +813,55 @@ public:
  * @brief Namespace for barcode correction functions and utilities
  */
 namespace barcode_correction {
+    /**
+     * @brief Where the whitelist lookup placed the barcode in the expanded window of `correct_barcode`.
+     * Indices are 0-based in the oriented window: primer side first, UMI side last.
+     */
+    struct bc_position {
+        enum kind_t : uint8_t { unknown = 0, window = 1, located = 2, tie = 3, clipped = 4 };
+        kind_t kind = unknown;
+        int end = -1;    // index of the last barcode base
+        int n_end = 0;   // number of equally good ends
+        int shift = 0;   // located: end minus the layout window end (positive = toward the UMI)
+
+        void set_from_match(int match_end, int match_n_end) {
+            end = match_end;
+            n_end = match_n_end;
+            kind = (match_n_end == 1 && match_end >= 0) ? located : tie;
+        }
+    };
+
+    /// Half-width of the expanded barcode window; also the edit distance of the global-list checks.
+    constexpr int expanded_window_pad = 4;
+
+    // A correction window may contain 64 barcode bases plus eight flanks.
+    // Use Edlib only for that bounded overflow; ordinary packed matching keeps
+    // its existing fast path and tie rules.
+    inline int barcode_distance(const int64_seq& query, const int64_seq& winner,
+                                int max_dist, const std::string* expanded_query = nullptr,
+                                int* match_end = nullptr, int* match_n = nullptr) {
+        if (!expanded_query)
+            return mutation_tools::int64_lvdist(query, winner, max_dist, match_end, match_n);
+        if (!winner.is_valid() || expanded_query->find_first_not_of("ACGT") != std::string::npos)
+            return -1;
+        const auto target = winner.bits_to_sequence();
+        auto result = edlibAlign(target.data(), static_cast<int>(target.size()),
+                                 expanded_query->data(), static_cast<int>(expanded_query->size()),
+                                 edlibNewAlignConfig(max_dist, EDLIB_MODE_HW, EDLIB_TASK_LOC, nullptr, 0));
+        const int distance = result.status == EDLIB_STATUS_OK ? result.editDistance : -1;
+        if (match_end) *match_end = distance >= 0 && result.numLocations ? result.endLocations[0] : -1;
+        if (match_n) *match_n = distance >= 0 ? result.numLocations : 0;
+        edlibFreeAlignResult(result);
+        return distance;
+    }
+    inline void locate_winner(bc_position* pos, const int64_seq& query, const int64_seq& winner,
+                              int max_dist, const std::string* expanded_query = nullptr) {
+        if (!pos || (!expanded_query && query.length <= winner.length)) return;
+        int match_end = -1, match_n = 0;
+        if (barcode_distance(query, winner, max_dist, expanded_query, &match_end, &match_n) >= 0)
+            pos->set_from_match(match_end, match_n);
+    }
+
     /**
      * @brief Check if a candidate barcode passes quality checks based on counts from the whitelist
      * @param candidate ``int64_seq`` Candidate barcode sequence
@@ -718,11 +944,16 @@ namespace barcode_correction {
  * @param wl ``const whitelist::wl_entry*`` Pointer to the whitelist entry
  * @return ``std::pair<std::optional<int64_seq>, std::optional<int>> Pair containing the resolved barcode (if any) and its edit distance
  */
-    std::pair<std::optional<int64_seq>, std::optional<int>> 
+    std::pair<std::optional<int64_seq>, std::optional<int>>
     resolve_multiple_hits_simple(const int64_seq& query, const std::unordered_set<int64_seq>& candidates,
-        int max_dist, bool verbose, const std::string& wl_type, const whitelist::wl_entry* wl = nullptr
+        int max_dist, bool verbose, const std::string& wl_type, const whitelist::wl_entry* wl = nullptr,
+        bc_position* pos = nullptr, const std::string* expanded_query = nullptr
     ) {
-        auto sorted = mutation_tools::int64_lvdist(query, candidates, max_dist);
+        std::map<int, std::unordered_set<int64_seq>> sorted;
+        for (const auto& candidate : candidates) {
+            const int distance = barcode_distance(query, candidate, max_dist, expanded_query);
+            if (distance >= 0) sorted[distance].insert(candidate);
+        }
         if (sorted.empty()) return {std::nullopt, std::nullopt};
 
         // Find candidates with raw_count > 0 at lowest edit distance
@@ -746,6 +977,7 @@ namespace barcode_correction {
             if (valid_candidates.size() == 1) {
                 if (verbose) RAD_COUT << "Winner: unique candidate at distance " << edit_dist << "\n";
                 if(passes_quality_check(valid_candidates[0], wl, wl_type, "offensive", verbose)) {
+                    locate_winner(pos, query, valid_candidates[0], max_dist, expanded_query);
                     return {valid_candidates[0], edit_dist};
                 } else {
                     if (verbose) RAD_COUT << "Quality check failed for candidate, rejecting\n";
@@ -780,10 +1012,12 @@ namespace barcode_correction {
  * If a single best match is identified, it also undergoes a quality check before being returned.
  * If no suitable match is found or if quality checks fail, the function returns std::nullopt.
  */
-    std::optional<int64_seq> check_against_wl(const int64_seq& bc, const std::unordered_set<int64_seq>& candidates,
-        const std::string& whitelist_type, int max_dist, bool verbose, const std::string& mode, const whitelist::wl_entry* wl = nullptr
+    template <class Candidates>
+    std::optional<int64_seq> check_against_wl(const int64_seq& bc, const Candidates& candidates,
+        const std::string& whitelist_type, int max_dist, bool verbose, const std::string& mode, const whitelist::wl_entry* wl = nullptr,
+        bc_position* pos = nullptr, const std::string* expanded_query = nullptr
     ) {
-        
+
 
         // Early exit if whitelist is empty or no candidates match
 
@@ -819,7 +1053,7 @@ namespace barcode_correction {
                     RAD_COUT << oss.str();
                 }
             }
-            int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_dist);
+            int res = barcode_distance(bc, putative_candidate, max_dist, expanded_query);
             if (res >= 0) {
                 // Quality check
                 if (passes_quality_check(putative_candidate, wl, whitelist_type, mode, verbose)) {
@@ -833,6 +1067,7 @@ namespace barcode_correction {
                             RAD_COUT << oss.str();
                         }
                     }
+                    locate_winner(pos, bc, putative_candidate, max_dist, expanded_query);
                     return putative_candidate;
                 } else {
                     if (verbose) {
@@ -850,7 +1085,7 @@ namespace barcode_correction {
             }
         } else if (matched.size() > 1) {
             // Multiple candidates case - use enhanced resolution
-            auto [resolved, min_dist] = resolve_multiple_hits_simple(bc, matched, max_dist, verbose, whitelist_type, wl);
+            auto [resolved, min_dist] = resolve_multiple_hits_simple(bc, matched, max_dist, verbose, whitelist_type, wl, pos, expanded_query);
             if (resolved.has_value()) {
                 if (passes_quality_check(resolved.value(), wl, whitelist_type, mode, verbose)) {
                     if (verbose) {
@@ -898,8 +1133,14 @@ namespace barcode_correction {
  * If no matches are found or if quality checks fail, the function returns std::nullopt.
  */ 
     std::optional<int64_seq> exhaustive_check_against_wl(const int64_seq& bc, const std::string& whitelist_type,
-        int max_dist,bool verbose, const std::string& mode, const whitelist::wl_entry* wl = nullptr
+        int max_dist,bool verbose, const std::string& mode, const whitelist::wl_entry* wl = nullptr,
+        bc_position* pos = nullptr, const std::string* expanded_query = nullptr
     ) {
+        // Part-table prefilter: gives the same match set as the full loop below.
+        const whitelist::wl_entry::part_idx* parts = nullptr;
+        if (!expanded_query && whitelist_type == "true" && wl->true_parts.covers(max_dist, wl->true_bcs.unique_val_size())) {
+            parts = &wl->true_parts;
+        }
         auto matches = wl->with_wl(whitelist_type, [&](const auto& typed_wl) {
             std::vector<std::pair<int64_seq, int>> match;
             if (verbose) {
@@ -912,11 +1153,17 @@ namespace barcode_correction {
                 }
             }
 
+            if (parts) {
+                parts->scan(bc, max_dist, match);
+                return match;
+            }
+
             auto unique_entries = typed_wl.get_unique_entries();
-            for (const auto* entry : unique_entries) {
-                int res = mutation_tools::int64_lvdist(bc, entry->barcode, max_dist);
+            for (const auto entry : unique_entries) {
+                const auto barcode = entry.barcode();
+                int res = barcode_distance(bc, barcode, max_dist, expanded_query);
                 if (res >= 0) {
-                    match.emplace_back(entry->barcode, res);
+                    match.emplace_back(barcode, res);
                 }
             }
             return match;
@@ -948,18 +1195,18 @@ namespace barcode_correction {
         
         if (matches.size() == 1) {
             auto [candidate, distance] = matches[0];
-            
+
             if (verbose) {
                 #pragma omp critical
                 {
                     std::ostringstream oss;
-                    oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_CANDIDATE::" 
+                    oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_CANDIDATE::"
                                                     : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_CANDIDATE::")
                         << candidate.bits_to_sequence() << "\n";
                     RAD_COUT << oss.str();
                 }
             }
-            
+
             // Quality check
             if (passes_quality_check(candidate, wl, whitelist_type, mode, verbose)) {
                 if (verbose) {
@@ -967,12 +1214,13 @@ namespace barcode_correction {
                     {
                         std::ostringstream oss;
                         oss << "LVDIST::" << distance << "\n"
-                            << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_MATCHED" 
+                            << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_MATCHED"
                                                         : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_MATCHED")
                             << "\n";
                         RAD_COUT << oss.str();
                     }
                 }
+                locate_winner(pos, bc, candidate, max_dist, expanded_query);
                 return candidate;
             } else {
                 if (verbose) {
@@ -1021,11 +1269,12 @@ namespace barcode_correction {
                         {
                             std::ostringstream oss;
                             oss << "LVDIST::" << best_distance << "\n"
-                                << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_MATCHED_RESOLVED" 
+                                << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_MATCHED_RESOLVED"
                                                             : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_MATCHED_RESOLVED") << "\n";
                             RAD_COUT << oss.str();
                         }
                     }
+                    locate_winner(pos, bc, best_candidate, max_dist, expanded_query);
                     return best_candidate;
                 } else {
                     if (verbose) {
@@ -1075,9 +1324,12 @@ namespace barcode_correction {
  * to find matches through k-mer mutations using an exhaustive search approach.
  */
     std::optional<int64_seq> kmer_fuzzy_search(const int64_seq& original_barcode, const std::string& expanded_seq, int bc_len,
-        const std::string& mode, const whitelist::wl_entry& wl, bool verbose, int max_dist
+        const std::string& mode, const whitelist::wl_entry& wl, bool verbose, int max_dist,
+        bc_position* pos = nullptr
     ) {
-    
+    // A direct k-mer hit sets no position here: correct_barcode finds it from the k-mer offsets.
+    if (pos) *pos = bc_position{};
+
     if (verbose) {
         #pragma omp critical
         {
@@ -1183,8 +1435,8 @@ namespace barcode_correction {
         if (!seed_entries.empty()) {
             std::unordered_set<int64_seq> seed_candidates;
             seed_candidates.reserve(seed_entries.size());
-            for (const auto* e : seed_entries) {
-                if (e) seed_candidates.insert(e->barcode);
+            for (const auto e : seed_entries) {
+                if (e) seed_candidates.insert(e.barcode());
             }
 
             auto seed_result = check_against_wl(
@@ -1198,21 +1450,22 @@ namespace barcode_correction {
                                   << seed_result.value().bits_to_sequence() << "\n";
                     }
                 }
+                if (pos) pos->kind = bc_position::window;
                 return seed_result;
             }
         }
     }
 
-    // int64_seq intentionally stores at most 32 bases.  The expanded search
+    // int64_seq intentionally stores at most 64 bases.  The expanded search
     // window may be wider (the barcode plus flanking padding), so retain the
     // original packed barcode for the exhaustive scorer when that happens.
     // Sliding k-mers above still examine every barcode-sized window.
     int64_seq exhaustive_query = original_barcode;
-    if (expanded_seq.size() <= 32) {
+    if (expanded_seq.size() <= 64) {
         exhaustive_query.sequence_to_bits(expanded_seq);
     }
     auto true_result = exhaustive_check_against_wl(
-        exhaustive_query, "true", 2, verbose, mode, &wl);
+        exhaustive_query, "true", 2, verbose, mode, &wl, pos, expanded_seq.size() > 64 ? &expanded_seq : nullptr);
     if (true_result.has_value()) {
         if (verbose) {
             #pragma omp critical
@@ -1232,31 +1485,32 @@ namespace barcode_correction {
     return std::nullopt;
 }
 /**
- * @brief Correct a barcode sequence using the provided layout and read information
+ * @brief Whitelist lookup of a barcode (the body of correct_barcode)
  * @param elem ``const seq_element&`` Sequence element containing barcode information
  * @param layout ``const ReadLayout&`` Read layout containing whitelist mappings
  * @param full_read ``const read_streaming::sequence&`` Full read sequence
+ * @param expanded_seq ``const std::string&`` oriented expanded window (see correct_barcode)
  * @param verbose ``bool`` Whether to print verbose output
  * @param mut_dist ``int`` Maximum allowed edit distance for mutation checks
  * @param mode ``std::string`` Barcode correction mode ("defensive" or "offensive")
+ * @param pos optional out: where the lookup placed the barcode
  * @return ``std::optional<int64_seq>`` Corrected barcode sequence if found, otherwise std::nullopt
  */
-    std::optional<int64_seq> correct_barcode(const seq_element& elem,  const ReadLayout& layout, 
-        const read_streaming::sequence& full_read,  bool verbose, int mut_dist, std::string mode) {
+    std::optional<int64_seq> correct_barcode_lookup(const seq_element& elem,  const ReadLayout& layout,
+        const read_streaming::sequence& full_read, const std::string& expanded_seq, bool verbose, int mut_dist, std::string mode,
+        bc_position* pos = nullptr) {
         // pick the right whitelist
         auto key = seq_utils::remove_rc(elem.class_id);
         auto wl_it = layout.wl_map.maps.find(key);
         if (wl_it == layout.wl_map.maps.end()) return std::nullopt;
         auto &wl = wl_it->second.get();
-        int max_dist = 4;
+        int max_dist = expanded_window_pad;
         // extract and reverse‐complement the raw string
         // encoded barcode and reverse complement
         std::string raw = elem.seq.value();
-        std::string expanded_seq = seq_utils::substr_w_padding(full_read.seq, elem.position.first, elem.position.second, max_dist);
 
         if (elem.direction == "reverse") {
             raw = seq_utils::revcomp(raw);
-            expanded_seq = seq_utils::revcomp(expanded_seq);
         }
 
         int64_seq bc, rc_bc;
@@ -1264,12 +1518,12 @@ namespace barcode_correction {
         bc.sequence_to_bits(raw);
         rc_bc.sequence_to_bits(seq_utils::revcomp(raw));
 
-        // Keep the padded region only when it fits the one-word barcode
-        // representation.  For a 25-32 base barcode, padding can make this
-        // window wider than 32 bases; the fuzzy k-mer pass still scans that
+        // Keep the padded region only when it fits the packed barcode
+        // representation.  For a 57-64 base barcode, padding can make this
+        // window wider than 64 bases; the fuzzy k-mer pass still scans that
         // full string, while packed fallback comparisons use the barcode.
         int64_seq correction_query = bc;
-        if (expanded_seq.size() <= 32) {
+        if (expanded_seq.size() <= 64) {
             correction_query.sequence_to_bits(expanded_seq);
         }
 
@@ -1310,6 +1564,7 @@ namespace barcode_correction {
                         << ")\n";
                 }
             }
+            if (pos) pos->kind = bc_position::window;
             return bc_true_identity ? bc : rc_bc;
         }
 
@@ -1336,6 +1591,7 @@ namespace barcode_correction {
                             RAD_COUT << oss.str();
                         }
                     }
+                    if (pos) pos->kind = bc_position::window;
                     return candidate;
                 } else {
                     if (verbose) {
@@ -1362,6 +1618,7 @@ namespace barcode_correction {
                                 RAD_COUT << oss.str();
                             }
                         }
+                        if (pos) pos->kind = bc_position::window;
                         return resolved;
                     } else {
                         if (verbose) {
@@ -1423,6 +1680,7 @@ namespace barcode_correction {
                             RAD_COUT << oss.str();
                         }
                     }
+                    if (pos) pos->kind = bc_position::window;
                     return candidate;
                 } else {
                     if (verbose) {
@@ -1449,6 +1707,7 @@ namespace barcode_correction {
                                 RAD_COUT << oss.str();
                             }
                         }
+                        if (pos) pos->kind = bc_position::window;
                         return resolved;
                     } else {
                         if (verbose) {
@@ -1490,7 +1749,7 @@ namespace barcode_correction {
         // generate mutations
         // === k-mer fuzzy search ===
 
-      auto kmer_fuzzy_result = kmer_fuzzy_search(bc, expanded_seq, bc_len, mode, wl, verbose, 3);
+      auto kmer_fuzzy_result = kmer_fuzzy_search(bc, expanded_seq, bc_len, mode, wl, verbose, 3, pos);
       if (verbose) {
             #pragma omp critical
             {
@@ -1505,14 +1764,24 @@ namespace barcode_correction {
             return kmer_fuzzy_result;
         }
         
-        auto muts = mutation_tools::generate_mutated_barcodes(bc, mut_dist);
+        if (pos) *pos = bc_position{};
+        const auto check_true_mutations = [&]() -> std::optional<int64_seq> {
+            if (wl.true_bcs.empty()) return std::nullopt;
+            auto muts = mutation_tools::generate_mutated_barcodes(bc, mut_dist);
+            return check_against_wl(correction_query, muts, "true", 2, verbose, mode, &wl, pos, expanded_seq.size() > 64 ? &expanded_seq : nullptr);
+        };
+        const auto check_global_mutations = [&]() -> std::optional<int64_seq> {
+            if (wl.global_bcs.empty()) return std::nullopt;
+            auto global_muts = mutation_tools::generate_lv_candidates(bc, mut_dist, wl.global_bcs.length_mask());
+            return check_against_wl(correction_query, global_muts, "global", max_dist, verbose, mode, &wl, pos, expanded_seq.size() > 64 ? &expanded_seq : nullptr);
+        };
         if(mode == "defensive"){
-            auto global_result = check_against_wl(correction_query, muts, "global", max_dist, verbose, mode, &wl);
+            auto global_result = check_global_mutations();
             if(global_result.has_value()){
                 return(global_result);
             }
 
-            auto true_result = check_against_wl(correction_query, muts, "true", 2, verbose, mode, &wl);
+            auto true_result = check_true_mutations();
             if(true_result.has_value()){
                 return(true_result);
             }
@@ -1521,7 +1790,7 @@ namespace barcode_correction {
         // IF OFFENSIVE: Check against true first, and then global
         
         if(mode == "offensive") {
-            auto true_result = check_against_wl(correction_query, muts, "true", 2, verbose, mode, &wl);
+            auto true_result = check_true_mutations();
             if (true_result.has_value()) {
                 if (verbose) {
                     #pragma omp critical
@@ -1533,7 +1802,7 @@ namespace barcode_correction {
                 return true_result;
             }
 
-            auto global_result = check_against_wl(correction_query, muts, "global", max_dist, verbose, mode, &wl);
+            auto global_result = check_global_mutations();
             if (global_result.has_value()) {
                 if (verbose) {
                     #pragma omp critical
@@ -1558,7 +1827,65 @@ namespace barcode_correction {
         }
         return std::nullopt;
     }
+
+/**
+ * @brief Correct a barcode sequence using the provided layout and read information
+ * @param elem ``const seq_element&`` Sequence element containing barcode information
+ * @param layout ``const ReadLayout&`` Read layout containing whitelist mappings
+ * @param full_read ``const read_streaming::sequence&`` Full read sequence
+ * @param verbose ``bool`` Whether to print verbose output
+ * @param mut_dist ``int`` Maximum allowed edit distance for mutation checks
+ * @param mode ``std::string`` Barcode correction mode ("defensive" or "offensive")
+ * @param pos optional out: where the corrected barcode lies in the oriented expanded window
+ * @return ``std::optional<int64_seq>`` Corrected barcode sequence if found, otherwise std::nullopt
+ */
+    std::optional<int64_seq> correct_barcode(const seq_element& elem,  const ReadLayout& layout,
+        const read_streaming::sequence& full_read,  bool verbose, int mut_dist, std::string mode,
+        bc_position* pos = nullptr) {
+        const int read_len = static_cast<int>(full_read.seq.size());
+        const int win_lo = std::max(1, elem.position.first - expanded_window_pad);
+        const int win_hi = std::min(read_len, elem.position.second + expanded_window_pad);
+        std::string expanded_seq = seq_utils::substr_w_padding(full_read.seq, elem.position.first, elem.position.second, expanded_window_pad);
+        const bool reverse = elem.direction == "reverse";
+        if (reverse) {
+            expanded_seq = seq_utils::revcomp(expanded_seq);
+        }
+        if (pos) *pos = bc_position{};
+
+        auto result = correct_barcode_lookup(elem, layout, full_read, expanded_seq, verbose, mut_dist, mode, pos);
+        if (!pos || !result.has_value()) return result;
+
+        // Search the full string: a 64-base barcode plus padding can exceed
+        // the packed representation without exceeding the supported barcode length.
+        const int W = static_cast<int>(expanded_seq.size());
+        const std::string winner = result->bits_to_sequence();
+        int copies = 0, copy_end = -1;
+        for (size_t found = expanded_seq.find(winner); found != std::string::npos;
+             found = expanded_seq.find(winner, found + 1)) {
+            ++copies;
+            copy_end = static_cast<int>(found + winner.size() - 1);
+        }
+        if (copies >= 1) pos->set_from_match(copy_end, copies);
+        else if (pos->kind == bc_position::located && pos->end == W - 1)
+            pos->kind = bc_position::clipped;
+        if (pos->kind == bc_position::located) {
+            const int window_first = reverse ? (win_hi - elem.position.second) : (elem.position.first - win_lo);
+            const int window_last = window_first + (elem.position.second - elem.position.first);
+            pos->shift = pos->end - window_last;
+        }
+        return result;
+    }
 };
+
+// Run counters of single-barcode position outcomes; reset by sigalign.
+namespace barcode_position_stats {
+inline std::atomic<size_t> moved{0}, moved_forward{0}, moved_reverse{0}, in_place{0}, window{0}, unknown{0}, tie{0},
+    clipped{0}, out_of_read{0};
+inline void reset() {
+    for (auto* c : {&moved, &moved_forward, &moved_reverse, &in_place, &window, &unknown, &tie, &clipped, &out_of_read})
+        c->store(0);
+}
+}  // namespace barcode_position_stats
 
 struct sigalign_run_stats {
     size_t total_reads = 0;
@@ -1570,6 +1897,272 @@ struct sigalign_run_stats {
     double process_time_seconds = 0.0;
     double output_staging_time_seconds = 0.0;
     double overhead_time_seconds = 0.0;
+    size_t bc_pos_moved = 0, bc_pos_moved_forward = 0, bc_pos_moved_reverse = 0, bc_pos_in_place = 0, bc_pos_window = 0,
+           bc_pos_unknown = 0, bc_pos_tie = 0, bc_pos_clipped = 0, bc_pos_out_of_read = 0;
+    bool concat_hmm_enabled = false;
+    size_t hmm_reads = 0, hmm_single = 0, hmm_split = 0, hmm_children = 0, hmm_children_full_search = 0,
+           hmm_same_molecule = 0;
+    size_t hmm_legacy_guard = 0, hmm_legacy_k0 = 0, hmm_legacy_abstain = 0, hmm_legacy_artifact = 0,
+           hmm_legacy_too_many = 0, hmm_full_as_missing = 0;
+    size_t hmm_spacer_retry = 0, hmm_spacer_retry_ok = 0, hmm_fragment_ok = 0, hmm_read_end_ok = 0;
+    bool hmm_abstain_legacy = false;
+    size_t hmm_drop_abstain = 0, hmm_drop_too_many = 0, hmm_drop_d_reads = 0, hmm_drop_d_children = 0;
+    size_t hmm_d_kept_left = 0, hmm_d_kept_right = 0, hmm_d_split = 0;
+    size_t hmm_fold_read_start = 0, hmm_fold_read_end = 0, hmm_partner_rejected = 0, hmm_retry_from_partner = 0;
+    size_t hmm_art_reads = 0, hmm_pieces = 0, hmm_trim_keep_F = 0, hmm_trim_keep_R = 0;
+    size_t hmm_both_pass_dropped = 0, hmm_duplet_named = 0;
+    size_t hmm_clip_hits = 0, hmm_two_unit_clip_dropped = 0;
+    size_t hmm_junctions_abstained = 0, hmm_pieces_suppressed = 0, hmm_drop_unresolved = 0;
+    size_t hmm_boundary_unresolved_parents = 0, hmm_boundary_unresolved_children = 0;
+    size_t hmm_cut_kind[6] = {0, 0, 0, 0, 0, 0};
+    size_t hmm_win[4] = {0, 0, 0, 0}, hmm_win_ok[4] = {0, 0, 0, 0};  // per concat_hmm::Status
+};
+
+#ifdef RAD_STAGE_TIMERS
+namespace rad_stage_timers {
+inline std::atomic<unsigned long long> read_ns{0}, hmm_ns{0}, windowed_static_ns{0}, legacy_static_ns{0}, reads{0};
+inline std::atomic<unsigned long long> variable_ns{0}, filter_ns{0}, molecules{0}, molecules_passed{0};
+// [0 HMM route, 1 default path][0 passed, 1 barcode correction failed, 2 other]
+inline std::atomic<unsigned long long> fb_ns[2][3]{}, fb_n[2][3]{};
+struct scope {
+    std::atomic<unsigned long long>& acc;
+    std::chrono::steady_clock::time_point t0;
+    explicit scope(std::atomic<unsigned long long>& a) : acc(a), t0(std::chrono::steady_clock::now()) {}
+    ~scope() {
+        acc.fetch_add(static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+    }
+};
+}  // namespace rad_stage_timers
+#endif
+
+// A bounded molecule and its assigned static evidence, before any variable
+// extraction or barcode-count side effects. Coordinates are parent-relative.
+struct static_segment {
+    std::pair<int, int> position;
+    std::string direction;
+    std::vector<seq_element> elements;
+    int edit_distance = 0;
+    bool ambiguous = false;
+};
+
+// --concat-hmm: concat_hmm::segment() names the strand and the expected static elements of each
+// read or child, with a window and status for each; sigalign_static aligns only inside these windows.
+struct static_check_window {
+    std::string class_id;
+    int lo = 1, hi = 0;  // 1-based inclusive, child coordinates
+    concat_hmm::Status status = concat_hmm::Status::MISSING_EXPECTED;
+    int retained_from = -1, retained_to = -1, edits = -1;
+};
+
+// Layout facts used by the windowed aligners, built once per run.
+struct concat_elem_info {
+    int m = 0;                   // adapter length
+    bool left_outward = false;   // no payload variable before it
+    bool right_outward = false;  // no payload variable after it
+    int k_full = 4;
+    int k_missing = 5;
+    std::string poly_id;         // poly tail joined by fixed-length spacers only
+    int poly_gap_lo = 0, poly_gap_hi = -1;
+    bool poly_after = true;
+    std::string partner_id;      // adapter joined by fixed-length spacers only
+    int partner_gap_lo = 0, partner_gap_hi = -1;
+    bool partner_after = true;
+    bool bc_outer = false;       // opens a barcode block that partner_id closes
+};
+
+struct concat_hmm_counters {
+    std::atomic<size_t> reads{0}, single{0}, split{0}, children{0}, children_full_search{0}, same_molecule{0};
+    std::atomic<size_t> legacy_guard{0}, legacy_k0{0}, legacy_abstain{0}, legacy_artifact{0}, legacy_too_many{0};
+    std::atomic<size_t> win[4]{}, win_ok[4]{};  // per concat_hmm::Status
+    std::atomic<size_t> full_as_missing{0};
+    std::atomic<size_t> spacer_retry{0}, spacer_retry_ok{0};
+    std::atomic<size_t> fragment_ok{0};
+    std::atomic<size_t> read_end_ok{0};
+    std::atomic<size_t> drop_abstain{0}, drop_too_many{0};
+    std::atomic<size_t> drop_d_reads{0}, drop_d_children{0};
+    std::atomic<size_t> d_kept_left{0}, d_kept_right{0}, d_split{0};
+    std::atomic<size_t> fold_read_start{0}, fold_read_end{0};
+    std::atomic<size_t> partner_rejected{0};
+    std::atomic<size_t> retry_from_partner{0};
+    std::atomic<size_t> art_reads{0};
+    std::atomic<size_t> pieces{0};
+    std::atomic<size_t> trim_keep_F{0}, trim_keep_R{0};
+    std::atomic<size_t> both_pass_dropped{0};
+    std::atomic<size_t> clip_hits{0};
+    std::atomic<size_t> two_unit_clip_dropped{0};
+    std::atomic<size_t> duplet_named{0};
+    std::atomic<size_t> junctions_abstained{0};
+    std::atomic<size_t> pieces_suppressed{0};
+    std::atomic<size_t> drop_unresolved{0};
+    std::atomic<size_t> boundary_unresolved_parents{0}, boundary_unresolved_children{0};
+    std::atomic<size_t> cut_kind[6]{};          // per concat_hmm CUT_* kind
+};
+
+// Barcode / UMI spacers between an outer adapter (no payload on its far side, e.g. 10x 5' forw_primer) and the
+// inner element joined to it by fixed-length spacers only (10x 5' tso; a poly tail on VisiumHD).
+struct concat_bc_block {
+    std::string outer_id, inner_id;
+    bool inner_after = true;
+    int gap_lo = 0, gap_hi = -1;         // layout spacer length between them
+    std::vector<std::string> barcode_ids;
+};
+
+struct concat_layout_info {
+    std::vector<concat_bc_block> bc_blocks;
+    std::unordered_map<std::string, concat_elem_info> elems;
+    std::unordered_map<std::string, const ReadElement*> layout_by_id;
+    std::vector<std::string> id_F, id_R;  // HMM spec element index -> RAD class_id per strand
+    int seen_pad = 6;
+    concat_hmm_counters* ctr = nullptr;
+};
+
+struct static_restriction {
+    std::string direction;
+    std::vector<static_check_window> windows;
+    const concat_layout_info* info = nullptr;
+    bool read_start = true, read_end = true;   // false at an HMM cut
+};
+
+// --concat-hmm: a piece's place in its parent read. Read ends and junction counterparts are judged
+// on the parent read, because a piece edge at an HMM cut is not a physical read end.
+struct static_piece_frame {
+    const std::string* parent_seq = nullptr;
+    int offset = 0;                           // 0-based start of the piece in the parent read
+};
+
+// A main F / R template, not a T, D or single-primer-end artifact.
+inline bool concat_plain_construct(const concat_hmm::Segment& s) {
+    return (s.strand == 'F' || s.strand == 'R') && !(s.flags & concat_hmm::SEG_ARTIFACT);
+}
+
+inline concat_layout_info build_concat_layout_info(const ReadLayout& layout, const concat_hmm::Model& model) {
+    concat_layout_info info;
+    info.seen_pad = model.opt.seen_pad;
+    std::map<std::string, std::vector<const ReadElement*>> by_dir;
+    for (const auto& e : layout.by_order()) by_dir[e.direction].push_back(&e);
+    auto lengths = [](const ReadElement& e, int& lo, int& hi) {
+        if (!e.length_candidates.empty()) {
+            lo = *std::min_element(e.length_candidates.begin(), e.length_candidates.end());
+            hi = *std::max_element(e.length_candidates.begin(), e.length_candidates.end());
+            return true;
+        }
+        if (e.expected_length && *e.expected_length > 0) { lo = hi = *e.expected_length; return true; }
+        return false;
+    };
+    for (const auto& dir_elems : by_dir) {
+        const auto& v = dir_elems.second;
+        for (size_t i = 0; i < v.size(); ++i) {
+            const ReadElement& e = *v[i];
+            if (e.type != "static" || e.seq.empty() || e.global_class == "start" ||
+                e.global_class == "stop" || e.global_class == "poly_tail") continue;
+            concat_elem_info x;
+            x.m = static_cast<int>(e.seq.size());
+            bool var_before = false, var_after = false;
+            for (size_t j = 0; j < v.size(); ++j) {
+                if (j == i || v[j]->type != "variable") continue;
+                if (j < i) var_before = true; else var_after = true;
+            }
+            x.left_outward = !var_before;
+            x.right_outward = !var_after;
+            x.k_full = std::max(1, std::min(4, x.m * 4 / 22));
+            x.k_missing = std::max(1, std::min(5, x.m * 5 / 22));
+            // walk outward over fixed-length variables to the first poly tail or adapter
+            auto link = [&](int step, bool want_poly) {
+                int lo_sum = 0, hi_sum = 0;
+                for (int j = static_cast<int>(i) + step; j >= 0 && j < static_cast<int>(v.size()); j += step) {
+                    const ReadElement& o = *v[j];
+                    if (o.global_class == "poly_tail") {
+                        if (!want_poly) return false;
+                        x.poly_id = o.class_id;
+                        x.poly_gap_lo = lo_sum;
+                        x.poly_gap_hi = hi_sum;
+                        x.poly_after = step > 0;
+                        return true;
+                    }
+                    if (o.type == "static" && !o.seq.empty() && o.global_class != "start" && o.global_class != "stop") {
+                        if (want_poly || j == static_cast<int>(i) + step) return false;
+                        x.partner_id = o.class_id;
+                        x.partner_gap_lo = lo_sum;
+                        x.partner_gap_hi = hi_sum;
+                        x.partner_after = step > 0;
+                        return true;
+                    }
+                    int lo = 0, hi = 0;
+                    if (o.type != "variable" || o.global_class == "read" || !lengths(o, lo, hi)) return false;
+                    lo_sum += lo;
+                    hi_sum += hi;
+                }
+                return false;
+            };
+            if (!link(+1, true)) link(-1, true);
+            if (!link(+1, false)) link(-1, false);
+            info.elems[e.class_id] = x;
+            info.layout_by_id[e.class_id] = &e;
+            const bool adapter_partner = !x.partner_id.empty();
+            const std::string& inner = adapter_partner ? x.partner_id : x.poly_id;
+            const bool after = adapter_partner ? x.partner_after : x.poly_after;
+            if (!inner.empty() && (after ? x.left_outward : x.right_outward)) {
+                concat_bc_block b;
+                b.outer_id = e.class_id;
+                b.inner_id = inner;
+                b.inner_after = after;
+                b.gap_lo = adapter_partner ? x.partner_gap_lo : x.poly_gap_lo;
+                b.gap_hi = adapter_partner ? x.partner_gap_hi : x.poly_gap_hi;
+                for (int j = static_cast<int>(i) + (after ? 1 : -1); j >= 0 && j < static_cast<int>(v.size()); j += after ? 1 : -1) {
+                    if (v[j]->class_id == inner) break;
+                    if (v[j]->type == "variable" && v[j]->global_class == "barcode") b.barcode_ids.push_back(v[j]->class_id);
+                }
+                if (!b.barcode_ids.empty()) {
+                    if (adapter_partner) info.elems[e.class_id].bc_outer = true;
+                    info.bc_blocks.push_back(std::move(b));
+                }
+            }
+        }
+    }
+    // a forward-only row maps to its reverse-complement counterpart on the R strand
+    const auto& els = model.spec.elements;
+    info.id_F.assign(els.size(), "");
+    info.id_R.assign(els.size(), "");
+    for (size_t j = 0; j < els.size(); ++j) {
+        const auto& e = els[j];
+        const std::string other_dir = e.direction == 'F' ? "reverse" : "forward";
+        std::string other;
+        for (const auto& o : layout.by_order()) {
+            if (o.direction.rfind(other_dir, 0) != 0 || o.type != "static") continue;
+            const bool poly = o.global_class == "poly_tail";
+            if ((e.klass == "poly_tail" && poly) ||
+                (!poly && !e.seq.empty() && o.seq == seq_utils::revcomp(e.seq))) { other = o.class_id; break; }
+        }
+        (e.direction == 'F' ? info.id_F[j] : info.id_R[j]) = e.id;
+        (e.direction == 'F' ? info.id_R[j] : info.id_F[j]) = other;
+    }
+    return info;
+}
+
+// --concat-hmm: a barcode block in a piece after the full static search. Positions are 1-based inclusive
+// in piece coordinates, -1 when absent.
+struct concat_bc_state {
+    const concat_bc_block* block = nullptr;
+    std::string dir;
+    int outer_s = -1, outer_e = -1;
+    int inner_s = -1, inner_e = -1;
+    bool paired = false;             // inner at the layout spacer offset from the outer (+-4 bp)
+    bool outer_clipped = false;      // outer is a refused clipped hit: evidence, not an element
+    bool strict() const { return outer_s > 0 && inner_s > 0 && paired; }
+    bool usable() const { return inner_s > 0 && (outer_s <= 0 || paired); }
+    bool bare() const { return outer_s > 0 && !paired; }
+    int rank() const { return strict() ? 3 : usable() ? 2 : bare() ? 1 : 0; }
+};
+
+// What the router does with a T / single-primer-end piece.
+struct concat_piece_plan {
+    enum kind_t { NORMAL, TRIM } kind = NORMAL;
+    std::string dir;                // strand of the only usable barcode unit; empty: none or two
+    int trim_lo = 0, trim_hi = 0;   // TRIM: kept range, 0-based half-open, piece coordinates
+    bool no_double_count = false;
+    uint8_t clip_check = 0;         // see SigString::hmm_clip_check
+    const char* note = "";
 };
 
 /**
@@ -1593,6 +2186,23 @@ class SigString {
     int sequence_length;
     std::string read_type;
     std::string additional_info;
+    bool from_concatemer = false;
+    // --concat-hmm only; the defaults are inert on every other path
+    uint8_t hmm_fold_edges = 0;   // bit0 child starts at a fold-back cut, bit1 ends at one
+    uint8_t hmm_fold_used = 0;
+    std::string hmm_fold_dir;
+    std::vector<std::string> hmm_reject_barcodes;
+    struct hmm_weak_ref { std::string id; std::pair<int, int> aligned, anchored; };
+    std::vector<hmm_weak_ref> hmm_weak_refs;
+    std::string hmm_note;
+    std::string hmm_boundary_note;
+    bool hmm_no_double_count = false;
+    // SSW hits refused by the read-end clipping rule in a piece's full search: evidence only, never elements.
+    struct hmm_clip_hit { std::string id; std::pair<int, int> pos; bool block_adapter = false; };
+    std::vector<hmm_clip_hit> hmm_clip_hits;
+    uint8_t hmm_clip_check = 0;        // do not write a record whose read element holds a clip hit (bit0 fwd, bit1 rev)
+    bool hmm_edge_is_fold = true;
+    int hmm_parent_off = -1, hmm_parent_end = -1;  // window in the parent read, 0-based half-open (reporting only)
 
 public:
     SigString(
@@ -1659,6 +2269,18 @@ public:
     void set_length(int length) { sequence_length = length; }
     void set_type(const std::string& type) { read_type = type; }
     void set_info(const std::string& info) { additional_info = info; }
+    void mark_concatemer() { from_concatemer = true; }
+    // --concat-hmm: the read element may start (end) at the child boundary
+    void set_fold_edges(bool at_start, bool at_end, const std::string& dir, bool fold = true) {
+        hmm_fold_edges = static_cast<uint8_t>((at_start ? 1 : 0) | (at_end ? 2 : 0));
+        hmm_fold_dir = dir;
+        hmm_edge_is_fold = fold;
+    }
+    uint8_t fold_boundary_used() const { return hmm_fold_used; }
+    bool fold_edge_is_fold() const { return hmm_edge_is_fold; }
+    // --concat-hmm: debug sigstrings print in parent coordinates; the mapping frame and FASTQ records do not change.
+    void set_parent_frame(int off, int end) { hmm_parent_off = off; hmm_parent_end = end; }
+    int parent_offset() const { return hmm_parent_off; }
 
     // Container operations
     size_t size() const { return sig_elements.size(); }
@@ -1727,6 +2349,28 @@ private:
                positions.first <= static_cast<int>(read_length) &&
                positions.second <= static_cast<int>(read_length) &&
                positions.second > positions.first;
+    }
+
+/**
+ * @brief --concat-hmm: child-boundary position for a read element whose references on that side are not placed.
+ * @return the position next to the virtual start (stop) element, or -1
+ */
+    static bool hmm_ref_placed(const std::vector<const seq_element*>& ordered, const std::string& id) {
+        if (id.empty()) return false;
+        for (const seq_element* e : ordered)
+            if (e->class_id == id && e->position.first > 0) return true;
+        return false;
+    }
+    int hmm_fold_boundary(const std::string& ref_a, const std::string& ref_b, const std::vector<const seq_element*>& ordered,
+                          const seq_element& var, bool at_start) {
+        if (var.global_class != "read" || var.direction != hmm_fold_dir) return -1;
+        if (hmm_ref_placed(ordered, ref_a) || hmm_ref_placed(ordered, ref_b)) return -1;
+        for (const seq_element* e : ordered) {
+            if (e->type != "static" || e->global_class != (at_start ? "start" : "stop")) continue;
+            hmm_fold_used = static_cast<uint8_t>(hmm_fold_used | (at_start ? 1 : 2));
+            return at_start ? e->position.second + 1 : e->position.first - 1;
+        }
+        return -1;
     }
 
 /**
@@ -2040,6 +2684,10 @@ private:
         }
     }
     
+    // --concat-hmm: at a fold-back cut with no start reference, the read element starts at the child boundary.
+    if (start_pos <= 0 && (hmm_fold_edges & 1))
+        start_pos = hmm_fold_boundary(ref_pos.primary_start.ref_id, ref_pos.secondary_start.ref_id, ordered_elements, *var_it, true);
+
     // ----- STOP POSITION LOOKUP -----
     int stop_pos = -1;
     { // Primary stop lookup
@@ -2280,6 +2928,10 @@ private:
         }
     }    
     
+    // --concat-hmm: mirror for the child end
+    if (stop_pos <= 0 && (hmm_fold_edges & 2))
+        stop_pos = hmm_fold_boundary(ref_pos.primary_stop.ref_id, ref_pos.secondary_stop.ref_id, ordered_elements, *var_it, false);
+
     var_positions = {start_pos, stop_pos};
     
     if (verbose) {
@@ -2363,10 +3015,11 @@ private:
     }
 
 /**
- * @brief Filter out reads that are shorter than the summative expected length of adapters
- * @param elems vector of references to `seq_element` objects
+ * @brief Filter out reads whose cDNA is shorter than --min-read-length
+ * @param elems elements after mask_and_trim_elements (the read element holds the written cDNA)
  * @param layout `ReadLayout` object containing layout elements
- * @return true if read length meets or exceeds total expected adapter length, false otherwise
+ * @param min_read_length the limit; -1 = the summed expected length of the layout's elements
+ * @return true if the cDNA length meets the limit
  */
     bool filter_short_reads(const std::vector<std::reference_wrapper<const seq_element>>& elems,
                             const ReadLayout& layout, int min_read_length = -1) const {
@@ -2612,21 +3265,21 @@ private:
             return false;
         }
 
-        // Length filtering
+        // Sort elements by order
+        std::sort(elements.begin(), elements.end(), [](const auto& a, const auto& b) {
+            return a.get().order < b.get().order;
+        });
+
+        // Mask overlapping elements and trim reads
+        mask_and_trim_elements(elements, read, verbose);
+
+        // After the trim, so the length test counts the written cDNA on every route.
         if (!filter_short_reads(elements, layout, min_read_length)) {
             filtered_because += direction + "_FILTERED_READ_LENGTH";
             set_info(filtered_because);
             return false;
         }
-        
-        // Sort elements by order
-        std::sort(elements.begin(), elements.end(), [](const auto& a, const auto& b) {
-            return a.get().order < b.get().order;
-        });
-        
-        // Mask overlapping elements and trim reads
-        mask_and_trim_elements(elements, read, verbose);
-        
+
         // Validate positions and check for overlaps
         return validate_element_positions(elements, direction, filtered_because, verbose);
     }
@@ -2969,7 +3622,34 @@ private:
         int64_seq bits;
         bits.sequence_to_bits(seq);
         if (!bits.is_valid()) return false;
-        return wl.true_bcs.check_wl_for(bits) || wl.global_bcs.check_wl_for(bits);
+        // Precomputed mutation aliases are not exact barcode identities.
+        return wl.true_bcs.has_identity_mapping(bits) || wl.global_bcs.check_wl_for(bits);
+    }
+
+    bool joint_barcode_pair_allowed(
+        const std::vector<std::reference_wrapper<const seq_element>>& group,
+        const ReadLayout& layout,
+        const std::vector<int64_seq>& identities
+    ) const {
+        if (group.size() != identities.size()) return false;
+        if (group.size() != 2) return true;
+
+        // Pair masks use forward molecule order, including on reverse reads.
+        bool reverse = group[0].get().direction == "reverse";
+        size_t first = reverse
+            ? (group[0].get().position.second >= group[1].get().position.second ? 0 : 1)
+            : (group[0].get().position.first <= group[1].get().position.first ? 0 : 1);
+        size_t second = 1 - first;
+        for (const auto& ref : group) {
+            auto found = layout.wl_map.maps.find(seq_utils::remove_rc(ref.get().class_id));
+            if (found == layout.wl_map.maps.end()) return false;
+            const auto& mask = found->second.get().spat_wl;
+            if (mask.has_value() &&
+                (mask->empty() || !mask->check(identities[first], identities[second]))) {
+                return false;
+            }
+        }
+        return true;
     }
 
 /**
@@ -2989,8 +3669,12 @@ private:
         const ReadLayout& layout,
         const read_streaming::sequence& read,
         const joint_barcode_info& jb_info,
-        bool verbose
+        bool verbose,
+        bool* ambiguous = nullptr,
+        bool* rejected_pair = nullptr
     ) {
+        if (ambiguous) *ambiguous = false;
+        if (rejected_pair) *rejected_pair = false;
         if (group.size() < 2) return false;
 
         // Validate: all must be barcodes, same direction
@@ -3041,6 +3725,23 @@ private:
             return members[a].position.first < members[b].position.first;
         });
 
+        // A fixed-length UMI directly before the chain shares its molecular
+        // boundary with BC1. Primer-based extraction may have been shifted; the
+        // resolved barcode placement supplies the more specific boundary.
+        std::string adjacent_umi_id;
+        int adjacent_umi_length = 0;
+        const auto* first_layout = find_layout_element(layout, members[order[0]].elem->class_id);
+        if (first_layout) {
+            const auto& ordered_layout = layout.by_order();
+            auto previous = ordered_layout.find(first_layout->order + (reverse ? 1 : -1));
+            if (previous != ordered_layout.end() && previous->direction == direction &&
+                previous->global_class == "umi" && previous->type == "variable" &&
+                previous->expected_length.value_or(0) > 0 && previous->length_candidates.size() <= 1) {
+                adjacent_umi_id = previous->class_id;
+                adjacent_umi_length = *previous->expected_length;
+            }
+        }
+
         // Build offset search order centered on 0
         const int off_min = jb_info.offset_min;
         const int off_max = jb_info.offset_max;
@@ -3065,9 +3766,42 @@ private:
         // cursor = current position in the oriented read (1-based)
         // depth  = which member in `order` we're trying to match
         std::vector<member_hit> hits(members.size());
+        std::vector<member_hit> accepted_hits;
+        std::string accepted_umi;
+        bool conflicting_identity = false;
+        bool mask_rejected_candidate = false;
 
-        std::function<bool(int, size_t)> search_chain = [&](int cursor, size_t depth) -> bool {
-            if (depth == order.size()) return true; // all matched
+        std::function<void(int, size_t)> search_chain = [&](int cursor, size_t depth) {
+            if (conflicting_identity) return;
+            if (depth == order.size()) {
+                std::vector<int64_seq> identities;
+                identities.reserve(hits.size());
+                for (const auto& hit : hits) identities.emplace_back(hit.seq);
+                if (!joint_barcode_pair_allowed(group, layout, identities)) {
+                    mask_rejected_candidate = true;
+                    return;
+                }
+                std::string candidate_umi;
+                if (adjacent_umi_length > 0) {
+                    const int start = hits[order[0]].start - adjacent_umi_length;
+                    if (start < 1) return;
+                    candidate_umi = oriented_read.substr(static_cast<size_t>(start - 1),
+                                                         static_cast<size_t>(adjacent_umi_length));
+                }
+                if (accepted_hits.empty()) {
+                    accepted_hits = hits;
+                    accepted_umi = std::move(candidate_umi);
+                } else {
+                    if (candidate_umi != accepted_umi) conflicting_identity = true;
+                    for (size_t i = 0; i < hits.size(); ++i) {
+                        if (hits[i].seq != accepted_hits[i].seq) {
+                            conflicting_identity = true;
+                            break;
+                        }
+                    }
+                }
+                return;
+            }
             size_t mi = order[depth];
             const auto& m = members[mi];
             for (int len : m.lengths) {
@@ -3078,46 +3812,27 @@ private:
                     static_cast<size_t>(start - 1), static_cast<size_t>(len));
                 if (!exact_whitelist_match(*m.wl, seq)) continue;
                 hits[mi] = {seq, start, end};
-                if (search_chain(end + 1, depth + 1)) return true;
+                search_chain(end + 1, depth + 1);
+                if (conflicting_identity) return;
             }
-            return false;
         };
 
-        bool found = false;
         for (int off : offset_order) {
             int start = anchor_start + off;
             if (start < 1) continue;
-            if (search_chain(start, 0)) {
-                found = true;
-                break;
-            }
+            search_chain(start, 0);
+            if (conflicting_identity) break;
         }
-        if (!found) return false;
-
-        // Validate the pair against the joint_spat_wl if loaded.
-        // For a two-member group: check the (BC1, BC2) bit in the sparse mask.
-        if (group.size() == 2) {
-            size_t first_idx = order[0];
-            size_t second_idx = order[1];
-            auto wl_it = layout.wl_map.maps.find(
-                seq_utils::remove_rc(members[first_idx].elem->class_id));
-            if (wl_it != layout.wl_map.maps.end()) {
-                const auto& wl_entry = wl_it->second.get();
-                if (wl_entry.spat_wl.has_value() && !wl_entry.spat_wl->empty()) {
-                    int64_seq bc1_bits, bc2_bits;
-                    bc1_bits.sequence_to_bits(hits[first_idx].seq);
-                    bc2_bits.sequence_to_bits(hits[second_idx].seq);
-                    if (!wl_entry.spat_wl->check(bc1_bits, bc2_bits)) {
-                        if (verbose) {
-                            log_verbose("JOINT_BARCODE_PAIR_REJECTED: " +
-                                hits[first_idx].seq + "+" + hits[second_idx].seq +
-                                " not in valid pairs mask");
-                        }
-                        return false;
-                    }
-                }
-            }
+        if (conflicting_identity) {
+            if (ambiguous) *ambiguous = true;
+            if (verbose) log_verbose("JOINT_BARCODE_AMBIGUOUS: multiple barcode or adjacent UMI identities");
+            return false;
         }
+        if (accepted_hits.empty()) {
+            if (rejected_pair) *rejected_pair = mask_rejected_candidate;
+            return false;
+        }
+        hits = std::move(accepted_hits);
 
         // Convert hits back to original coordinates and apply corrections
         auto to_original = [read_len, reverse](std::pair<int, int> p) -> std::pair<int, int> {
@@ -3126,6 +3841,24 @@ private:
         };
 
         auto& id_index = sig_elements.get<sig_id_tag>();
+        if (adjacent_umi_length > 0) {
+            const int stop = hits[order[0]].start - 1;
+            const auto position = to_original({stop - adjacent_umi_length + 1, stop});
+            auto found = id_index.find(adjacent_umi_id);
+            if (found == id_index.end() ||
+                (read.is_fastq && position.second > static_cast<int>(read.qual.size()))) return false;
+            id_index.modify(found, [&](seq_element& elem) {
+                elem.original_seq = elem.seq;
+                elem.position = position;
+                elem.seq = read.seq.substr(static_cast<size_t>(position.first - 1),
+                                           static_cast<size_t>(adjacent_umi_length));
+                if (read.is_fastq) {
+                    elem.qual = read.qual.substr(static_cast<size_t>(position.first - 1),
+                                                 static_cast<size_t>(adjacent_umi_length));
+                }
+                elem.element_pass = true;
+            });
+        }
         for (size_t mi = 0; mi < members.size(); ++mi) {
             const auto& m = members[mi];
             const auto& h = hits[mi];
@@ -3199,6 +3932,7 @@ private:
         bool strict_joint_mode = (joint_bc_mode == "strict");
         bool all_barcodes_passed = true;
         bool any_barcode_passed = false;
+        bool joint_identity_rejected = false;
 
         auto& id_index = sig_elements.get<sig_id_tag>();
         for (size_t i = 0; i < barcode_entries.size();) {
@@ -3219,13 +3953,51 @@ private:
                     ++j;
                 }
 
-                if (group.size() >= 2 &&
-                    try_process_joint_barcode_group(group, layout, read, group_info, verbose)) {
-                    any_barcode_passed = true;
-                    i = j;
-                    continue;
+                bool ambiguous = false;
+                bool rejected_pair = false;
+                bool exact_group = group.size() >= 2 &&
+                    try_process_joint_barcode_group(group, layout, read, group_info, verbose,
+                                                    &ambiguous, &rejected_pair);
+                std::vector<bool> resolved(group.size(), exact_group);
+                if (!exact_group && !ambiguous && !rejected_pair) {
+                    // Default mode can retain independently resolved components.
+                    // A failed component is not a corrected barcode and must not
+                    // be written into an apparently complete molecular identity.
+                    for (size_t member = 0; member < group.size(); ++member) {
+                        seq_element elem = group[member].get();
+                        resolved[member] = elem.seq &&
+                            process_single_barcode(elem, layout, read, gen_mut, mode, verbose);
+                    }
                 }
-                // Joint group failed — fall through to process individually
+                if (!ambiguous && !rejected_pair && group.size() >= 2 &&
+                    std::all_of(resolved.begin(), resolved.end(), [](bool value) { return value; })) {
+                    // Check the full resolved pair before output filtering: a
+                    // suppressed component cannot hide a known mask violation.
+                    std::vector<int64_seq> identities;
+                    identities.reserve(group.size());
+                    for (const auto& ref : group) identities.emplace_back(*ref.get().seq);
+                    rejected_pair = !joint_barcode_pair_allowed(group, layout, identities);
+                }
+                const bool rejected = ambiguous || rejected_pair;
+                size_t retained = 0;
+                for (size_t member = 0; member < group.size(); ++member) {
+                    const auto& elem = group[member].get();
+                    if (rejected || !resolved[member] || !elem.write.value_or(true)) {
+                        edit_elem(elem.class_id, [](seq_element& failed) {
+                            failed.element_pass = false;
+                            failed.write = false;
+                        });
+                    } else {
+                        ++retained;
+                    }
+                }
+                if (retained != group.size() || group.size() < 2) {
+                    all_barcodes_passed = false;
+                }
+                joint_identity_rejected = joint_identity_rejected || rejected;
+                any_barcode_passed = any_barcode_passed || retained > 0;
+                i = std::max(i + 1, j);
+                continue;
             }
 
             // Process as a single barcode
@@ -3235,7 +4007,7 @@ private:
                 continue;
             }
             seq_element elem = *it;
-            bool barcode_passed = process_single_barcode(elem, layout, read, gen_mut, mode, verbose);
+            bool barcode_passed = process_single_barcode(elem, layout, read, gen_mut, mode, verbose, /*locate=*/true);
             if (!barcode_passed) {
                 all_barcodes_passed = false;
                 mark_element_failed(elem.class_id);
@@ -3245,6 +4017,7 @@ private:
             ++i;
         }
 
+        if (joint_identity_rejected) return false;
         if (!has_multiple_barcodes) {
             return all_barcodes_passed;
         }
@@ -3266,15 +4039,16 @@ private:
  * @return true if barcode correction is successful, false otherwise
  */
     bool process_single_barcode(const seq_element& elem, const ReadLayout& layout, const read_streaming::sequence& read,
-        int gen_mut, const std::string& mode, bool verbose
+        int gen_mut, const std::string& mode, bool verbose, bool locate = false
     ) {
 
         if (verbose) {
             log_verbose("Processing barcode: " + elem.seq.value());
         }
-        
+
+        barcode_correction::bc_position pos;
         auto correction_result = barcode_correction::correct_barcode(
-            elem, layout, read, verbose, gen_mut, mode
+            elem, layout, read, verbose, gen_mut, mode, locate ? &pos : nullptr
         );
 
         // Apply correction and update element
@@ -3283,7 +4057,94 @@ private:
         }
 
         apply_barcode_correction(elem, correction_result.value(), layout, verbose);
+        if (locate) {
+            move_barcode_position(elem, pos, layout, read, verbose);
+        }
         return true;
+    }
+
+/**
+ * @brief Move a single barcode to where the whitelist match found it, with the elements whose primary start and
+ * stop both reference it (the UMI). The read element never moves: it was extracted and masked before correction.
+ * @param elem the barcode element before correction (layout position)
+ * @param pos where correct_barcode located the barcode
+ */
+    void move_barcode_position(const seq_element& elem, const barcode_correction::bc_position& pos,
+        const ReadLayout& layout, const read_streaming::sequence& read, bool verbose
+    ) {
+        using bc_position = barcode_correction::bc_position;
+        namespace st = barcode_position_stats;
+        auto kept = [&](std::atomic<size_t>& counter, const std::string& why) {
+            counter.fetch_add(1, std::memory_order_relaxed);
+            if (verbose) log_verbose("Barcode position kept: " + elem.class_id + " (" + why + ")");
+        };
+        switch (pos.kind) {
+            case bc_position::unknown: kept(st::unknown, "position unknown"); return;
+            case bc_position::window: kept(st::window, "window match"); return;
+            case bc_position::tie: kept(st::tie, "ambiguous: " + std::to_string(pos.n_end) + " equally good ends"); return;
+            case bc_position::clipped: kept(st::clipped, "match clipped at the window edge"); return;
+            case bc_position::located: break;
+        }
+        if (pos.shift == 0) {
+            kept(st::in_place, "located in place");
+            return;
+        }
+
+        const bool reverse = elem.direction == "reverse";
+        // reverse strand: the UMI side is at lower read coordinates
+        const int delta = reverse ? -pos.shift : pos.shift;
+        const int read_len = static_cast<int>(read.seq.size());
+        const std::pair<int, int> bc_pos{elem.position.first + delta, elem.position.second + delta};
+        if (bc_pos.first < 1 || bc_pos.second > read_len) {
+            kept(st::out_of_read, "new position outside the read");
+            return;
+        }
+
+        auto& id_index = sig_elements.get<sig_id_tag>();
+        auto bc_it = id_index.find(elem.class_id);
+        if (bc_it == id_index.end()) return;
+
+        struct chained_move { std::string id; std::pair<int, int> position; };
+        std::vector<chained_move> chained;
+        auto& type_index = layout.by_type();
+        auto variable_range = type_index.equal_range("variable");
+        for (auto lit = variable_range.first; lit != variable_range.second; ++lit) {
+            if (!lit->ref_pos || lit->direction != elem.direction) continue;
+            const auto& rp = *lit->ref_pos;
+            if (rp.primary_start.ref_id != elem.class_id || rp.primary_stop.ref_id != elem.class_id) continue;
+            auto it = id_index.find(lit->class_id);
+            if (it == id_index.end() || it->type != "variable") continue;
+            if (it->position.first < 1 || it->position.second < it->position.first) continue;  // not placed
+            const int start = (rp.primary_start.is_start ? bc_pos.first : bc_pos.second) + rp.primary_start.offset;
+            const int stop = (rp.primary_stop.is_start ? bc_pos.first : bc_pos.second) + rp.primary_stop.offset;
+            if (start < 1 || stop > read_len || stop < start) {
+                kept(st::out_of_read, "new position outside the read");
+                return;
+            }
+            chained.push_back({lit->class_id, {start, stop}});
+        }
+
+        id_index.modify(bc_it, [&](seq_element& e) { e.position = bc_pos; });
+        for (const auto& m : chained) {
+            id_index.modify(id_index.find(m.id), [&](seq_element& e) {
+                e.position = m.position;
+                const size_t off = static_cast<size_t>(m.position.first - 1);
+                const size_t len = static_cast<size_t>(m.position.second - m.position.first + 1);
+                e.seq = read.seq.substr(off, len);
+                if (e.qual.has_value() && read.is_fastq && read.qual.size() >= off + len) {
+                    e.qual = read.qual.substr(off, len);
+                }
+            });
+        }
+        st::moved.fetch_add(1, std::memory_order_relaxed);
+        (reverse ? st::moved_reverse : st::moved_forward).fetch_add(1, std::memory_order_relaxed);
+
+        if (verbose) {
+            log_verbose("Barcode position moved: " + elem.class_id + " " + std::to_string(elem.position.first) + "-" +
+                        std::to_string(elem.position.second) + " -> " + std::to_string(bc_pos.first) + "-" +
+                        std::to_string(bc_pos.second) + " (shift " + std::to_string(pos.shift) + ", " +
+                        std::to_string(chained.size()) + " chained element(s) moved)");
+        }
     }
 
 /**
@@ -3304,16 +4165,16 @@ private:
 
         // Single-lookup resolution: find the entry once in true, then global.
         // Stash the counter pointer on the element so update_bc_counts avoids re-lookup.
-        barcode_entry* entry = nullptr;
+        counter* resolved = nullptr;
         bool found_in_true = false;
         bool found_in_global = false;
 
-        entry = wl.true_bcs.find_entry(corrected_barcode);
-        if (entry) {
+        resolved = wl.true_bcs.find_counter(corrected_barcode);
+        if (resolved) {
             found_in_true = true;
         } else {
-            entry = wl.global_bcs.find_entry(corrected_barcode);
-            if (entry) found_in_global = true;
+            resolved = wl.global_bcs.find_counter(corrected_barcode);
+            if (resolved) found_in_global = true;
         }
 
         bool true_wl_empty = wl.true_bcs.empty();
@@ -3326,7 +4187,7 @@ private:
             e.seq = final_bc;
             e.element_pass = true;
             e.write = found_in_true || (true_wl_empty && found_in_global);
-            e.resolved_counter = entry ? &entry->count : nullptr;
+            e.resolved_counter = resolved;
             // Check if corrected: different from original (and not just its RC)
             if (e.original_seq.has_value() && !e.original_seq->empty()) {
                 const std::string& orig = e.original_seq.value();
@@ -3451,10 +4312,6 @@ private:
                     log_verbose("Adding failed barcode to filter: " + failed_bc.bits_to_sequence());
                 }
                 
-                barcode_entry failed_entry;
-                failed_entry.barcode = failed_bc;
-                failed_entry.filtered = true;
-                
                 // Double-check that it's still not present
                 auto failed_range = wl.filter_bcs.equal_range(failed_bc);
                 auto rc_failed_range = wl.filter_bcs.equal_range(rc_failed_bc);
@@ -3462,7 +4319,7 @@ private:
                 if ((failed_range.first == failed_range.second) && 
                     (rc_failed_range.first == rc_failed_range.second)) {
                     // Entry doesn't exist - insert it
-                    //wl.filter_bcs.insert_bc_entry(failed_bc, failed_entry);
+                    // Insertion into filter_bcs remains disabled.
                 }
             }
         }
@@ -3492,7 +4349,7 @@ private:
         return count;
     }
     
-    void log_verbose(const std::string& message) {
+    void log_verbose(const std::string& message) const {
         #pragma omp critical
         {
             std::ostringstream oss;
@@ -3533,7 +4390,10 @@ public:
  * misalignment regions or are truncated on the edges of reads.
  * Aligned elements in the read are masked to prevent re-alignment or overlapping.
  */
-   void sigalign_static(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose) {
+   void sigalign_static(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose,
+                        std::vector<seq_element>* additional_hits = nullptr,
+                        const static_restriction* restrict_to = nullptr,
+                        const static_piece_frame* piece = nullptr) {
     aligner_tools aligner;
     auto& type_index = layout.by_type();
     auto static_range = type_index.equal_range("static");
@@ -3549,9 +4409,25 @@ public:
     int max_distance = -1;
     // Make a mutable copy of the read to mask aligned regions
     std::string mutable_seq = read.seq;
+    std::vector<const ReadElement*> deferred_polys;
+    std::vector<std::pair<const ReadElement*, static_check_window>> spacer_retries;
     size_t read_length = read.seq.length();
+    // Clipped hits wait for a counterpart that may align later; no new alignment, no wider budget.
+    std::vector<std::pair<const ReadElement*, static_alignments>> clipped_pending;
+    // A piece edge at an HMM cut is not a physical read end.
+    const bool at_read_start = !piece || piece->offset == 0;
+    const bool at_read_end = !piece || !piece->parent_seq ||
+        piece->offset + read_length >= piece->parent_seq->size();
 
     for (auto it = static_range.first; it != static_range.second; ++it) {
+        // --concat-hmm: poly tails go last so a run cannot mask the edge of an adapter next to it.
+        if (restrict_to && it->global_class != "start" && it->global_class != "stop") {
+            if (it->direction == restrict_to->direction) {
+                if (it->global_class == "poly_tail") deferred_polys.push_back(&*it);
+                else align_static_in_windows(*it, read, mutable_seq, *restrict_to, aligner, verbose, &spacer_retries);
+            }
+            continue;
+        }
         if(verbose){
             #pragma omp critical
             {
@@ -3673,6 +4549,7 @@ public:
         }
 
         // Use the entire mutable sequence as target
+        static_alignments candidates;
         auto result = aligner.align_static_elements(it->seq,
                                                     mutable_seq,
                                                     verbose,
@@ -3680,7 +4557,59 @@ public:
                                                     it->masked_seq,
                                                     verbose,
                                                     expected_start,
-                                                    expected_end);
+                                                    expected_end,
+                                                    additional_hits ? &candidates : nullptr,
+                                                    1, -1, true,
+                                                    at_read_start, at_read_end);
+        // Forward elements are visited before their reverse counterparts.
+        // Do not let an imperfect hit mask an exact opposite-strand adapter at
+        // the same locus; otherwise the later read boundary falls back to a
+        // barcode/UMI and can retain adapter sequence in the written cDNA.
+        if (result.success && result.edit_distance > 0 && result.positions.size() == 1 &&
+            exact_opposite_at_locus(*it, layout, read, result.positions.front(), max_distance)) {
+            result.success = false;
+            result.positions.clear();
+        }
+        if (candidates.edit_distance > 0) {
+            candidates.positions.erase(std::remove_if(candidates.positions.begin(), candidates.positions.end(),
+                [&](const auto& position) {
+                    return exact_opposite_at_locus(*it, layout, read, position, max_distance);
+                }), candidates.positions.end());
+            if (candidates.positions.empty()) candidates.success = false;
+        }
+        if (!result.success && result.edit_distance >= 0 &&
+            result.edit_distance <= max_distance && result.positions.size() == 1 &&
+            ((result.query_clip_left > 0) != (result.query_clip_right > 0))) {
+            clipped_pending.emplace_back(&*it, result);
+        }
+        // --concat-hmm piece: keep the refused hit as evidence only (not an element, not masked).
+        if (piece && !result.success && result.edit_distance >= 0 &&
+            result.edit_distance <= max_distance && result.positions.size() == 1) {
+            hmm_clip_hits.push_back({it->class_id, result.positions.front(), false});
+            if (verbose) log_verbose("CLIP_EVIDENCE " + it->class_id + " " +
+                std::to_string(result.positions.front().first) + ":" +
+                std::to_string(result.positions.front().second) + " local_edits=" +
+                std::to_string(result.edit_distance) + " clip=" +
+                std::to_string(result.query_clip_left) + "/" + std::to_string(result.query_clip_right));
+        }
+        if (additional_hits && candidates.success) {
+            for (const auto& pos : candidates.positions) {
+                if (pos.first < 1 || pos.second < pos.first ||
+                    pos.second > static_cast<int>(read_length)) continue;
+                // Alternative tracebacks at the primary locus are not extra
+                // molecules. Keep legacy coordinates/metadata there.
+                if (result.success && std::any_of(result.positions.begin(), result.positions.end(),
+                    [&](const auto& primary_pos) {
+                        return pos.first <= primary_pos.second && primary_pos.first <= pos.second;
+                    })) continue;
+                additional_hits->emplace_back(it->class_id, it->global_class,
+                    candidates.edit_distance, pos, "static", it->order, it->direction,
+                    true, std::nullopt, read.seq.substr(pos.first - 1, pos.second - pos.first + 1));
+                if (verbose) log_verbose("CONCAT_CANDIDATE " + it->class_id + " " +
+                    std::to_string(pos.first) + ":" + std::to_string(pos.second) +
+                    " edits=" + std::to_string(candidates.edit_distance));
+            }
+        }
             if (result.success) {
                 // Positions returned are relative to the full read
                 for (const auto& pos : result.positions) {
@@ -3699,7 +4628,7 @@ public:
                     // Extract N-masked regions if query contains N's
                     std::string n_extracted = aligner.extract_n_masked_regions(result, it->seq);
 
-                    add_element(seq_element(
+                    seq_element primary(
                         it->class_id,
                         it->global_class,
                         result.edit_distance,
@@ -3712,7 +4641,9 @@ public:
                         n_extracted.empty() ? full_aligned_seq : n_extracted,
                         std::nullopt,
                         n_extracted.empty() ? std::nullopt : std::optional<std::string>(full_aligned_seq)
-                    ));
+                    );
+                    primary.query_complete = result.query_complete;
+                    add_element(std::move(primary));
 
                     // Mask the aligned region so that it is not re-aligned
                     std::fill(mutable_seq.begin() + adj_start - 1,
@@ -3722,6 +4653,979 @@ public:
                 continue;
             }
         }
+    // A clipped end may face a molecule junction: accept it only next to an exact full-length
+    // reverse-complement counterpart (extraction evidence only, never a split anchor).
+    for (const auto& pending : clipped_pending) {
+        const auto& element = *pending.first;
+        const auto& result = pending.second;
+        if (!has_exact_molecular_boundary(result, element, layout, read,
+                                          additional_hits, piece)) continue;
+        seq_element primary(element.class_id, element.global_class,
+            result.edit_distance, result.positions.front(), "static", element.order,
+            element.direction, true, std::nullopt, result.seq);
+        primary.query_complete = false;
+        add_element(std::move(primary));
+        if (piece)
+            hmm_clip_hits.erase(std::remove_if(hmm_clip_hits.begin(), hmm_clip_hits.end(),
+                [&](const hmm_clip_hit& h) { return h.id == element.class_id; }), hmm_clip_hits.end());
+        if (verbose) log_verbose("MOLECULAR_END_CLIP " + element.class_id + " " +
+            std::to_string(result.positions.front().first) + ":" +
+            std::to_string(result.positions.front().second) + " local_edits=" +
+            std::to_string(result.edit_distance));
+    }
+        for (const ReadElement* poly : deferred_polys)
+            align_static_in_windows(*poly, read, mutable_seq, *restrict_to, aligner, verbose);
+        for (const auto& rq : spacer_retries)
+            retry_at_spacer_offset(*rq.first, rq.second, read, mutable_seq, *restrict_to, aligner, verbose);
+    }
+
+    static bool exact_opposite_at_locus(const ReadElement& element, const ReadLayout& layout,
+                                        const read_streaming::sequence& read,
+                                        const std::pair<int, int>& position, int max_distance) {
+        if (max_distance <= 0 || element.seq.empty() ||
+            element.seq.find_first_not_of("ACGT") != std::string::npos) return false;
+        const std::string opposite = seq_utils::revcomp(element.seq);
+        bool has_counterpart = false;
+        for (const auto& other : layout.by_type()) {
+            if (other.type == "static" && other.direction != element.direction &&
+                other.global_class == element.global_class && other.seq == opposite) {
+                has_counterpart = true;
+                break;
+            }
+        }
+        if (!has_counterpart) return false;
+        const size_t first = static_cast<size_t>(std::max(0, position.first - 1 - max_distance));
+        for (size_t start = read.seq.find(opposite, first); start != std::string::npos;
+             start = read.seq.find(opposite, start + 1)) {
+            const int left = static_cast<int>(start) + 1;
+            if (left > position.first + max_distance) break;
+            const int right = static_cast<int>(start + opposite.size());
+            // Both boundaries must describe the same locus. An independent
+            // forward repeat elsewhere in the read must still be retained.
+            if (left <= position.second && right >= position.first &&
+                std::abs(right - position.second) <= max_distance) return true;
+        }
+        return false;
+    }
+
+    bool has_exact_molecular_boundary(const static_alignments& partial,
+        const ReadElement& element, const ReadLayout& layout,
+        const read_streaming::sequence& read,
+        const std::vector<seq_element>* additional_hits = nullptr,
+        const static_piece_frame* piece = nullptr) const {
+        if (partial.query_complete || partial.positions.size() != 1 ||
+            ((partial.query_clip_left > 0) == (partial.query_clip_right > 0)) ||
+            element.seq.find_first_not_of("ACGTacgt") != std::string::npos) return false;
+        // Only a missing end that faces away from all payload can be supported.
+        auto outward_edge = [&](const ReadElement& adapter) {
+            bool payload_left = false, payload_right = false;
+            for (const auto& item : layout.by_order()) {
+                if (item.direction != adapter.direction || item.type != "variable") continue;
+                payload_left = payload_left || item.order < adapter.order;
+                payload_right = payload_right || item.order > adapter.order;
+            }
+            return payload_right && !payload_left ? -1 : payload_left && !payload_right ? 1 : 0;
+        };
+        const int missing_edge = partial.query_clip_left > 0 ? -1 : 1;
+        if (outward_edge(element) != missing_edge) return false;
+        const auto pos = partial.positions.front();
+        if (pos.first < 1 || pos.second < pos.first || pos.second > static_cast<int>(read.seq.size()) ||
+            read.seq.compare(pos.first - 1, pos.second - pos.first + 1, partial.seq) != 0) return false;
+        const std::string counterpart = seq_utils::revcomp(element.seq);
+        auto supports = [&](const seq_element& hit) {
+            if (hit.type != "static" || !hit.element_pass.value_or(false) ||
+                !hit.query_complete || hit.edit_distance.value_or(-1) != 0 ||
+                hit.global_class != element.global_class ||
+                !((element.direction == "forward" && hit.direction == "reverse") ||
+                  (element.direction == "reverse" && hit.direction == "forward"))) return false;
+            const auto definition = layout.by_id().find(hit.class_id);
+            if (definition == layout.by_id().end() || definition->seq != counterpart ||
+                outward_edge(*definition) != -missing_edge ||
+                hit.position.first < 1 || hit.position.second > static_cast<int>(read.seq.size()) ||
+                hit.position.second - hit.position.first + 1 != static_cast<int>(counterpart.size()) ||
+                read.seq.compare(hit.position.first - 1, counterpart.size(), counterpart) != 0) return false;
+            const int gap = partial.query_clip_left > 0
+                ? pos.first - hit.position.second - 1
+                : hit.position.first - pos.second - 1;
+            return gap >= 0 && gap <= 3;
+        };
+        for (const auto& hit : sig_elements) if (supports(hit)) return true;
+        if (additional_hits) for (const auto& hit : *additional_hits) if (supports(hit)) return true;
+        // --concat-hmm piece: the counterpart may lie across the HMM cut, so test the parent read.
+        if (piece && piece->parent_seq) {
+            bool defined = false;
+            for (const auto& item : layout.by_order()) {
+                if (item.type != "static" || item.seq != counterpart ||
+                    item.global_class != element.global_class ||
+                    !((element.direction == "forward" && item.direction == "reverse") ||
+                      (element.direction == "reverse" && item.direction == "forward")) ||
+                    outward_edge(item) != -missing_edge) continue;
+                defined = true;
+                break;
+            }
+            const std::string& parent = *piece->parent_seq;
+            const long len = static_cast<long>(counterpart.size());
+            const long piece_lo = piece->offset;
+            const long piece_hi = piece_lo + static_cast<long>(read.seq.size());
+            for (int gap = 0; defined && gap <= 3; ++gap) {
+                const long start = partial.query_clip_left > 0
+                    ? piece_lo + (pos.first - 1) - gap - len
+                    : piece_lo + pos.second + gap;
+                if (start < 0 || start + len > static_cast<long>(parent.size())) continue;
+                if (start >= piece_lo && start + len <= piece_hi) continue;  // already tested above
+                if (parent.compare(static_cast<size_t>(start), counterpart.size(), counterpart) == 0) return true;
+            }
+        }
+        return false;
+    }
+
+    // --concat-hmm: align one static element inside each HMM window for it, with the aligner its expected
+    // status calls for. Unconfirmed barcode-side adapters are queued for retry_at_spacer_offset.
+    void align_static_in_windows(const ReadElement& elem, const read_streaming::sequence& read,
+                                 std::string& mutable_seq, const static_restriction& rs,
+                                 aligner_tools& aligner, bool verbose,
+                                 std::vector<std::pair<const ReadElement*, static_check_window>>* retry = nullptr) {
+        using concat_hmm::Status;
+        if (elem.global_class == "poly_tail") {
+            bool named = false;
+            for (const auto& w : rs.windows) named = named || w.class_id == elem.class_id;
+            if (!named) return;
+            auto result = aligner.find_poly_tails(elem.seq, read.seq, 14);
+            if (!result.success) return;
+            for (auto positions : result.positions) {
+                while (positions.first <= positions.second && mutable_seq[positions.first - 1] == 'X') ++positions.first;
+                while (positions.second >= positions.first && mutable_seq[positions.second - 1] == 'X') --positions.second;
+                if (positions.second - positions.first + 1 < 12) continue;
+                bool overlaps = false;
+                for (const auto& w : rs.windows)
+                    overlaps = overlaps || (w.class_id == elem.class_id && positions.first <= w.hi && w.lo <= positions.second);
+                if (!overlaps) continue;
+                add_element(seq_element(elem.class_id, elem.global_class, result.edit_distance, positions, "static",
+                                        elem.order, elem.direction, true, std::nullopt,
+                                        mutable_seq.substr(positions.first - 1, positions.second - positions.first + 1)));
+                std::fill(mutable_seq.begin() + positions.first - 1, mutable_seq.begin() + positions.second, 'X');
+            }
+            return;
+        }
+        if (!rs.info || elem.seq.empty()) return;
+        const auto info_it = rs.info->elems.find(elem.class_id);
+        if (info_it == rs.info->elems.end()) return;
+        const concat_elem_info& info = info_it->second;
+        concat_hmm_counters* ctr = rs.info->ctr;
+        const int read_length = static_cast<int>(read.seq.length());
+        const int max_distance = elem.misalignment_threshold
+            ? std::get<0>(*elem.misalignment_threshold)
+            : adapter_thresholds::fallback_max_edit_distance(elem.seq.length());
+        const int m = info.m;
+        auto poly_support = [&](const static_alignments& hit) {
+            if (info.poly_id.empty() || hit.positions.empty()) return false;
+            const int as = hit.positions.front().first, ae = hit.positions.front().second;
+            for (const auto& pw : rs.windows) {
+                if (pw.class_id != info.poly_id || pw.status != Status::FULL) continue;
+                const int gap = info.poly_after ? (pw.lo - 1 + rs.info->seen_pad) - ae
+                                                : (as - 1) - (pw.hi - rs.info->seen_pad);
+                if (gap >= info.poly_gap_lo - 4 && gap <= info.poly_gap_hi + 4) return true;
+            }
+            return false;
+        };
+        // At a cut (not a physical read end), the primer may reach at most 4 bp into the barcode block that a
+        // FULL partner implies.
+        auto clamp_to_partner = [&](static_check_window& wc) {
+            if (info.partner_id.empty() || (info.partner_after ? rs.read_start : rs.read_end)) return;
+            int best = -1, bd = INT_MAX;
+            for (size_t i = 0; i < rs.windows.size(); ++i) {
+                const auto& pw = rs.windows[i];
+                if (pw.class_id != info.partner_id || pw.status != Status::FULL) continue;
+                const int d = info.partner_after ? pw.lo - wc.hi : wc.lo - pw.hi;
+                if (d > -m && std::abs(d) < bd) { bd = std::abs(d); best = static_cast<int>(i); }
+            }
+            if (best < 0) return;
+            const auto& pw = rs.windows[best];
+            if (info.partner_after) wc.hi = std::min(wc.hi, pw.lo + rs.info->seen_pad - 1 - info.partner_gap_lo + 4);
+            else wc.lo = std::max(wc.lo, pw.hi - rs.info->seen_pad + 1 + info.partner_gap_lo - 4);
+        };
+        for (const auto& w0 : rs.windows) {
+            if (w0.class_id != elem.class_id) continue;
+            static_check_window w = w0;
+            clamp_to_partner(w);
+            const int st = static_cast<int>(w.status);
+            if (ctr) ctr->win[st].fetch_add(1, std::memory_order_relaxed);
+            if (w.hi < w.lo) {
+                if (retry && w.status != Status::TRUNCATED_AT_READ_END && (!info.poly_id.empty() || !info.partner_id.empty()))
+                    retry->push_back({&elem, w0});
+                continue;
+            }
+            static_alignments hit;
+            bool missing_rules = false;
+            bool is_fragment = false;
+            bool whole_degraded = false;
+            if (w.status == Status::FULL) {
+                hit = aligner.align_static_elements(elem.seq, mutable_seq, verbose, std::max(info.k_full, w.edits),
+                                                    elem.masked_seq, verbose, w.lo, w.hi, nullptr, w.lo, w.hi, false);
+                missing_rules = !hit.success;
+            } else if (w.status == Status::PARTIAL) {
+                const int rf = std::max(0, w.retained_from);
+                const int rt = w.retained_to < 0 ? m : std::min(m, w.retained_to);
+                whole_degraded = rf == 0 && rt == m;
+                const bool faces_boundary = (rf == 0 || info.left_outward) && (rt == m || info.right_outward);
+                if (rt - rf >= 10 && rt - rf < m && faces_boundary) {
+                    const int a = std::max(0, rf - 2), b = std::min(m, rt + 2);
+                    hit = aligner.align_static_elements(elem.seq.substr(a, b - a), mutable_seq, verbose,
+                                                        std::max(1, (rt - rf) / 8), "", verbose, w.lo, w.hi,
+                                                        nullptr, w.lo, w.hi, false);
+                    if (hit.success) {
+                        hit.query_complete = (a == 0 && b == m);
+                        is_fragment = true;
+                    }
+                }
+                if (!hit.success) {
+                    const bool at3 = w.hi >= read_length - 6;
+                    const bool at5 = !at3 && w.lo <= 7;
+                    if ((at3 && rf == 0 && info.right_outward) || (at5 && rt == m && info.left_outward)) {
+                        hit = aligner.align_read_end_fragment(elem.seq, mutable_seq, at3, rt - rf + 4);
+                        is_fragment = hit.success;
+                    }
+                }
+                missing_rules = !hit.success;
+            } else if (w.status == Status::TRUNCATED_AT_READ_END) {
+                const bool at3 = w.hi >= read_length - 6;
+                const bool at5 = !at3 && w.lo <= 7;
+                if ((at3 && info.right_outward) || (at5 && info.left_outward)) {
+                    // only a retained length seen in sequence (edits >= 0) bounds the search
+                    const int keep = (w.edits >= 0 && w.retained_from >= 0 && w.retained_to > w.retained_from)
+                        ? w.retained_to - w.retained_from + 4 : -1;
+                    hit = aligner.align_read_end_fragment(elem.seq, mutable_seq, at3, keep);
+                    is_fragment = hit.success;
+                }
+            } else {
+                missing_rules = true;
+            }
+            if (missing_rules) {
+                const int k = std::min(max_distance, info.k_missing);
+                const bool extend = max_distance > k && !info.poly_id.empty();
+                hit = aligner.align_static_elements(elem.seq, mutable_seq, verbose, extend ? k + 1 : k,
+                                                    elem.masked_seq, verbose, w.lo, w.hi, nullptr, w.lo, w.hi, true);
+                if (hit.success && hit.edit_distance > k && !poly_support(hit)) hit.success = false;
+                if (hit.success && !hit.query_complete && !hit.positions.empty()) {
+                    const int len = hit.positions.front().second - hit.positions.front().first + 1;
+                    const bool lclip = hit.ref_begin > 0;
+                    const bool rclip = hit.ref_end >= 0 && hit.ref_end < m - 1;
+                    // outside PARTIAL windows a clipped edge must face outward
+                    const bool seen = w.status == Status::PARTIAL;
+                    const int ed = hit.edit_distance;
+                    const bool long_enough = seen ? ((len >= 12 && ed <= 1) || (len >= 16 && ed * 6 <= len))
+                                                  : (len >= 16 && ed * 8 <= len);
+                    if (!long_enough || (!seen && ((lclip && !info.left_outward) || (rclip && !info.right_outward))))
+                        hit.success = false;
+                }
+                if (hit.success && w.status == Status::FULL && ctr)
+                    ctr->full_as_missing.fetch_add(1, std::memory_order_relaxed);
+                if (!hit.success && w.status == Status::PARTIAL && info.right_outward != info.left_outward) {
+                    // the inward part is retained: prefix of a closer, suffix of an opener
+                    const bool prefix = info.right_outward;
+                    const int rf = std::max(0, w.retained_from);
+                    const int rt = w.retained_to < 0 ? m : std::min(m, w.retained_to);
+                    if (prefix ? rf == 0 : rt == m) {
+                        const int t_max = std::min(m - 1, (prefix ? rt : m - rf) + 2);
+                        hit = aligner.align_adapter_fragment(elem.seq, mutable_seq, w.lo, w.hi, prefix, whole_degraded ? 12 : 10, t_max);
+                        is_fragment = hit.success;
+                        if (hit.success && ctr) ctr->fragment_ok.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                if (!hit.success && w.status != Status::FULL) {
+                    const bool at3 = w.hi >= read_length - 6 && info.right_outward;
+                    const bool at5 = !at3 && w.lo <= 7 && info.left_outward;
+                    if (at3 || at5) {
+                        hit = aligner.align_read_end_fragment(elem.seq, mutable_seq, at3, -1);
+                        is_fragment = hit.success;
+                    }
+                }
+            }
+            if (!hit.success && w.status == Status::TRUNCATED_AT_READ_END && info.right_outward != info.left_outward) {
+                const bool prefix = info.right_outward;
+                const int rf = std::max(0, w.retained_from), rt = w.retained_to < 0 ? m : std::min(m, w.retained_to);
+                const int t_max = (w.edits >= 0 && rt > rf) ? std::min(m - 1, rt - rf + 2) : m - 1;
+                hit = aligner.align_adapter_fragment(elem.seq, mutable_seq, w.lo, w.hi, prefix, 10, t_max);
+                is_fragment = hit.success;
+                if (hit.success && ctr) ctr->fragment_ok.fetch_add(1, std::memory_order_relaxed);
+            }
+            // a fragment that kept the outward edge and lost the inward one
+            if (!hit.success && (w.status == Status::PARTIAL || w.status == Status::TRUNCATED_AT_READ_END) &&
+                info.right_outward != info.left_outward) {
+                hit = aligner.align_adapter_fragment(elem.seq, mutable_seq, w.lo, w.hi, !info.right_outward, 12, m - 1, true);
+                is_fragment = hit.success;
+                if (hit.success && ctr) ctr->fragment_ok.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (!hit.success || hit.positions.empty()) {
+                if (retry && w.status != Status::TRUNCATED_AT_READ_END && (!info.poly_id.empty() || !info.partner_id.empty()))
+                    retry->push_back({&elem, w});
+                continue;
+            }
+            if (ctr) ctr->win_ok[st].fetch_add(1, std::memory_order_relaxed);
+            const int adj_start = std::max(1, hit.positions.front().first);
+            const int adj_end = std::min(read_length, hit.positions.front().second);
+            if (adj_end < adj_start) continue;
+            const std::string full_aligned_seq = mutable_seq.substr(adj_start - 1, adj_end - adj_start + 1);
+            const std::string n_extracted = is_fragment ? std::string() : aligner.extract_n_masked_regions(hit, elem.seq);
+            seq_element primary(
+                elem.class_id, elem.global_class, hit.edit_distance, std::make_pair(adj_start, adj_end), "static",
+                elem.order, elem.direction, true, std::nullopt,
+                n_extracted.empty() ? full_aligned_seq : n_extracted, std::nullopt,
+                n_extracted.empty() ? std::nullopt : std::optional<std::string>(full_aligned_seq));
+            primary.query_complete = hit.query_complete;
+            add_element(std::move(primary));
+            std::fill(mutable_seq.begin() + adj_start - 1, mutable_seq.begin() + adj_end, 'X');
+            if (verbose)
+                log_verbose("CONCAT_HMM_STATIC " + elem.class_id + " " + concat_hmm::status_name(w.status) + " " +
+                            std::to_string(adj_start) + ":" + std::to_string(adj_end) +
+                            " edits=" + std::to_string(hit.edit_distance) +
+                            (hit.query_complete ? "" : " partial"));
+        }
+    }
+
+    // --concat-hmm: retry an unconfirmed barcode-side adapter at the layout spacer offset from an aligned
+    // partner, then jointly with its adapter partner, then alone when the partner ran off the read end.
+    // Runs after every other element of the strand.
+    void retry_at_spacer_offset(const ReadElement& elem, const static_check_window& w, const read_streaming::sequence& read,
+                                std::string& mutable_seq, const static_restriction& rs, aligner_tools& aligner, bool verbose) {
+        if (!rs.info) return;
+        const auto info_it = rs.info->elems.find(elem.class_id);
+        if (info_it == rs.info->elems.end()) return;
+        const concat_elem_info& info = info_it->second;
+        concat_hmm_counters* ctr = rs.info->ctr;
+        const int n = static_cast<int>(read.seq.length());
+        const int m = info.m;
+        const int k = elem.misalignment_threshold ? std::get<0>(*elem.misalignment_threshold)
+                                                  : adapter_thresholds::fallback_max_edit_distance(elem.seq.length());
+        const bool seen = w.status == concat_hmm::Status::PARTIAL && w.edits >= 0;
+        const int tol = seen ? 8 : 4;
+        const int wlo = w.lo - m, whi = w.hi + m, plo_lim = w.lo - 60, phi_lim = w.hi + 60;
+        {   // already aligned here, e.g. by its partner's joint search
+            auto range = by_id().equal_range(elem.class_id);
+            for (auto it = range.first; it != range.second; ++it)
+                if (it->position.first <= whi && wlo <= it->position.second) return;
+        }
+        if (ctr) ctr->spacer_retry.fetch_add(1, std::memory_order_relaxed);
+        auto record = [&](const ReadElement& el, const static_alignments& hit, int hs, int he, const std::string& why) {
+            const std::string full_aligned_seq = mutable_seq.substr(hs - 1, he - hs + 1);
+            const std::string n_extracted = aligner.extract_n_masked_regions(hit, el.seq);
+            seq_element primary(
+                el.class_id, el.global_class, hit.edit_distance, std::make_pair(hs, he), "static",
+                el.order, el.direction, true, std::nullopt,
+                n_extracted.empty() ? full_aligned_seq : n_extracted, std::nullopt,
+                n_extracted.empty() ? std::nullopt : std::optional<std::string>(full_aligned_seq));
+            primary.query_complete = true;
+            add_element(std::move(primary));
+            std::fill(mutable_seq.begin() + hs - 1, mutable_seq.begin() + he, 'X');
+            if (verbose)
+                log_verbose("CONCAT_HMM_STATIC " + el.class_id + " SPACER_RETRY " + std::to_string(hs) + ":" + std::to_string(he) +
+                            " edits=" + std::to_string(hit.edit_distance) + " " + why);
+        };
+        auto try_partner = [&](const std::string& pid, int glo, int ghi, bool after) -> bool {
+            if (pid.empty()) return false;
+            auto range = by_id().equal_range(pid);
+            std::vector<std::pair<int, int>> partners;
+            for (auto it = range.first; it != range.second; ++it) partners.push_back(it->position);
+            const bool junction_side = after ? !rs.read_start : !rs.read_end;
+            const int tin = pid == info.partner_id && junction_side ? std::min(tol, 4) : tol;
+            for (const auto& pp : partners) {
+                const int ps = pp.first, pe = pp.second;
+                int lo, hi, edge_lo, edge_hi;             // edge: accepted adapter end (after) / start (before)
+                if (after) { edge_hi = ps - 1 - glo + tin; edge_lo = ps - 1 - ghi - tol; lo = edge_lo - m + 1 - k; hi = edge_hi; }
+                else { edge_lo = pe + 1 + glo - tin; edge_hi = pe + 1 + ghi + tol; lo = edge_lo; hi = edge_hi + m - 1 + k; }
+                lo = std::max({lo, 1, plo_lim});
+                hi = std::min({hi, n, phi_lim});
+                if (hi - lo + 1 < m - k) continue;
+                static_alignments hit = aligner.align_static_elements(elem.seq, mutable_seq, verbose, k, elem.masked_seq, verbose,
+                                                                      lo, hi, nullptr, lo, hi, false);
+                if (!hit.success || hit.positions.empty() || !hit.query_complete) continue;
+                const int hs = std::max(1, hit.positions.front().first), he = std::min(n, hit.positions.front().second);
+                if (he < hs || (after ? (he < edge_lo || he > edge_hi) : (hs < edge_lo || hs > edge_hi))) continue;
+                record(elem, hit, hs, he, "partner=" + pid);
+                if (ctr) ctr->spacer_retry_ok.fetch_add(1, std::memory_order_relaxed);
+                if (pid == info.partner_id && info.bc_outer)
+                    mark_weak_primer(elem.class_id, hs, he, ps, pe, glo, ghi, after);
+                return true;
+            }
+            return false;
+        };
+        if (try_partner(info.poly_id, info.poly_gap_lo, info.poly_gap_hi, info.poly_after)) return;
+        if (try_partner(info.partner_id, info.partner_gap_lo, info.partner_gap_hi, info.partner_after)) return;
+        if (info.partner_id.empty() || by_id().count(info.partner_id)) return;
+        auto try_joint = [&]() -> bool {
+            const ReadElement* pel = nullptr;
+            {
+                auto found = rs.info->layout_by_id.find(info.partner_id);
+                if (found != rs.info->layout_by_id.end()) pel = found->second;
+            }
+            if (!pel) return false;
+            const auto pinfo_it = rs.info->elems.find(info.partner_id);
+            if (pinfo_it == rs.info->elems.end()) return false;
+            const int mp = pinfo_it->second.m;
+            const int kp = pel->misalignment_threshold ? std::get<0>(*pel->misalignment_threshold)
+                                                       : adapter_thresholds::fallback_max_edit_distance(pel->seq.length());
+            int lo = std::max(1, wlo), hi = std::min(n, whi);
+            if (hi - lo + 1 < m - k) return false;
+            static_alignments he_hit = aligner.align_static_elements(elem.seq, mutable_seq, verbose, k, elem.masked_seq, verbose,
+                                                                     lo, hi, nullptr, lo, hi, false);
+            if (!he_hit.success || he_hit.positions.empty() || !he_hit.query_complete) return false;
+            const int hs = std::max(1, he_hit.positions.front().first), he = std::min(n, he_hit.positions.front().second);
+            if (he < hs) return false;
+            const bool after = info.partner_after;
+            const int glo = info.partner_gap_lo, ghi = info.partner_gap_hi;
+            const bool junction_side = after ? !rs.read_start : !rs.read_end;
+            const int tin = junction_side ? std::min(tol, 4) : tol;
+            int edge_lo, edge_hi, plo, phi;  // edge: accepted partner start (after) / end (before)
+            if (after) { edge_lo = he + 1 + glo - tin; edge_hi = he + 1 + ghi + tol; plo = edge_lo; phi = edge_hi + mp - 1 + kp; }
+            else { edge_hi = hs - 1 - glo + tin; edge_lo = hs - 1 - ghi - tol; plo = edge_lo - mp + 1 - kp; phi = edge_hi; }
+            plo = std::max(1, plo);
+            phi = std::min(n, phi);
+            bool named = false;
+            for (const auto& pw : rs.windows)
+                named = named || (pw.class_id == info.partner_id && pw.lo <= phi + mp && plo - mp <= pw.hi);
+            if (!named || phi - plo + 1 < mp - kp) return false;
+            static_alignments hp = aligner.align_static_elements(pel->seq, mutable_seq, verbose, kp, pel->masked_seq, verbose,
+                                                                 plo, phi, nullptr, plo, phi, false);
+            if (!hp.success || hp.positions.empty() || !hp.query_complete) return false;
+            const int ps = std::max(1, hp.positions.front().first), pe = std::min(n, hp.positions.front().second);
+            if (pe < ps || (ps <= he && hs <= pe)) return false;
+            if (after ? (ps < edge_lo || ps > edge_hi) : (pe < edge_lo || pe > edge_hi)) return false;
+            record(elem, he_hit, hs, he, "joint with " + info.partner_id);
+            record(*pel, hp, ps, pe, "joint with " + elem.class_id);
+            if (ctr) ctr->spacer_retry_ok.fetch_add(2, std::memory_order_relaxed);
+            if (info.bc_outer) mark_weak_primer(elem.class_id, hs, he, ps, pe, glo, ghi, after);
+            return true;
+        };
+        if (try_joint()) return;
+        // The partner ran off the physical read end: accept the adapter alone at one edit above its anchor grade.
+        const bool after = info.partner_after;
+        if (after ? !rs.read_end : !rs.read_start) return;
+        const auto pinfo_it = rs.info->elems.find(info.partner_id);
+        if (pinfo_it == rs.info->elems.end()) return;
+        const int mp = pinfo_it->second.m, glo = info.partner_gap_lo, t0 = 4;
+        const int kr = std::min(k, std::max(1, std::min(4, m * 4 / 22)) + 1);
+        int edge_lo, edge_hi, lo, hi;  // edge: accepted adapter end (after) / start (before)
+        if (after) { edge_lo = n - mp - glo + t0 + 1; edge_hi = n - glo; lo = edge_lo - m + 1 - kr; hi = edge_hi; }
+        else { edge_lo = glo + 1; edge_hi = mp + glo - t0; lo = edge_lo; hi = edge_hi + m - 1 + kr; }
+        lo = std::max({lo, 1, wlo});
+        hi = std::min({hi, n, whi});
+        if (edge_hi < edge_lo || hi - lo + 1 < m - kr) return;
+        static_alignments hit = aligner.align_static_elements(elem.seq, mutable_seq, verbose, kr, elem.masked_seq, verbose,
+                                                              lo, hi, nullptr, lo, hi, false);
+        if (!hit.success || hit.positions.empty() || !hit.query_complete) return;
+        const int hs = std::max(1, hit.positions.front().first), he = std::min(n, hit.positions.front().second);
+        if (he < hs || (after ? (he < edge_lo || he > edge_hi) : (hs < edge_lo || hs > edge_hi))) return;
+        record(elem, hit, hs, he, "read-end partner=" + info.partner_id);
+        if (ctr) {
+            ctr->spacer_retry_ok.fetch_add(1, std::memory_order_relaxed);
+            ctr->read_end_ok.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    // --concat-hmm: the barcode and UMI of a retry-only outer primer are placed from the partner anchor (the primer
+    // laid at the layout spacer offset). Only an outer adapter: moving the inner one would move the cDNA edge.
+    void mark_weak_primer(const std::string& class_id, int start, int end, int ps, int pe, int glo, int ghi, bool partner_after) {
+        constexpr int min_shift = 3;
+        int a = start, b = end;
+        if (partner_after) { b = std::min(std::max(end, ps - 1 - ghi), ps - 1 - glo); a = b - (end - start); }
+        else { a = std::min(std::max(start, pe + 1 + glo), pe + 1 + ghi); b = a + (end - start); }
+        if (std::abs(a - start) < min_shift) return;
+        hmm_weak_refs.push_back({class_id, {start, end}, {a, b}});
+    }
+    size_t weak_primer_count() const { return hmm_weak_refs.size(); }
+
+    // Outer-adapter hits of a block: aligned elements, then refused clip hits (clipped = true, evidence only).
+    template <class Fn>  // fn(position, clipped)
+    void concat_hmm_each_outer_hit(const concat_bc_block& b, Fn&& fn) const {
+        auto orng = by_id().equal_range(b.outer_id);
+        for (auto o = orng.first; o != orng.second; ++o)
+            if (o->position.first > 0) fn(o->position, false);
+        for (const auto& h : hmm_clip_hits)
+            if (h.id == b.outer_id) fn(h.pos, true);
+    }
+    size_t concat_hmm_classify_clip_hits(const concat_layout_info& info) {
+        for (auto& h : hmm_clip_hits)
+            for (const auto& b : info.bc_blocks) h.block_adapter = h.block_adapter || h.id == b.outer_id || h.id == b.inner_id;
+        return hmm_clip_hits.size();
+    }
+    void mark_hmm_clip_check(uint8_t dirs) { hmm_clip_check = dirs; }
+    // True when a written record's read element holds a refused clip hit, i.e. it would join two constructs.
+    // Call after sigalign_filter, when the element positions are final.
+    bool hmm_clip_hit_in_written_read() const {
+        if (!hmm_clip_check || read_type == "filtered" || read_type == "skipped") return false;
+        for (const auto& e : sig_elements) {
+            if (e.global_class != "read" || e.position.first <= 0 || !e.seq.has_value() || e.seq->empty()) continue;
+            if (read_type != "concatenate" && e.direction != read_type) continue;
+            if (!(hmm_clip_check & (e.direction == "forward" ? 1 : 2))) continue;
+            for (const auto& h : hmm_clip_hits)
+                if (!h.block_adapter && h.pos.first >= e.position.first && h.pos.second <= e.position.second) return true;
+        }
+        return false;
+    }
+
+    // --concat-hmm: a block keeps its barcode only when its outer adapter is absent or its inner partner is at the
+    // layout spacer offset (+-4 bp). Returns the number of rejected blocks.
+    int concat_hmm_partner_rule(const concat_layout_info& info) {
+        constexpr int tol = 4;
+        int rejected = 0;
+        for (const auto& b : info.bc_blocks) {
+            bool outer = false, paired = false;
+            concat_hmm_each_outer_hit(b, [&](const std::pair<int, int>& o, bool) {
+                outer = true;
+                auto irng = by_id().equal_range(b.inner_id);
+                for (auto in = irng.first; in != irng.second; ++in) {
+                    if (in->position.first <= 0) continue;
+                    const int gap = b.inner_after ? in->position.first - o.second - 1
+                                                  : o.first - in->position.second - 1;
+                    paired = paired || (gap >= b.gap_lo - tol && gap <= b.gap_hi + tol);
+                }
+            });
+            if (!outer || paired) continue;
+            ++rejected;
+            for (const auto& id : b.barcode_ids) hmm_reject_barcodes.push_back(id);
+        }
+        return rejected;
+    }
+    void concat_hmm_apply_barcode_rejections() {
+        for (const auto& id : hmm_reject_barcodes)
+            edit_elem(id, [](seq_element& x) { x.position = {-1, -1}; x.element_pass = false; });
+    }
+
+    void set_hmm_note(const std::string& n) { hmm_note = n; }
+    void set_hmm_boundary_note(const std::string& n) { hmm_boundary_note = n; }
+    const std::string& hmm_note_str() const { return hmm_note; }
+    void mark_hmm_no_double_count() { hmm_no_double_count = true; }
+    bool hmm_no_double_count_set() const { return hmm_no_double_count; }
+
+    std::vector<concat_bc_state> concat_hmm_block_states(const concat_layout_info& info) const {
+        constexpr int tol = 4;
+        std::vector<concat_bc_state> out;
+        for (const auto& b : info.bc_blocks) {
+            concat_bc_state st;
+            st.block = &b;
+            auto lit = info.layout_by_id.find(b.outer_id);
+            st.dir = lit != info.layout_by_id.end() ? lit->second->direction : std::string();
+            auto irng = by_id().equal_range(b.inner_id);
+            concat_hmm_each_outer_hit(b, [&](const std::pair<int, int>& o, bool clipped) {
+                if (st.outer_s <= 0) { st.outer_s = o.first; st.outer_e = o.second; st.outer_clipped = clipped; }
+                for (auto in = irng.first; in != irng.second; ++in) {
+                    if (in->position.first <= 0) continue;
+                    const int gap = b.inner_after ? in->position.first - o.second - 1
+                                                  : o.first - in->position.second - 1;
+                    if (gap >= b.gap_lo - tol && gap <= b.gap_hi + tol && !st.paired) {
+                        st.paired = true;
+                        st.outer_s = o.first; st.outer_e = o.second; st.outer_clipped = clipped;
+                        st.inner_s = in->position.first; st.inner_e = in->position.second;
+                    }
+                }
+            });
+            if (st.inner_s <= 0)
+                for (auto in = irng.first; in != irng.second; ++in)
+                    if (in->position.first > 0) { st.inner_s = in->position.first; st.inner_e = in->position.second; break; }
+            out.push_back(std::move(st));
+        }
+        return out;
+    }
+
+    // Plan a T / single-primer-end piece: TRIM at a bare outermost primer facing the one usable unit, else NORMAL.
+    concat_piece_plan concat_hmm_plan_piece(const concat_layout_info& info, int len) const {
+        concat_piece_plan plan;
+        const auto states = concat_hmm_block_states(info);
+        const concat_bc_state* F = nullptr;
+        const concat_bc_state* R = nullptr;
+        for (const auto& s : states) {
+            const concat_bc_state*& slot = s.dir == "reverse" ? R : F;
+            if (!slot || s.rank() > slot->rank()) slot = &s;
+        }
+        const bool u_f = F && F->usable(), u_r = R && R->usable();
+        if (u_f && u_r) {
+            plan.no_double_count = true;
+            plan.note = "ART_BOTH";
+            // check records only against a complete unit: an inner anchor alone is often a chance hit
+            bool far_hit = false;
+            for (const auto& h : hmm_clip_hits) far_hit = far_hit || !h.block_adapter;
+            if (far_hit) plan.clip_check = static_cast<uint8_t>((R->strict() ? 1 : 0) | (F->strict() ? 2 : 0));
+            return plan;
+        }
+        if (u_f || u_r) {
+            const concat_bc_state* unit = u_f ? F : R;
+            const concat_bc_state* other = u_f ? R : F;
+            plan.dir = unit->dir;
+            if (other && other->bare()) {
+                const bool far_right = u_f && other->outer_s > unit->inner_e;
+                const bool far_left = u_r && other->outer_e < unit->inner_s;
+                bool outermost = far_right || far_left;
+                if (outermost) {
+                    for (const auto& e : sig_elements) {
+                        if (e.type != "static" || e.position.first <= 0 || e.global_class == "start" ||
+                            e.global_class == "stop" || e.global_class == "poly_tail") continue;
+                        if (e.class_id == other->block->outer_id && e.position.first == other->outer_s) continue;
+                        if ((far_right && e.position.second > other->outer_e) || (far_left && e.position.first < other->outer_s)) {
+                            outermost = false;
+                            break;
+                        }
+                    }
+                }
+                if (outermost) {
+                    plan.kind = concat_piece_plan::TRIM;
+                    plan.trim_lo = far_left ? other->outer_e : 0;
+                    plan.trim_hi = far_right ? other->outer_s - 1 : len;
+                    plan.note = u_f ? "P7_TRIM_F" : "P7_TRIM_R";
+                    return plan;
+                }
+            }
+            plan.note = "ART_SINGLE";
+            return plan;
+        }
+        plan.note = "ART_NONE";
+        return plan;
+    }
+
+    // Best concat_bc_state::rank on the given strand (any strand when dir is empty).
+    int concat_hmm_unit_rank(const concat_layout_info& info, const std::string& dir) const {
+        int r = 0;
+        for (const auto& st : concat_hmm_block_states(info))
+            if (dir.empty() || st.dir == dir) r = std::max(r, st.rank());
+        return r;
+    }
+
+    void concat_hmm_reject_strand(const concat_layout_info& info, const std::string& dir) {
+        for (const auto& b : info.bc_blocks) {
+            auto lit = info.layout_by_id.find(b.outer_id);
+            if (lit == info.layout_by_id.end() || lit->second->direction != dir) continue;
+            for (const auto& id : b.barcode_ids) hmm_reject_barcodes.push_back(id);
+        }
+    }
+
+    // Copy the parent's static alignments inside [offset0, offset0 + new_len), shifted to this molecule's
+    // coordinates, plus virtual start / stop boundaries. No new alignment is run.
+    void adopt_statics_from(const SigString& src, int offset0, int new_len, const ReadLayout& layout) {
+        for (const auto& e : src.sig_elements) {
+            if (e.type != "static" || e.global_class == "start" || e.global_class == "stop") continue;
+            if (e.position.first <= 0 || e.position.first <= offset0 || e.position.second > offset0 + new_len) continue;
+            seq_element c = e;
+            c.position.first -= offset0;
+            c.position.second -= offset0;
+            add_element(std::move(c));
+        }
+        for (const auto& elem : layout.by_type()) {
+            if (elem.type != "static" || (elem.global_class != "start" && elem.global_class != "stop")) continue;
+            const int boundary = elem.global_class == "start" ? 0 : new_len + 1;
+            add_element(seq_element(elem.class_id, elem.global_class, std::nullopt, {boundary, boundary},
+                                    "static", elem.order, elem.direction));
+        }
+    }
+
+    // Records to_fastqa_append would write: {forward, reverse}.
+    std::pair<int, int> concat_hmm_pending_records() const {
+        if (read_type == "skipped" || read_type == "filtered") return {0, 0};
+        std::pair<int, int> out{0, 0};
+        const bool bulk = additional_info == "bulk";
+        for (const char* dir : {"forward", "reverse"}) {
+            if (read_type != "concatenate" && read_type != dir) continue;
+            bool has_bc = false, has_read = false;
+            for (const auto& elem : sig_elements) {
+                if (!elem.seq.has_value() || elem.direction != dir) continue;
+                if (elem.global_class == "barcode") has_bc = true;
+                else if (elem.global_class == "read" && !elem.seq->empty()) has_read = true;
+                else if (bulk && elem.type == "static" && elem.original_seq.has_value()) has_bc = true;
+            }
+            if ((has_bc || bulk) && has_read) (std::string(dir) == "forward" ? out.first : out.second) += 1;
+        }
+        return out;
+    }
+
+    // Group occurrences, not alignment scores. This runs before variables are
+    // instantiated, and never changes the legacy signature on an unresolved
+    // read. In particular, an ordinary F/R duplet stays on its existing path.
+    std::vector<static_segment> group_static_candidates(
+        const ReadLayout& layout, const std::vector<seq_element>& additional_hits,
+        bool verbose = false, int min_read_length = 0) const {
+        if (additional_hits.empty()) return {};
+
+        auto is_anchor = [&](const seq_element& elem) {
+            if (elem.type != "static" || !elem.element_pass.value_or(false) ||
+                elem.global_class == "start" || elem.global_class == "stop" ||
+                elem.global_class == "poly_tail") return false;
+            const auto found = layout.by_id().find(elem.class_id);
+            if (found == layout.by_id().end() || !elem.edit_distance) return false;
+            // Reject spans incompatible with a full-query alignment. This is
+            // necessary but not sufficient to rule out SSW clipping; exact
+            // query coverage is checked separately before a primary can root
+            // a repeated orientation.
+            const int span = elem.position.second - elem.position.first + 1;
+            return std::abs(span - static_cast<int>(found->seq.size())) <= *elem.edit_distance;
+        };
+        // Most unused LOC results are an alternative to a failed/positional
+        // primary, not a repeat. Avoid building grouping indices for them.
+        bool repeated_anchor = false;
+        for (size_t index = 0; index < additional_hits.size() && !repeated_anchor; ++index) {
+            const auto& hit = additional_hits[index];
+            if (!is_anchor(hit)) continue;
+            auto same_id = by_id().equal_range(hit.class_id);
+            auto separate = [&](const seq_element& other) {
+                return other.class_id == hit.class_id && is_anchor(other) &&
+                    (other.position.second < hit.position.first || hit.position.second < other.position.first);
+            };
+            for (auto it = same_id.first; it != same_id.second; ++it) repeated_anchor = repeated_anchor || separate(*it);
+            for (size_t other = 0; other < index && !repeated_anchor; ++other) repeated_anchor = separate(additional_hits[other]);
+        }
+        if (!repeated_anchor) return {};
+        const int read_length_floor = std::max(1, min_read_length >= 0
+            ? min_read_length : calc_total_static_len(layout));
+
+        std::map<std::string, std::vector<const seq_element*>> hits;
+        for (const auto& elem : sig_elements) {
+            if (is_anchor(elem)) hits[elem.class_id].push_back(&elem);
+        }
+        for (const auto& elem : additional_hits) {
+            if (is_anchor(elem)) hits[elem.class_id].push_back(&elem);
+        }
+        for (auto& entry : hits) {
+            auto& positions = entry.second;
+            std::stable_sort(positions.begin(), positions.end(), [](const auto* a, const auto* b) {
+                return a->position < b->position;
+            });
+            std::vector<const seq_element*> distinct;
+            int cluster_end = -1;
+            for (const auto* hit : positions) {
+                if (distinct.empty() || hit->position.first > cluster_end) {
+                    distinct.push_back(hit);
+                } else if (hit->edit_distance.value_or(INT_MAX) <
+                           distinct.back()->edit_distance.value_or(INT_MAX)) {
+                    distinct.back() = hit;
+                }
+                cluster_end = std::max(cluster_end, hit->position.second);
+            }
+            positions = std::move(distinct);
+        }
+
+        std::vector<static_segment> segments;
+        std::map<std::string, bool> incomplete_directions;
+        std::map<std::string, std::vector<std::pair<std::string, std::string>>> anchor_patterns;
+        for (const std::string direction : {"forward", "reverse"}) {
+            std::vector<const ReadElement*> anchors;
+            int first_read = INT_MAX, last_read = -1;
+            for (const auto& elem : layout.by_order()) {
+                if (elem.direction != direction) continue;
+                if (elem.type == "variable" && elem.global_class == "read") {
+                    first_read = std::min(first_read, elem.order);
+                    last_read = std::max(last_read, elem.order);
+                }
+                if (elem.type == "static" && elem.global_class != "start" &&
+                    elem.global_class != "stop" && elem.global_class != "poly_tail") {
+                    anchors.push_back(&elem);
+                }
+            }
+            // A single adapter or a homopolymer is insufficient evidence for
+            // a new molecule. Require real layout anchors around the cDNA.
+            if (anchors.size() < 2 || first_read == INT_MAX || first_read != last_read ||
+                anchors.front()->order >= first_read || anchors.back()->order <= last_read) continue;
+            bool unbounded_variables = false;
+            for (const auto& elem : layout.by_order()) {
+                if (elem.direction == direction && elem.type == "variable" &&
+                    (elem.order < anchors.front()->order || elem.order > anchors.back()->order)) {
+                    unbounded_variables = true;
+                }
+            }
+            if (unbounded_variables) continue;
+            auto& pattern = anchor_patterns[direction];
+            for (const auto* anchor : anchors) {
+                pattern.emplace_back(seq_utils::remove_rc(anchor->class_id),
+                    direction == "reverse" ? seq_utils::revcomp(anchor->seq) : anchor->seq);
+            }
+            std::sort(pattern.begin(), pattern.end());
+
+            std::vector<int> min_gaps(anchors.size(), 0);
+            for (size_t index = 1; index < anchors.size(); ++index) {
+                for (const auto& elem : layout.by_order()) {
+                    if (elem.direction != direction || elem.type != "variable" ||
+                        elem.order <= anchors[index - 1]->order || elem.order >= anchors[index]->order) continue;
+                    int length = elem.expected_length.value_or(0);
+                    if (!elem.length_candidates.empty()) {
+                        length = *std::min_element(elem.length_candidates.begin(), elem.length_candidates.end());
+                    }
+                    // A necessarily too-short cDNA cannot lend support to a
+                    // cut of an otherwise valid parent. This is an optimistic
+                    // bound (poly-tails are not charged here); normal extraction
+                    // and filtering still decide whether the child passes.
+                    min_gaps[index] += std::max(elem.global_class == "read" ? read_length_floor : 0, length);
+                }
+            }
+            const auto& heads = hits[anchors.front()->class_id];
+            bool incomplete = false;
+            for (size_t head = 0; head < heads.size(); ++head) {
+                const int limit = head + 1 < heads.size() ? heads[head + 1]->position.first : sequence_length + 1;
+                std::vector<const seq_element*> chain{heads[head]};
+                bool ambiguous = false;
+                for (size_t index = 1; index < anchors.size(); ++index) {
+                    const seq_element* next = nullptr;
+                    bool tied = false;
+                    for (const auto* hit : hits[anchors[index]->class_id]) {
+                        if (hit->position.first <= chain.back()->position.second + min_gaps[index] ||
+                            hit->position.second >= limit) continue;
+                        if (!next || *hit->edit_distance < *next->edit_distance) {
+                            next = hit;
+                            tied = false;
+                        } else if (*hit->edit_distance == *next->edit_distance) {
+                            tied = true;
+                        }
+                    }
+                    if (!next) break;
+                    chain.push_back(next);
+                    ambiguous = ambiguous || tied;
+                }
+                if (chain.size() != anchors.size()) {
+                    incomplete = true;
+                    continue;
+                }
+                static_segment segment{{chain.front()->position.first, chain.back()->position.second}, direction, {}};
+                segment.ambiguous = ambiguous;
+                for (const auto* hit : chain) {
+                    segment.elements.push_back(*hit);
+                    segment.edit_distance += *hit->edit_distance;
+                }
+                for (const auto& elem : sig_elements) {
+                    if (elem.global_class == "poly_tail" && elem.direction == direction &&
+                        elem.position.first >= segment.position.first && elem.position.second <= segment.position.second) {
+                        segment.elements.push_back(elem);
+                    }
+                }
+                segments.push_back(std::move(segment));
+            }
+            incomplete_directions[direction] = incomplete;
+        }
+        // Let complete, stronger chains outvote incidental opposite-strand
+        // matches in their interval. Equal-strength conflicting evidence is
+        // unresolved, not a reason to invent a cut. Custom asymmetric layouts
+        // cannot compare raw edit sums across different anchor sets.
+        const bool comparable_orientations = anchor_patterns["forward"] == anchor_patterns["reverse"];
+        std::sort(segments.begin(), segments.end(), [](const auto& a, const auto& b) {
+            return std::tie(a.edit_distance, a.position) < std::tie(b.edit_distance, b.position);
+        });
+        std::vector<static_segment> selected;
+        std::map<std::string, size_t> direction_counts;
+        for (auto& segment : segments) {
+            bool overlaps_better = false;
+            for (const auto& other : selected) {
+                if (segment.position.first <= other.position.second && other.position.first <= segment.position.second) {
+                    if (segment.edit_distance == other.edit_distance ||
+                        (segment.direction != other.direction && !comparable_orientations)) {
+                        if (verbose) log_verbose("CONCAT_UNRESOLVED equal-strength/incomparable overlapping chains");
+                        return {};
+                    }
+                    overlaps_better = true;
+                }
+            }
+            if (overlaps_better) continue;
+            if (segment.ambiguous || incomplete_directions[segment.direction]) {
+                if (verbose) log_verbose("CONCAT_UNRESOLVED ambiguous/incomplete anchor chain: " + segment.direction);
+                return {};
+            }
+            ++direction_counts[segment.direction];
+            selected.push_back(std::move(segment));
+        }
+        if (direction_counts["forward"] < 2 && direction_counts["reverse"] < 2) return {};
+        // A repeat must extend an accepted full-query primary, not consist
+        // entirely of LOC alternatives whose legacy SSW validation failed.
+        // Otherwise weak repeated motifs can replace a valid opposite strand.
+        for (const auto& entry : direction_counts) {
+            if (entry.second < 2) continue;
+            bool supported = false;
+            for (const auto& primary : sig_elements) {
+                if (primary.direction != entry.first || !primary.query_complete || !is_anchor(primary)) continue;
+                for (const auto& segment : selected) {
+                    if (segment.direction != entry.first) continue;
+                    for (const auto& hit : segment.elements) {
+                        if (hit.class_id == primary.class_id &&
+                            hit.position.first <= primary.position.second &&
+                            primary.position.first <= hit.position.second) supported = true;
+                    }
+                }
+            }
+            if (!supported) {
+                if (verbose) log_verbose("CONCAT_UNRESOLVED repeat without primary support: " + entry.first);
+                return {};
+            }
+        }
+        std::sort(selected.begin(), selected.end(), [](const auto& a, const auto& b) { return a.position < b.position; });
+        // Clipped/one-sided primaries cannot justify a cut, but they can still
+        // support legacy extraction. Do not abandon their intervals. Coverage
+        // is strand-independent so incidental opposite hits inside (or across
+        // touching) accepted children do not veto otherwise resolved groups.
+        for (const auto& primary : sig_elements) {
+            if (primary.type != "static" || !primary.element_pass.value_or(false) ||
+                primary.global_class == "start" || primary.global_class == "stop" ||
+                primary.global_class == "poly_tail" || layout.by_id().find(primary.class_id) == layout.by_id().end() ||
+                primary.position.first < 1 || primary.position.second < primary.position.first ||
+                primary.position.second > sequence_length) continue;
+            int uncovered = primary.position.first;
+            for (const auto& segment : selected) {
+                if (segment.position.second < uncovered) continue;
+                if (segment.position.first > uncovered) break;
+                uncovered = segment.position.second + 1;
+                if (uncovered > primary.position.second) break;
+            }
+            if (uncovered <= primary.position.second) {
+                if (verbose) log_verbose("CONCAT_UNRESOLVED uncovered primary: " + primary.class_id);
+                return {};
+            }
+        }
+        if (verbose) {
+            log_verbose("CONCAT_GROUPS " + std::to_string(selected.size()) + " (reused static alignments)");
+            for (const auto& segment : selected) {
+                log_verbose("CONCAT_SEGMENT " + segment.direction + " " +
+                    std::to_string(segment.position.first) + ":" + std::to_string(segment.position.second) +
+                    " edits=" + std::to_string(segment.edit_distance));
+            }
+        }
+        return selected;
+    }
+
+    // Materialize only an accepted occurrence. No child adapter search is
+    // performed; the only possible alignment here is a local traceback for
+    // an indel-containing N-masked capture whose LOC result has no path.
+    bool assign_static_segment(const static_segment& segment, const ReadLayout& layout,
+                               const read_streaming::sequence& read) {
+        from_concatemer = true;
+        const int offset = segment.position.first - 1;
+        aligner_tools aligner;
+        for (auto elem : segment.elements) {
+            elem.position.first -= offset;
+            elem.position.second -= offset;
+            const auto layout_it = layout.by_id().find(elem.class_id);
+            if (layout_it != layout.by_id().end() && layout_it->seq.find('N') != std::string::npos &&
+                !elem.original_seq) {
+                static_alignments capture;
+                capture.seq = read.seq.substr(elem.position.first - 1, elem.position.second - elem.position.first + 1);
+                if (elem.edit_distance.value_or(-1) != 0) {
+                    const EdlibEqualityPair equalities[] = {
+                        {'A','a'}, {'C','c'}, {'T','t'}, {'G','g'},
+                        {'A','x'}, {'C','x'}, {'T','x'}, {'G','x'},
+                        {'N','A'}, {'N','C'}, {'N','T'}, {'N','G'}, {'N','x'}};
+                    auto result = edlibAlign(layout_it->seq.c_str(), layout_it->seq.size(),
+                        capture.seq.c_str(), capture.seq.size(),
+                        edlibNewAlignConfig(elem.edit_distance.value_or(-1), EDLIB_MODE_NW,
+                                            EDLIB_TASK_PATH, equalities, 13));
+                    if (result.status == EDLIB_STATUS_OK && result.editDistance >= 0 && result.alignment) {
+                        char* cigar = edlibAlignmentToCigar(result.alignment, result.alignmentLength, EDLIB_CIGAR_STANDARD);
+                        if (cigar) { capture.cigar = cigar; free(cigar); }
+                    }
+                    edlibFreeAlignResult(result);
+                    if (capture.cigar.empty()) return false;
+                }
+                elem.original_seq = capture.seq;
+                elem.seq = aligner.extract_n_masked_regions(capture, layout_it->seq);
+            }
+            add_element(std::move(elem));
+        }
+        for (const auto& elem : layout.by_type()) {
+            if (elem.type != "static" || (elem.global_class != "start" && elem.global_class != "stop")) continue;
+            const int boundary = elem.global_class == "start" ? 0 : sequence_length + 1;
+            add_element(seq_element(elem.class_id, elem.global_class, std::nullopt, {boundary, boundary},
+                                    "static", elem.order, elem.direction));
+        }
+        return true;
     }
 
 /**
@@ -3790,12 +5694,34 @@ public:
         }
         
         int positioned_count = 0;
+
+        // --concat-hmm: map_positions sees retry-only primers at their partner-anchored position (copies).
+        std::vector<seq_element> hmm_anchored;
+        std::vector<const seq_element*> hmm_anchored_of;
+        if (!hmm_weak_refs.empty()) {
+            hmm_anchored.reserve(hmm_weak_refs.size());  // no reallocation: pointers into it must stay valid
+            for (const auto& elem : sig_elements) {
+                if (elem.type != "static") continue;
+                for (const auto& w : hmm_weak_refs) {
+                    if (w.id != elem.class_id || w.aligned != elem.position || hmm_anchored.size() == hmm_weak_refs.size()) continue;
+                    hmm_anchored.push_back(elem);
+                    hmm_anchored.back().position = w.anchored;
+                    hmm_anchored_of.push_back(&elem);
+                    break;
+                }
+            }
+        }
+        auto ref_ptr = [&](const seq_element& elem) -> const seq_element* {
+            for (size_t i = 0; i < hmm_anchored_of.size(); ++i)
+                if (hmm_anchored_of[i] == &elem) return &hmm_anchored[i];
+            return &elem;
+        };
         
         // Process forward non-read variables
         std::multimap<std::string, const seq_element*> static_refs;
         for (const auto& elem : sig_elements) {
             if (elem.type == "static") {
-                static_refs.insert({elem.class_id, &elem});
+                static_refs.insert({elem.class_id, hmm_weak_refs.empty() ? &elem : ref_ptr(elem)});
                 if (verbose) {
                     #pragma omp critical
                     {
@@ -3839,7 +5765,7 @@ public:
         //  total ref container
         std::multimap<std::string, const seq_element*> total_refs;
         for (const auto& elem : sig_elements) {
-            total_refs.insert({elem.class_id, &elem});
+            total_refs.insert({elem.class_id, hmm_anchored_of.empty() ? &elem : ref_ptr(elem)});
             if (verbose) {
                 #pragma omp critical
                 {
@@ -3964,6 +5890,293 @@ public:
  * @param write_debug flag to enable writing debug output files
  * @param mode `std::string` correction mode for barcode correction (offensive or defensive, which whitelist to check first)
  */
+    // --concat-hmm per-read router: segments the read with the HMM, aligns each construct in its windows and
+    // passes each molecule to process_molecule. Returns false when the caller must run the default path
+    // (guard failed, k = 0, or an abstain with --concat-hmm-abstain=legacy); true when handled, possibly
+    // without a record.
+    template <class mol_fn>
+    static bool concat_hmm_route(const read_streaming::sequence& read, const ReadLayout& layout,
+                                 const concat_layout_info& info, mol_fn&& process_molecule, bool verbose,
+                                 const std::function<void(const read_streaming::sequence&)>& preserve_unresolved = {}) {
+        thread_local concat_hmm::Scratch scratch;
+        thread_local concat_hmm::Result res;
+        concat_hmm_counters& ctr = *info.ctr;
+        const int len = static_cast<int>(read.seq.size());
+        ctr.reads.fetch_add(1, std::memory_order_relaxed);
+        if (layout.concat_model->guard_failed) {
+            ctr.legacy_guard.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        {
+#ifdef RAD_STAGE_TIMERS
+            rad_stage_timers::scope t_hmm(rad_stage_timers::hmm_ns);
+#endif
+            concat_hmm::segment(*layout.concat_model, read.seq.data(), len, scratch, res);
+        }
+        // A confident repeat transition need not locate the physical junction.
+        // Keep the original parent, and do not assign the unresolved interval to
+        // either barcode merely by choosing an arithmetic midpoint.
+        std::vector<uint8_t> boundary_blocked(static_cast<size_t>(std::max(0, res.k)), 0);
+        bool has_unresolved_boundary = res.boundary_unresolved_seen;
+        for (size_t j = 0; j < res.cut_flags.size() && j + 1 < boundary_blocked.size(); ++j) {
+            if (!(res.cut_flags[j] & concat_hmm::BOUNDARY_UNRESOLVED)) continue;
+            boundary_blocked[j] = boundary_blocked[j + 1] = 1;
+            has_unresolved_boundary = true;
+        }
+        if (has_unresolved_boundary) {
+            ctr.boundary_unresolved_parents.fetch_add(1, std::memory_order_relaxed);
+            ctr.boundary_unresolved_children.fetch_add(
+                static_cast<size_t>(std::count(boundary_blocked.begin(), boundary_blocked.end(), uint8_t{1})),
+                std::memory_order_relaxed);
+            if (preserve_unresolved) preserve_unresolved(read);
+        }
+        const char* legacy = nullptr;
+        const char* drop = nullptr;  // written without any record
+        bool junction_abstain = false;
+        // Legacy fallback must not reintroduce a cut through an interval we
+        // have explicitly classified as coordinate-unresolved.
+        const bool abstain_legacy = layout.concat_abstain_legacy && !has_unresolved_boundary;
+        if (res.flags & concat_hmm::RES_GUARD_FAILED) { legacy = "guard"; ctr.legacy_guard.fetch_add(1, std::memory_order_relaxed); }
+        else if (res.k <= 0) { legacy = "k0"; ctr.legacy_k0.fetch_add(1, std::memory_order_relaxed); }
+        else if (res.flags & concat_hmm::RES_TOO_MANY) {
+            if (abstain_legacy) { legacy = "too_many"; ctr.legacy_too_many.fetch_add(1, std::memory_order_relaxed); }
+            else { drop = "too_many"; ctr.drop_too_many.fetch_add(1, std::memory_order_relaxed); }
+        } else if (res.flags & concat_hmm::RES_OPPOSITE_EVIDENCE) {
+            if (abstain_legacy) { legacy = "abstain"; ctr.legacy_abstain.fetch_add(1, std::memory_order_relaxed); }
+            else { drop = "abstain"; ctr.drop_abstain.fetch_add(1, std::memory_order_relaxed); }
+        } else if (res.flags & concat_hmm::RES_ABSTAIN) {
+            // k >= 2: abstain only on the uncertain junctions (resolved below)
+            if (abstain_legacy) { legacy = "abstain"; ctr.legacy_abstain.fetch_add(1, std::memory_order_relaxed); }
+            else if (res.k == 1) { drop = "abstain"; ctr.drop_abstain.fetch_add(1, std::memory_order_relaxed); }
+            else junction_abstain = true;
+        } else if (res.k == 1 && (res.segs[0].flags & concat_hmm::SEG_DOUBLE_BC)) {
+            // D construct with no clear cDNA direction: write nothing rather than guess the unit
+            drop = "d";
+            ctr.drop_d_reads.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (verbose) {
+            std::ostringstream oss;
+            oss << "CONCAT_HMM " << read.id << " k=" << res.k << " p_single=" << res.p_single
+                << " strand=" << res.strand_call << " flags=" << res.flags << " cuts=";
+            for (size_t c = 0; c < res.cuts.size(); ++c) oss << (c ? ";" : "") << res.cuts[c];
+            oss << " branch=" << (legacy ? std::string("legacy:") + legacy
+                                  : drop ? std::string("drop:") + drop : (res.k == 1 ? "single" : "split"));
+            #pragma omp critical
+            RAD_COUT << oss.str() << std::endl;
+        }
+        if (legacy) return false;
+        if (drop) return true;
+
+        // check regions of construct c -> windows in child coordinates
+        auto restriction_for = [&](int c, int child_start, int child_end) {
+            static_restriction r;
+            const char strand = res.segs[c].strand;
+            r.direction = strand == 'F' ? "forward" : "reverse";
+            r.info = &info;
+            r.read_start = child_start == 0;
+            r.read_end = child_end == len;
+            const int child_len = child_end - child_start;
+            for (const auto& chk : res.checks) {
+                if (chk.construct != c || chk.element < 0 || chk.element >= static_cast<int>(info.id_F.size())) continue;
+                const std::string& id = strand == 'F' ? info.id_F[chk.element] : info.id_R[chk.element];
+                if (id.empty()) continue;
+                static_check_window w;
+                w.class_id = id;
+                w.lo = std::max(chk.start, child_start) - child_start + 1;
+                w.hi = std::min(chk.end, child_end) - child_start;
+                if (w.hi < w.lo) {
+                    if (chk.status != concat_hmm::Status::TRUNCATED_AT_READ_END) continue;
+                    w.lo = w.hi = std::max(1, std::min(child_len, w.hi));  // read-end marker
+                }
+                w.status = chk.status;
+                w.retained_from = chk.retained_from;
+                w.retained_to = chk.retained_to;
+                w.edits = chk.edits;
+                r.windows.push_back(std::move(w));
+            }
+            return r;
+        };
+        const bool split = res.k >= 2;
+        if (!split) ctr.single.fetch_add(1, std::memory_order_relaxed);
+        else {
+            ctr.split.fetch_add(1, std::memory_order_relaxed);
+            ctr.children.fetch_add(static_cast<size_t>(res.k), std::memory_order_relaxed);
+        }
+        for (uint8_t kd : res.cut_kind) if (kd < 6) ctr.cut_kind[kd].fetch_add(1, std::memory_order_relaxed);
+        struct piece_t {
+            int c = 0, start = 0, end = 0;
+            bool plain = true, trimmed = false, suppressed = false;
+            char strand = '?';
+            read_streaming::sequence rs;
+            SigString sig;
+        };
+        std::vector<piece_t> pieces;
+        pieces.reserve(static_cast<size_t>(res.k));
+        const bool win = res.cut_lo.size() == res.cuts.size() && res.cut_hi.size() == res.cuts.size();
+        for (int c = 0; c < res.k; ++c) {
+            if (boundary_blocked[static_cast<size_t>(c)]) {
+                continue;
+            }
+            if (res.segs[c].flags & concat_hmm::SEG_SAME_MOLECULE_R) ctr.same_molecule.fetch_add(1, std::memory_order_relaxed);
+            // children may overlap at a cut (cut_lo / cut_hi) so each keeps its whole barcode block
+            int start = c == 0 ? 0 : (win ? res.cut_lo[c - 1] : res.cuts[c - 1]);
+            int end = c + 1 == res.k ? len : (win ? res.cut_hi[c] : res.cuts[c]);
+            // D kept unit: the piece ends at the removed unit's inner anchor, so that unit is never inside it
+            const bool d_kept = (res.segs[c].flags & concat_hmm::SEG_D_KEPT) != 0;
+            const bool d_left = d_kept && res.segs[c].strand == 'F';
+            if (d_kept) { if (d_left) end = std::min(end, res.segs[c].end); else start = std::max(start, res.segs[c].start); }
+            if (end <= start) continue;
+            if (res.segs[c].flags & concat_hmm::SEG_DOUBLE_BC) {
+                ctr.drop_d_children.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            const bool piece_of_read = split || d_kept;
+            piece_t p;
+            p.c = c; p.start = start; p.end = end;
+            p.plain = concat_plain_construct(res.segs[c]);
+            p.strand = res.segs[c].strand;
+            p.rs = read_streaming::sequence{split ? read.id + "/seg" + std::to_string(c + 1) : read.id, read.comment,
+                                            piece_of_read ? read.seq.substr(start, end - start) : read.seq, read.plus,
+                                            read.is_fastq ? (piece_of_read ? read.qual.substr(start, end - start) : read.qual) : "", read.is_fastq};
+            p.sig = SigString(p.rs.id, end - start, "undefined", layout.sequencing_type);
+            if (split) p.sig.mark_concatemer();
+            if (piece_of_read) p.sig.set_parent_frame(start, end);
+            {
+#ifdef RAD_STAGE_TIMERS
+                rad_stage_timers::scope t_static(rad_stage_timers::windowed_static_ns);
+#endif
+                if (p.plain) {
+                    // at a fold-back or strand-flip cut the read element may run to the child boundary
+                    auto cut_edge = [&](int j) {
+                        return j >= 0 && j < static_cast<int>(res.cut_kind.size()) &&
+                               (res.cut_kind[j] == concat_hmm::CUT_FOLDBACK || res.cut_kind[j] == concat_hmm::CUT_STRAND_FLIP);
+                    };
+                    const bool fold_start = c > 0 && ((res.segs[c - 1].flags & concat_hmm::SEG_SAME_MOLECULE_R) || cut_edge(c - 1));
+                    const bool fold_end = c + 1 < res.k && ((res.segs[c].flags & concat_hmm::SEG_SAME_MOLECULE_R) || cut_edge(c));
+                    // likewise at the edge of a D kept unit, where no layout reference remains
+                    if (fold_start || fold_end || d_kept)
+                        p.sig.set_fold_edges(fold_start || (d_kept && !d_left), fold_end || d_left,
+                                             res.segs[c].strand == 'F' ? "forward" : "reverse", !d_kept);
+                    if (d_kept) {
+                        p.sig.set_hmm_note(d_left ? "D_KEEP_L" : "D_KEEP_R");
+                        (d_left ? ctr.d_kept_left : ctr.d_kept_right).fetch_add(1, std::memory_order_relaxed);
+                    } else if (res.segs[c].flags & concat_hmm::SEG_D_SPLIT) {
+                        p.sig.set_hmm_note("D_SPLIT");
+                        if (res.segs[c].strand == 'F') ctr.d_split.fetch_add(1, std::memory_order_relaxed);  // count once per D
+                    }
+                    const static_restriction r = restriction_for(c, start, end);
+                    p.sig.sigalign_static(p.rs, layout, verbose, nullptr, &r);
+                } else {
+                    // T / single-primer end: full static search in the piece, then the piece and partner rules
+                    ctr.pieces.fetch_add(1, std::memory_order_relaxed);
+                    if (split) ctr.children_full_search.fetch_add(1, std::memory_order_relaxed);
+                    else ctr.art_reads.fetch_add(1, std::memory_order_relaxed);
+                    const static_piece_frame frame{&read.seq, start};
+                    p.sig.sigalign_static(p.rs, layout, verbose, nullptr, nullptr, &frame);
+                    if (const size_t nclip = p.sig.concat_hmm_classify_clip_hits(info)) ctr.clip_hits.fetch_add(nclip, std::memory_order_relaxed);
+                    const concat_piece_plan plan = p.sig.concat_hmm_plan_piece(info, end - start);
+                    const std::string other = plan.dir == "forward" ? "reverse" : "forward";
+                    if (plan.kind == concat_piece_plan::TRIM) {
+                        const int tl = plan.trim_lo, th = plan.trim_hi;
+                        read_streaming::sequence rs2{p.rs.id, read.comment, p.rs.seq.substr(tl, th - tl), p.rs.plus,
+                                                     p.rs.is_fastq ? p.rs.qual.substr(tl, th - tl) : "", p.rs.is_fastq};
+                        SigString sig2(rs2.id, th - tl, "undefined", layout.sequencing_type);
+                        if (split) sig2.mark_concatemer();
+                        sig2.set_parent_frame(start + tl, start + th);
+                        sig2.adopt_statics_from(p.sig, tl, th - tl, layout);
+                        sig2.set_fold_edges(tl > 0, th < end - start, plan.dir, false);
+                        sig2.concat_hmm_reject_strand(info, other);
+                        sig2.set_hmm_note(plan.note);
+                        p.sig = std::move(sig2);
+                        p.rs = std::move(rs2);
+                        p.trimmed = true;
+                        (plan.dir == "forward" ? ctr.trim_keep_F : ctr.trim_keep_R).fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        if (!plan.dir.empty()) p.sig.concat_hmm_reject_strand(info, other);
+                        if (plan.no_double_count) p.sig.mark_hmm_no_double_count();
+                        if (plan.clip_check) p.sig.mark_hmm_clip_check(plan.clip_check);
+                        p.sig.set_hmm_note(plan.note);
+                    }
+                    p.strand = plan.dir == "forward" ? 'F' : plan.dir == "reverse" ? 'R' : '?';
+                    if (const int rej = p.sig.concat_hmm_partner_rule(info))
+                        ctr.partner_rejected.fetch_add(static_cast<size_t>(rej), std::memory_order_relaxed);
+                }
+            }
+            if (p.sig.weak_primer_count()) ctr.retry_from_partner.fetch_add(p.sig.weak_primer_count(), std::memory_order_relaxed);
+            auto one_sided_edge = [&](int j) {
+                if (j < 0 || j >= static_cast<int>(res.cut_flags.size())) return false;
+                const uint8_t f = res.cut_flags[static_cast<size_t>(j)];
+                return !(f & concat_hmm::BOUNDARY_UNRESOLVED) &&
+                       static_cast<bool>(f & concat_hmm::BOUNDARY_LEFT_BOUNDED) !=
+                       static_cast<bool>(f & concat_hmm::BOUNDARY_RIGHT_BOUNDED);
+            };
+            if (one_sided_edge(c - 1) || one_sided_edge(c))
+                p.sig.set_hmm_boundary_note("layout_edge");
+            pieces.push_back(std::move(p));
+        }
+        // At a weak junction keep only the piece with the better barcode unit (ties: HMM confidence, then forward).
+        if (split && !pieces.empty()) {
+            const float tau = layout.concat_model ? layout.concat_model->opt.tau_junction : 0.9f;
+            bool any_weak = false;
+            std::vector<uint8_t> weak(static_cast<size_t>(res.k - 1), 0);
+            for (int j = 0; j + 1 < res.k; ++j) {
+                const bool low_post = j < static_cast<int>(res.cut_post.size()) && res.cut_post[j] < tau;
+                const bool midpoint = j < static_cast<int>(res.cut_kind.size()) && res.cut_kind[j] == concat_hmm::CUT_MIDPOINT;
+                weak[j] = static_cast<uint8_t>(low_post || midpoint || (junction_abstain && res.p_single > 0.01f));
+                any_weak = any_weak || weak[j];
+            }
+            if (any_weak) {
+                std::vector<int> rank(pieces.size(), 0);
+                for (size_t i = 0; i < pieces.size(); ++i) {
+                    const std::string dir = pieces[i].strand == 'F' ? "forward" : pieces[i].strand == 'R' ? "reverse" : "";
+                    rank[i] = pieces[i].sig.concat_hmm_unit_rank(info, dir);
+                }
+                auto find = [&](int c) -> int { for (size_t i = 0; i < pieces.size(); ++i) if (pieces[i].c == c) return static_cast<int>(i); return -1; };
+                for (int j = 0; j + 1 < res.k; ++j) {
+                    if (!weak[j]) continue;
+                    ctr.junctions_abstained.fetch_add(1, std::memory_order_relaxed);
+                    const int L = find(j), R = find(j + 1);
+                    if (L >= 0 && R >= 0) {
+                        int keep = -1;
+                        if (rank[L] != rank[R]) keep = rank[L] > rank[R] ? L : R;
+                        else if (rank[L] > 0) {
+                            const float cl = res.segs[j].conf, cr = res.segs[j + 1].conf;
+                            keep = cl != cr ? (cl > cr ? L : R) : (pieces[L].strand == 'F' ? L : pieces[R].strand == 'F' ? R : L);
+                        }
+                        if (keep != L) pieces[L].suppressed = true;
+                        if (keep != R) pieces[R].suppressed = true;
+                    } else if (L >= 0 || R >= 0) {
+                        const int x = L >= 0 ? L : R;
+                        if (rank[x] == 0) pieces[x].suppressed = true;
+                    }
+                }
+                size_t nsup = 0;
+                for (auto& p : pieces) nsup += p.suppressed ? 1 : 0;
+                ctr.pieces_suppressed.fetch_add(nsup, std::memory_order_relaxed);
+                if (nsup == pieces.size()) {
+                    ctr.drop_unresolved.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+            }
+        }
+        // one F + one R construct: duplet names (<id>-F-CT / <id>-R-CT); otherwise /segN
+        if (split && res.k == 2 && pieces.size() == 2 &&
+            ((pieces[0].strand == 'F' && pieces[1].strand == 'R') || (pieces[0].strand == 'R' && pieces[1].strand == 'F'))) {
+            for (auto& p : pieces) { p.sig.set_id(read.id); p.rs.id = read.id; }
+            ctr.duplet_named.fetch_add(1, std::memory_order_relaxed);
+        }
+        for (auto& p : pieces) {
+            if (p.suppressed) continue;
+            process_molecule(p.sig, p.rs);
+            const uint8_t fu = p.sig.fold_boundary_used();
+            if (fu && p.sig.fold_edge_is_fold()) {
+                if (fu & 1) ctr.fold_read_start.fetch_add(1, std::memory_order_relaxed);
+                if (fu & 2) ctr.fold_read_end.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        return true;
+    }
+
     static sigalign_run_stats sigalign(
         const std::string& fastq_path, 
         const ReadLayout& layout, 
@@ -3978,19 +6191,35 @@ public:
         std::string joint_bc_mode = "default",
         bool rc_umi = true,
         int min_read_length = -1,
-        std::function<void()> boundary_poll = {}
+        std::function<void()> boundary_poll = {},
+        FILE* stdout_sink = nullptr,
+        std::function<void(const std::string&)> output_callback = {}
     ) {
     const auto sigalign_wall_t0 = std::chrono::steady_clock::now();
 
     std::string file_out = path_utils::get_fastqa_type(fastq_path);
     std::string fastq_output_path = output_prefix + file_out;
     bool compress_fastq = true;
+    if (stdout_sink && output_callback)
+        throw std::invalid_argument("Specify only one sequence output sink");
+    const bool stream_output = stdout_sink || static_cast<bool>(output_callback);
+    if (stream_output) write_debug = false;
 
     std::unique_ptr<std::ofstream> metrics_file_ptr;
     std::unique_ptr<sigstring_writing> debug_sig_writer, debug_csv_writer, debug_fastqa_writer;
 
     // Primary FASTQA writer
-    sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, compress_fastq, false, num_threads);
+    std::unique_ptr<sigstring_writing> primary_writer;
+    if (stdout_sink)
+        primary_writer = std::make_unique<sigstring_writing>(stdout_sink, sigstring_writing::format::FASTQA);
+    else if (!output_callback)
+        primary_writer = std::make_unique<sigstring_writing>(fastq_output_path, sigstring_writing::format::FASTQA,
+                                                          compress_fastq, false, num_threads);
+    std::unique_ptr<sigstring_writing> unresolved_writer;
+    const std::string unresolved_path = output_prefix + "_boundary_unresolved" + file_out;
+    if (layout.concat_model && !stream_output)
+        unresolved_writer = std::make_unique<sigstring_writing>(unresolved_path,
+            sigstring_writing::format::FASTQA, compress_fastq, false, num_threads);
 
     if (write_debug) {
         std::string sig_path = output_prefix + "_dbg.sig";
@@ -4048,12 +6277,22 @@ public:
     std::atomic<long long> total_queue_time_ms{0};
     std::mutex metrics_mu;
 
+    barcode_position_stats::reset();
+
+    concat_hmm_counters hmm_ctr;
+    std::unique_ptr<concat_layout_info> hmm_info;
+    if (layout.concat_model) {
+        hmm_info = std::make_unique<concat_layout_info>(build_concat_layout_info(layout, *layout.concat_model));
+        hmm_info->ctr = &hmm_ctr;
+    }
+
     auto process_chunk = [&](std::vector<read_streaming::sequence>& chunk, 
                              const std::string& path)
     {
         if (chunk.empty()){
             return;
         }
+        writer.rethrow_if_failed();
 
         const size_t my_chunk_id = ++chunk_id_ctr;
         const auto wall_t0 = std::chrono::steady_clock::now();
@@ -4072,11 +6311,13 @@ public:
         std::vector<std::string> thread_buffers(worker_count);
         std::vector<std::vector<serialized_read_span>> thread_spans(
             worker_count);
+        std::vector<std::string> unresolved_buffers(worker_count);
+        std::vector<std::vector<serialized_read_span>> unresolved_spans(worker_count);
         std::atomic<size_t> passed_count{0};
         std::atomic<size_t> demultiplexed_count{0};
         std::atomic<size_t> records_written_count{0};
 
-        std::vector<std::optional<SigString>> debug_by_input;
+        std::vector<std::vector<SigString>> debug_by_input;
         if (write_debug) {
             debug_by_input.resize(chunk.size());
         }
@@ -4102,48 +6343,161 @@ public:
 
             #pragma omp for schedule(dynamic) nowait
             for (size_t i = 0; i < chunk.size(); ++i) {
-                if (processing_failed.load(std::memory_order_acquire)) {
-                    continue;
-                }
+                if (processing_failed.load(std::memory_order_acquire) || writer.failed()) continue;
                 try {
-                    const auto& read = chunk[i];
-                    SigString sig(read.id, read.seq.length(),"undefined", layout.sequencing_type);
-                    sig.sigalign_static(read, layout, verbose);
-                    sig.sigalign_variable(read, layout, verbose);
-                    sig.sigalign_filter(read, layout, gen_mut.value_or(2), verbose, mode, joint_bc_mode, min_read_length);
+                    const size_t offset = thread_buffers[tid].size();
+                    const size_t unresolved_offset = unresolved_buffers[tid].size();
+                    auto process_one = [&]() {
+                const auto& read = chunk[i];
+#ifdef RAD_STAGE_TIMERS
+                rad_stage_timers::scope t_read(rad_stage_timers::read_ns);
+                rad_stage_timers::reads.fetch_add(1, std::memory_order_relaxed);
+#endif
 
-                    // Serialize directly to the worker-local buffer, retaining
-                    // the byte range for this input read.  One read can emit
-                    // multiple FASTQ records; keeping them in one span also
-                    // preserves their intra-read order.
-                    if (sig.read_type != "filtered" && sig.read_type != "skipped") {
-                        passed_count.fetch_add(1, std::memory_order_relaxed);
-                        const size_t offset = thread_buffers[tid].size();
-                        const size_t records_written =
-                            sig.to_fastqa_append(thread_buffers[tid], rc_umi);
-                        if (records_written > 0) {
-                            thread_spans[tid].push_back(serialized_read_span{
-                                i,
-                                static_cast<size_t>(tid),
-                                offset,
-                                thread_buffers[tid].size() - offset
-                            });
-                            demultiplexed_count.fetch_add(
-                                1, std::memory_order_relaxed);
-                            records_written_count.fetch_add(
-                                records_written, std::memory_order_relaxed);
+                // --concat-hmm: reads the router does not handle fall through to the default path
+                if (hmm_info) {
+                    bool hmm_passed = false;
+                    size_t hmm_records = 0;
+                    auto hmm_molecule = [&](SigString& molecule, const read_streaming::sequence& molecule_read) {
+#ifdef RAD_STAGE_TIMERS
+                        rad_stage_timers::molecules.fetch_add(1, std::memory_order_relaxed);
+                        { rad_stage_timers::scope t_var(rad_stage_timers::variable_ns);
+#endif
+                        molecule.sigalign_variable(molecule_read, layout, verbose);
+                        molecule.concat_hmm_apply_barcode_rejections();
+#ifdef RAD_STAGE_TIMERS
+                        }
+                        rad_stage_timers::scope t_filt(rad_stage_timers::filter_ns);
+                        const auto t_fb0 = std::chrono::steady_clock::now();
+#endif
+                        molecule.sigalign_filter(molecule_read, layout, gen_mut.value_or(2), verbose,
+                                                 mode, joint_bc_mode, min_read_length);
+#ifdef RAD_STAGE_TIMERS
+                        {
+                            const int oc = (molecule.type() != "filtered" && molecule.type() != "skipped") ? 0
+                                         : molecule.info().find("BARCODE_CORRECTION_FAILED") != std::string::npos ? 1 : 2;
+                            rad_stage_timers::fb_ns[0][oc].fetch_add(static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t_fb0).count()), std::memory_order_relaxed);
+                            rad_stage_timers::fb_n[0][oc].fetch_add(1, std::memory_order_relaxed);
+                        }
+#endif
+                        // two barcode units that both pass would be written twice: never double-count
+                        if (molecule.hmm_no_double_count_set() && molecule.read_type == "concatenate") {
+                            molecule.set_type("skipped");
+                            hmm_ctr.both_pass_dropped.fetch_add(1, std::memory_order_relaxed);
+                        } else if (molecule.hmm_clip_hit_in_written_read()) {
+                            molecule.set_type("skipped");
+                            molecule.set_hmm_note(molecule.hmm_note_str() + "_CLIP");
+                            hmm_ctr.two_unit_clip_dropped.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        if (write_debug) debug_by_input[i].push_back(molecule);
+                        if (molecule.read_type != "filtered" && molecule.read_type != "skipped") {
+                            hmm_passed = true;
+                            hmm_records += molecule.to_fastqa_append(thread_buffers[tid], rc_umi);
+                        }
+                    };
+                    auto preserve_unresolved = [&](const read_streaming::sequence& parent) {
+                        if (!unresolved_writer) return;
+                        std::string& b = unresolved_buffers[static_cast<size_t>(tid)];
+                        b += parent.is_fastq ? '@' : '>';
+                        b += parent.id;
+                        if (!parent.comment.empty()) { b += ' '; b += parent.comment; }
+                        b += "\tHU:Z:boundary_unresolved\n";
+                        b += parent.seq;
+                        b += '\n';
+                        if (parent.is_fastq) { b += '+'; b += parent.plus; b += '\n'; b += parent.qual; b += '\n'; }
+                    };
+                    if (concat_hmm_route(read, layout, *hmm_info, hmm_molecule, verbose, preserve_unresolved)) {
+                        if (hmm_passed) passed_count.fetch_add(1, std::memory_order_relaxed);
+                        if (hmm_records > 0) {
+                            demultiplexed_count.fetch_add(1, std::memory_order_relaxed);
+                            records_written_count.fetch_add(hmm_records, std::memory_order_relaxed);
+                        }
+                        return;
+                    }
+                }
+                
+                // process the read
+                {
+                    SigString sig(read.id, read.seq.length(),"undefined", layout.sequencing_type);
+                    std::vector<seq_element> additional_hits;
+#ifdef RAD_STAGE_TIMERS
+                    std::optional<rad_stage_timers::scope> t_static;
+                    t_static.emplace(rad_stage_timers::legacy_static_ns);
+#endif
+                    sig.sigalign_static(read, layout, verbose, &additional_hits);
+                    auto segments = sig.group_static_candidates(layout, additional_hits, verbose, min_read_length);
+#ifdef RAD_STAGE_TIMERS
+                    t_static.reset();
+#endif
+                    bool parent_passed = false;
+                    size_t parent_records = 0;
+                    auto process_molecule = [&](SigString& molecule, const read_streaming::sequence& molecule_read) {
+#ifdef RAD_STAGE_TIMERS
+                        rad_stage_timers::molecules.fetch_add(1, std::memory_order_relaxed);
+                        { rad_stage_timers::scope t_var(rad_stage_timers::variable_ns);
+#endif
+                        molecule.sigalign_variable(molecule_read, layout, verbose);
+#ifdef RAD_STAGE_TIMERS
+                        }
+                        rad_stage_timers::scope t_filt(rad_stage_timers::filter_ns);
+                        const auto t_fb0 = std::chrono::steady_clock::now();
+#endif
+                        molecule.sigalign_filter(molecule_read, layout, gen_mut.value_or(2), verbose,
+                                                 mode, joint_bc_mode, min_read_length);
+#ifdef RAD_STAGE_TIMERS
+                        {
+                            const int oc = (molecule.type() != "filtered" && molecule.type() != "skipped") ? 0
+                                         : molecule.info().find("BARCODE_CORRECTION_FAILED") != std::string::npos ? 1 : 2;
+                            rad_stage_timers::fb_ns[1][oc].fetch_add(static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t_fb0).count()), std::memory_order_relaxed);
+                            rad_stage_timers::fb_n[1][oc].fetch_add(1, std::memory_order_relaxed);
+                        }
+#endif
+                        if (write_debug) debug_by_input[i].push_back(molecule);
+                        if (molecule.read_type != "filtered" && molecule.read_type != "skipped") {
+                            parent_passed = true;
+                            parent_records += molecule.to_fastqa_append(thread_buffers[tid], rc_umi);
+                        }
+                    };
+                    if (segments.empty()) {
+                        process_molecule(sig, read);
+                    } else {
+                        for (size_t index = 0; index < segments.size(); ++index) {
+                            const auto& segment = segments[index];
+                            const int offset = segment.position.first - 1;
+                            const int length = segment.position.second - offset;
+                            read_streaming::sequence molecule_read{
+                                read.id + "/seg" + std::to_string(index + 1), read.comment,
+                                read.seq.substr(offset, length), read.plus,
+                                read.is_fastq ? read.qual.substr(offset, length) : "", read.is_fastq};
+                            SigString molecule(molecule_read.id, length, "undefined", layout.sequencing_type);
+                            if (!molecule.assign_static_segment(segment, layout, molecule_read)) {
+                                if (verbose) molecule.log_verbose("CONCAT_UNRESOLVED masked-capture traceback");
+                                continue;
+                            }
+                            process_molecule(molecule, molecule_read);
                         }
                     }
-                    if (write_debug) {
-                        debug_by_input[i].emplace(std::move(sig));
+                    // Success remains parent-scoped; emitted records count
+                    // molecules. Filtering/counter side effects occur once.
+                    if (parent_passed) passed_count.fetch_add(1, std::memory_order_relaxed);
+                    if (parent_records > 0) {
+                        demultiplexed_count.fetch_add(1, std::memory_order_relaxed);
+                        records_written_count.fetch_add(parent_records, std::memory_order_relaxed);
                     }
+                }  // sig destroyed here
+                    };
+                    process_one();
+                    if (thread_buffers[tid].size() > offset)
+                        thread_spans[tid].push_back({i, static_cast<size_t>(tid), offset,
+                                                    thread_buffers[tid].size() - offset});
+                    if (unresolved_buffers[tid].size() > unresolved_offset)
+                        unresolved_spans[tid].push_back({i, static_cast<size_t>(tid), unresolved_offset,
+                                                        unresolved_buffers[tid].size() - unresolved_offset});
                 } catch (...) {
-                    {
-                        std::lock_guard<std::mutex> lock(processing_error_mutex);
-                        if (!processing_error) {
-                            processing_error = std::current_exception();
-                        }
-                    }
+                    std::lock_guard<std::mutex> lock(processing_error_mutex);
+                    if (!processing_error) processing_error = std::current_exception();
                     processing_failed.store(true, std::memory_order_release);
                 }
             }
@@ -4163,12 +6517,11 @@ public:
         if (write_debug) {
             debug_sigs.reserve(chunk.size());
             for (auto& sig : debug_by_input) {
-                if (sig.has_value()) {
-                    debug_sigs.push_back(std::move(sig.value()));
-                }
+                for (auto& molecule : sig) debug_sigs.push_back(std::move(molecule));
             }
         }
 
+        writer.rethrow_if_failed();
         const auto wall_t1 = std::chrono::steady_clock::now();
         
         // Calculate actual work time (max across all threads)
@@ -4177,35 +6530,33 @@ public:
             actual_process_ms = std::max(actual_process_ms, t);
         }
 
-        // === consolidate and write ===
+        // Consolidate complete input-parent spans on the serial caller. R
+        // callbacks must never be called by alignment or writer workers.
+        auto consolidate = [](const auto& spans, const auto& buffers) {
+            std::vector<serialized_read_span> ordered;
+            size_t bytes = 0;
+            for (const auto& local : spans) for (const auto& span : local) {
+                ordered.push_back(span);
+                bytes += span.length;
+            }
+            std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+                return a.input_index < b.input_index;
+            });
+            std::string result;
+            result.reserve(bytes);
+            for (const auto& span : ordered)
+                result.append(buffers[span.worker_index], span.offset, span.length);
+            return result;
+        };
+        if (unresolved_writer)
+            writer.write_raw_string(*unresolved_writer, consolidate(unresolved_spans, unresolved_buffers));
         if (passed_count > 0) {
-            std::vector<serialized_read_span> ordered_spans;
-            ordered_spans.reserve(demultiplexed_count.load(
-                std::memory_order_relaxed));
-            size_t total_size = 0;
-            for (auto& local : thread_spans) {
-                for (const auto& span : local) {
-                    total_size += span.length;
-                    ordered_spans.push_back(span);
-                }
+            auto output = consolidate(thread_spans, thread_buffers);
+            if (output_callback) {
+                if (!output.empty()) output_callback(output);
+            } else {
+                writer.write_raw_string(*primary_writer, std::move(output));
             }
-            std::sort(
-                ordered_spans.begin(), ordered_spans.end(),
-                [](const serialized_read_span& lhs,
-                   const serialized_read_span& rhs) {
-                    return lhs.input_index < rhs.input_index;
-                });
-
-            std::string consolidated;
-            consolidated.reserve(total_size);
-
-            for (const auto& span : ordered_spans) {
-                consolidated.append(
-                    thread_buffers[span.worker_index],
-                    span.offset,
-                    span.length);
-            }
-            writer.write_raw_string(fastqa_writer, std::move(consolidated));
         }
         if (write_debug && !debug_sigs.empty()) {
             writer.write_debug(debug_sig_writer.get(), debug_csv_writer.get(),
@@ -4290,8 +6641,9 @@ public:
     }
 
     writer.stop();
+    if (primary_writer) primary_writer->finalize();
+    if (unresolved_writer) unresolved_writer->finish();
 
-    fastqa_writer.finalize();
     if (debug_sig_writer) debug_sig_writer->finalize();
     if (debug_csv_writer) debug_csv_writer->finalize();
     if (debug_fastqa_writer) debug_fastqa_writer->finalize();
@@ -4334,13 +6686,63 @@ public:
               << "%)\n";
     RAD_COUT << "[sigalign] Output records serialized: "
               << total_records_written.load() << "\n";
+    if (hmm_info) {
+        const size_t legacy = hmm_ctr.legacy_guard + hmm_ctr.legacy_k0 + hmm_ctr.legacy_abstain +
+                              hmm_ctr.legacy_artifact + hmm_ctr.legacy_too_many;
+        RAD_COUT << "[sigalign] concat-HMM: reads=" << hmm_ctr.reads.load()
+                  << " single=" << hmm_ctr.single.load() << " split=" << hmm_ctr.split.load()
+                  << " (children=" << hmm_ctr.children.load()
+                  << ", full-search children=" << hmm_ctr.children_full_search.load() << ") existing_path=" << legacy
+                  << " [abstain=" << hmm_ctr.legacy_abstain.load() << " k0=" << hmm_ctr.legacy_k0.load()
+                  << " artifact=" << hmm_ctr.legacy_artifact.load() << " guard=" << hmm_ctr.legacy_guard.load()
+                  << " too_many=" << hmm_ctr.legacy_too_many.load() << "]"
+                  << " dropped=" << (hmm_ctr.drop_abstain.load() + hmm_ctr.drop_too_many.load() + hmm_ctr.drop_d_reads.load())
+                  << " [abstain=" << hmm_ctr.drop_abstain.load() << " too_many=" << hmm_ctr.drop_too_many.load()
+                  << " D=" << hmm_ctr.drop_d_reads.load() << " unresolved=" << hmm_ctr.drop_unresolved.load()
+                  << "] dropped_D_children=" << hmm_ctr.drop_d_children.load()
+                  << " junctions_abstained=" << hmm_ctr.junctions_abstained.load()
+                  << " trim_keep=" << hmm_ctr.trim_keep_F.load() + hmm_ctr.trim_keep_R.load()
+                  << " duplets=" << hmm_ctr.duplet_named.load()
+                  << " boundary_unresolved_saved="
+                  << (unresolved_writer ? hmm_ctr.boundary_unresolved_parents.load() : 0)
+                  << " abstain_policy=" << (layout.concat_abstain_legacy ? "legacy" : "drop") << "\n";
+        if (stream_output)
+            RAD_COUT << "[sigalign] unresolved boundaries flagged="
+                      << hmm_ctr.boundary_unresolved_parents.load() << "; raw-parent output suppressed\n";
+    }
+#ifdef RAD_STAGE_TIMERS
+    {
+        const double n = std::max<double>(1.0, static_cast<double>(rad_stage_timers::reads.load()));
+        RAD_COUT << "[stage_timers] reads=" << rad_stage_timers::reads.load()
+                  << " read_us=" << rad_stage_timers::read_ns.load() / n / 1000.0
+                  << " hmm_us=" << rad_stage_timers::hmm_ns.load() / n / 1000.0
+                  << " windowed_static_us=" << rad_stage_timers::windowed_static_ns.load() / n / 1000.0
+                  << " legacy_static_us=" << rad_stage_timers::legacy_static_ns.load() / n / 1000.0
+                  << " static_stage_us="
+                  << (rad_stage_timers::hmm_ns.load() + rad_stage_timers::windowed_static_ns.load() +
+                      rad_stage_timers::legacy_static_ns.load()) / n / 1000.0
+                  << " variable_us=" << rad_stage_timers::variable_ns.load() / n / 1000.0
+                  << " filter_us=" << rad_stage_timers::filter_ns.load() / n / 1000.0
+                  << " molecules=" << rad_stage_timers::molecules.load()
+                  << " filter_split_us(path:pass/bcfail/other n)="
+                  << rad_stage_timers::fb_ns[0][0].load() / n / 1000.0 << "/" << rad_stage_timers::fb_ns[0][1].load() / n / 1000.0 << "/"
+                  << rad_stage_timers::fb_ns[0][2].load() / n / 1000.0 << " (" << rad_stage_timers::fb_n[0][0].load() << "/"
+                  << rad_stage_timers::fb_n[0][1].load() << "/" << rad_stage_timers::fb_n[0][2].load() << ") legacy "
+                  << rad_stage_timers::fb_ns[1][0].load() / n / 1000.0 << "/" << rad_stage_timers::fb_ns[1][1].load() / n / 1000.0 << "/"
+                  << rad_stage_timers::fb_ns[1][2].load() / n / 1000.0 << " (" << rad_stage_timers::fb_n[1][0].load() << "/"
+                  << rad_stage_timers::fb_n[1][1].load() << "/" << rad_stage_timers::fb_n[1][2].load() << ")"
+                  << "\n";
+    }
+#endif
     RAD_COUT << "[sigalign] Timing breakdown:\n";
     RAD_COUT << "  - Accounted chunk runtime: " << accounted_s << " seconds\n";
     RAD_COUT << "  - Process time: " << process_s << " seconds\n";
     RAD_COUT << "  - Output staging time: " << queue_s << " seconds\n";
     RAD_COUT << "  - Overhead (writer drain/setup): " << overhead_s << " seconds\n";
 
-    if (write_debug) {
+    if (stream_output) {
+        RAD_COUT << "\n[sigalign][fastq]: stdout (uncompressed)\n";
+    } else if (write_debug) {
         RAD_COUT << "\n[sigalign] Output written to:\n"
                   << "[sigalign] [sigstring]: " << output_prefix << ".sig\n"
                   << "[sigalign]       [csv]: " << output_prefix << ".csv\n"
@@ -4350,8 +6752,11 @@ public:
         RAD_COUT << "\n[sigalign] Output written to:\n"
                   << "[sigalign][fastq]: " << fastq_output_path << (compress_fastq ? ".gz" : "") << "\n";
     }
+    if (unresolved_writer)
+        RAD_COUT << "[sigalign][unresolved boundaries]: " << unresolved_path << ".gz ("
+                  << hmm_ctr.boundary_unresolved_parents.load() << " raw parent copies; unresolved intervals unassigned)\n";
 
-    return sigalign_run_stats{
+    sigalign_run_stats run_stats{
         total_reads.load(),
         total_passed.load(),
         total_demultiplexed.load(),
@@ -4362,6 +6767,65 @@ public:
         queue_s,
         overhead_s
     };
+    if (hmm_info) {
+        run_stats.concat_hmm_enabled = true;
+        run_stats.hmm_reads = hmm_ctr.reads;
+        run_stats.hmm_single = hmm_ctr.single;
+        run_stats.hmm_split = hmm_ctr.split;
+        run_stats.hmm_children = hmm_ctr.children;
+        run_stats.hmm_children_full_search = hmm_ctr.children_full_search;
+        run_stats.hmm_same_molecule = hmm_ctr.same_molecule;
+        run_stats.hmm_legacy_guard = hmm_ctr.legacy_guard;
+        run_stats.hmm_legacy_k0 = hmm_ctr.legacy_k0;
+        run_stats.hmm_legacy_abstain = hmm_ctr.legacy_abstain;
+        run_stats.hmm_legacy_artifact = hmm_ctr.legacy_artifact;
+        run_stats.hmm_legacy_too_many = hmm_ctr.legacy_too_many;
+        run_stats.hmm_full_as_missing = hmm_ctr.full_as_missing;
+        run_stats.hmm_spacer_retry = hmm_ctr.spacer_retry;
+        run_stats.hmm_spacer_retry_ok = hmm_ctr.spacer_retry_ok;
+        run_stats.hmm_read_end_ok = hmm_ctr.read_end_ok;
+        run_stats.hmm_fragment_ok = hmm_ctr.fragment_ok;
+        run_stats.hmm_abstain_legacy = layout.concat_abstain_legacy;
+        run_stats.hmm_drop_abstain = hmm_ctr.drop_abstain;
+        run_stats.hmm_drop_too_many = hmm_ctr.drop_too_many;
+        run_stats.hmm_drop_d_reads = hmm_ctr.drop_d_reads;
+        run_stats.hmm_drop_d_children = hmm_ctr.drop_d_children;
+        run_stats.hmm_d_kept_left = hmm_ctr.d_kept_left;
+        run_stats.hmm_d_kept_right = hmm_ctr.d_kept_right;
+        run_stats.hmm_d_split = hmm_ctr.d_split;
+        run_stats.hmm_fold_read_start = hmm_ctr.fold_read_start;
+        run_stats.hmm_fold_read_end = hmm_ctr.fold_read_end;
+        run_stats.hmm_partner_rejected = hmm_ctr.partner_rejected;
+        run_stats.hmm_retry_from_partner = hmm_ctr.retry_from_partner;
+        run_stats.hmm_art_reads = hmm_ctr.art_reads;
+        run_stats.hmm_pieces = hmm_ctr.pieces;
+        run_stats.hmm_trim_keep_F = hmm_ctr.trim_keep_F;
+        run_stats.hmm_trim_keep_R = hmm_ctr.trim_keep_R;
+        run_stats.hmm_both_pass_dropped = hmm_ctr.both_pass_dropped;
+        run_stats.hmm_clip_hits = hmm_ctr.clip_hits;
+        run_stats.hmm_two_unit_clip_dropped = hmm_ctr.two_unit_clip_dropped;
+        run_stats.hmm_duplet_named = hmm_ctr.duplet_named;
+        run_stats.hmm_junctions_abstained = hmm_ctr.junctions_abstained;
+        run_stats.hmm_pieces_suppressed = hmm_ctr.pieces_suppressed;
+        run_stats.hmm_drop_unresolved = hmm_ctr.drop_unresolved;
+        run_stats.hmm_boundary_unresolved_parents = hmm_ctr.boundary_unresolved_parents;
+        run_stats.hmm_boundary_unresolved_children = hmm_ctr.boundary_unresolved_children;
+        for (int kd = 0; kd < 6; ++kd) run_stats.hmm_cut_kind[kd] = hmm_ctr.cut_kind[kd];
+        for (int s = 0; s < 4; ++s) {
+            run_stats.hmm_win[s] = hmm_ctr.win[s];
+            run_stats.hmm_win_ok[s] = hmm_ctr.win_ok[s];
+        }
+    }
+    run_stats.bc_pos_moved = barcode_position_stats::moved;
+    run_stats.bc_pos_moved_forward = barcode_position_stats::moved_forward;
+    run_stats.bc_pos_moved_reverse = barcode_position_stats::moved_reverse;
+    run_stats.bc_pos_in_place = barcode_position_stats::in_place;
+    run_stats.bc_pos_window = barcode_position_stats::window;
+    run_stats.bc_pos_unknown = barcode_position_stats::unknown;
+    run_stats.bc_pos_tie = barcode_position_stats::tie;
+    run_stats.bc_pos_clipped = barcode_position_stats::clipped;
+    run_stats.bc_pos_out_of_read = barcode_position_stats::out_of_read;
+    return run_stats;
 }
 
 /**
@@ -4402,6 +6866,8 @@ public:
                     });
             
             bool first_elem = true;
+            // --concat-hmm piece: print in parent coordinates (debug output only)
+            const bool parent_frame = hmm_parent_off >= 0;
             for (const auto& elem_ref : sorted_elements) {
                 const auto& elem = elem_ref.get();
 
@@ -4412,20 +6878,30 @@ public:
                     continue; // Skip elements with invalid positions
                 }
                 first_elem = false;
+                if (parent_frame && (elem.global_class == "start" || elem.global_class == "stop")) {
+                    const bool at_start = elem.global_class == "start";
+                    const int p = at_start ? hmm_parent_off : hmm_parent_end;
+                    ss << (elem.direction == "reverse" ? "rc_" : "") << (at_start ? "seg_start" : "seg_stop") << ":0:" << p << ":" << p;
+                    continue;
+                }
+                const int shift = parent_frame ? hmm_parent_off : 0;
                 ss << elem.class_id << ":"
                 << (elem.edit_distance ? std::to_string(elem.edit_distance.value()) : "0") << ":"
-                << elem.position.first << ":"
-                << elem.position.second;
+                << elem.position.first + shift << ":"
+                << elem.position.second + shift;
             }
             // Append final tag: direction abbreviated as F or R
             std::string dir = (direction == "forward") ? "F" : "R";
-            std::string concat = read_type == "concatenate" ? ":C" : "";
+            std::string concat = (from_concatemer || read_type == "concatenate") ? ":C" : "";
             std::string combined_info = "";
             if (read_type == "filtered") {
                 combined_info += ":filtered";
             }
             if (additional_info.length() > 2) {
                 combined_info += ":" + additional_info;
+            }
+            if (!hmm_note.empty()) {
+                combined_info += ":HMM=" + hmm_note;
             }
             ss << "<" << sequence_length << ":" << sequence_id << ":" << dir << concat <<  combined_info << ">";
         }
@@ -4565,7 +7041,7 @@ public:
             }
             
             bool is_fastq = !read_qual.empty();
-            bool is_concatenate = (read_type == "concatenate");
+            bool is_concatenate = from_concatemer || (read_type == "concatenate");
             bool is_forward = (dir == "forward");
             
             // Append directly to buffer - no intermediate string
@@ -4591,6 +7067,10 @@ public:
                 buffer += umi;
             }
             
+            if (!hmm_boundary_note.empty()) {
+                buffer += "\tHB:Z:";
+                buffer += hmm_boundary_note;
+            }
             buffer += (is_forward ? "\tTS:A:+\n" : "\tTS:A:-\n");
             buffer += read_seq;
             buffer += '\n';
@@ -4721,7 +7201,7 @@ public:
                 }
             }
             bool is_fastq = !read_qual.empty();
-            bool is_concatenate = (read_type == "concatenate");
+            bool is_concatenate = from_concatemer || (read_type == "concatenate");
             bool is_forward = (dir == "forward");
             std::stringstream ss;
             //generating modified sequence id
@@ -4738,6 +7218,7 @@ public:
             }
             //adding transcript tag for SAM
             if (!umi.empty()) ss << "\tUB:Z:" << umi;
+            if (!hmm_boundary_note.empty()) ss << "\tHB:Z:" << hmm_boundary_note;
             if(is_forward){
                 ss << "\tTS:A:+";
             } else {
@@ -4783,7 +7264,7 @@ public:
                 // If the overall read type is "reverse", skip forward elements.
                 if (read_type == "reverse" && read_mintype != "reverse")
                     continue;
-                if(read_type == "concatenate"){
+                if(from_concatemer || read_type == "concatenate"){
                     read_mintype = read_mintype + "_concatenate";
                 }
                 // If read_type is "concatenate", include both.

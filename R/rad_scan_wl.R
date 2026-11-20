@@ -148,10 +148,9 @@
     stop("batch_csv output prefixes must be unique", call. = FALSE)
   }
 
-  suffixes <- c(".csv", ".txt", "_scan_wl.log")
-  if (split_mode) {
-    suffixes <- c(suffixes, "_valid_pairs.csv", "_spat_mask.csv")
-  }
+  suffixes <- c(".csv", ".txt", "_scan_wl.log", "_coordinates.tsv.gz",
+                "_regions.tsv", "_rad.csv", "_rad.txt",
+                "_valid_pairs.csv", "_spat_mask.csv")
   artifacts <- unlist(lapply(
     output_prefix,
     function(prefix) paste0(prefix, suffixes)
@@ -248,7 +247,8 @@
          call. = FALSE)
   }
   if (!is.character(config$input) || length(config$input) != 1L ||
-      is.na(config$input) || !nzchar(config$input) ||
+      is.na(config$input) ||
+      (!nzchar(config$input) && is.null(config$spatial_slide)) ||
       !is.character(config$output_prefix) ||
       length(config$output_prefix) != 1L || is.na(config$output_prefix) ||
       !nzchar(config$output_prefix) ||
@@ -287,7 +287,8 @@
          call. = FALSE)
   }
   if (!is.character(native$input) || length(native$input) != 1L ||
-      is.na(native$input) || !nzchar(native$input) ||
+      is.na(native$input) ||
+      (!nzchar(native$input) && is.null(native$config$spatial_slide)) ||
       !is.character(native$output_prefix) ||
       length(native$output_prefix) != 1L || is.na(native$output_prefix) ||
       !nzchar(native$output_prefix)) {
@@ -363,15 +364,18 @@
 #'
 #' @param input Input FASTQ, FASTA, or gzip-compressed FASTQ/FASTA path. With
 #'   `rescan = TRUE`, a CSV, TSV, or whitespace-delimited barcode/count table
-#'   instead. Supply exactly one of `input` and `batch_csv`.
+#'   instead. Supply exactly one of `input` and `batch_csv`, or omit both
+#'   to export a slide coordinate catalog.
 #' @param output_prefix Prefix for generated files. The default is `"barcodes"`
 #'   for sequence scans and `<input>_rescan` for statistical rescans.
 #' @param batch_csv Optional two-column CSV containing an input FASTQ/FASTA
 #'   path and output prefix per row. A conventional header is accepted. Every
 #'   row is validated before the first native scan begins.
 #' @param adapter_seq Adapter or primer immediately upstream of the barcode.
-#'   Required for sequence scans and unused for statistical rescans.
-#' @param barcode_length Number of barcode bases to extract, from 1 to 32.
+#'   Required for sequence scans and unused for statistical rescans. Slide scans
+#'   provide defaults for Visium, Visium HD, and Curio Seeker.
+#' @param barcode_length Number of barcode bases to extract, from 1 through 64.
+#'   In masked mode, an omitted length is inferred from uppercase N positions.
 #' @param left_margin,right_margin Non-negative RAD extraction offsets. For a
 #'   forward adapter, `left_margin` skips bases before extraction and
 #'   `right_margin` extends its end; reverse matches use the corresponding
@@ -390,15 +394,35 @@
 #'   no sequence records are scanned.
 #' @param bc1_whitelist,bc2_whitelist Optional built-in keys or files for a
 #'   two-part barcode scan. Supply both or neither. Two-part mode is an
-#'   alternative to `whitelist` and is unavailable for rescans.
+#'   alternative to `whitelist`. HD slide rescans can use these catalogs to
+#'   translate native spot IDs; other rescans do not use them.
 #' @param bc1_length,bc2_length Optional packed-whitelist barcode lengths,
-#'   each from 1 through 32. They are needed for custom numeric bit-lists,
+#'   each from 1 through 64. They are needed for custom numeric bit-lists,
 #'   which do not encode sequence length; bundled SPLiT-seq keys infer 8.
 #' @param umi_length Non-negative UMI length between the adapter and BC1 in
 #'   two-part mode.
 #' @param offset_min,offset_max Inclusive BC1 search-offset range. The minimum
 #'   must not exceed the maximum.
 #' @param verbose Print the native progress captured during each completed run.
+#' @param capture_mode With `after_adapter` (default), N retains its legacy
+#'   wildcard meaning and the barcode follows the adapter. With `masked`,
+#'   uppercase N positions are concatenated into the barcode and lowercase n
+#'   matches a base without capturing it. Margins must be zero. Split scans use
+#'   lowercase n only because component catalogs define their barcodes.
+#' @param spatial Use the spatial low-count abundance profile. This also works
+#'   with batch input and statistical rescans without coordinate data.
+#' @param spatial_slide Slide map path or registered slide ID. Supply
+#'   `spatial_platform` as well. Omit input to export the coordinate catalog.
+#' @param spatial_platform One of `visium`, `visium-hd`, `curio-seeker`,
+#'   `curio-trekker`, or `stereo-seq`.
+#' @param slide_map Explicit sequence-to-coordinate CSV/TSV map, optionally gzip.
+#' @param slide_dir Registry directory containing `<platform>/<slide>.tsv.gz`
+#'   (or .csv.gz, .tsv, .csv). Defaults to RAD_SLIDE_DIR or packaged resources.
+#' @param bc1_axis,bc2_axis Alternative Visium HD axis tables with barcode and
+#'   array_col or array_row columns, expressed in native 2-micrometre indices.
+#' @param spatial_selection `abundance` applies the low-count abundance caller
+#'   before slide membership and HD occupancy filtering. `legacy` preserves
+#'   upstream's historical slide route, including occupancy-only HD selection.
 #' @return A `rad_scan_wl_result` containing provenance, the effective native
 #'   configuration (including inferred split-barcode lengths), artifact paths,
 #'   scan statistics, and captured log output. Batch mode
@@ -427,10 +451,51 @@ rad_scan_wl <- function(input = NULL,
                         umi_length = 9L,
                         offset_min = 0L,
                         offset_max = 3L,
-                        verbose = FALSE) {
+                        verbose = FALSE,
+                        capture_mode = c("after_adapter", "masked"),
+                        spatial = FALSE,
+                        spatial_slide = NULL,
+                        spatial_platform = NULL,
+                        slide_map = NULL,
+                        slide_dir = NULL,
+                        bc1_axis = NULL,
+                        bc2_axis = NULL,
+                        spatial_selection = c("abundance", "legacy")) {
+  barcode_length_explicit <- !missing(barcode_length)
+  capture_mode <- match.arg(capture_mode)
+  spatial_selection <- match.arg(spatial_selection)
+  spatial <- .rad_scalar_logical(spatial, "spatial")
+  slide_mode <- !is.null(spatial_slide)
+  if (slide_mode) {
+    spatial_slide <- .rad_scalar_character(spatial_slide, "spatial_slide")
+    if (file.exists(spatial_slide)) {
+      spatial_slide <- .rad_existing_file(spatial_slide, "spatial_slide")
+    }
+    if (is.null(spatial_platform)) stop("spatial_slide requires spatial_platform", call. = FALSE)
+    spatial_platform <- match.arg(spatial_platform, c(
+      "visium", "visium-hd", "curio-seeker", "curio-trekker", "stereo-seq"
+    ))
+    if (is.null(spatial_platform)) {
+      stop("spatial_slide requires spatial_platform", call. = FALSE)
+    }
+    spatial <- TRUE
+    if (!is.null(batch_csv)) stop("slide scans do not support batch_csv", call. = FALSE)
+    if (!is.null(whitelist)) stop("slide scans use the slide catalog instead of whitelist", call. = FALSE)
+  } else if (any(!vapply(list(spatial_platform, slide_map, slide_dir, bc1_axis, bc2_axis), is.null, logical(1))) ||
+             spatial_selection == "legacy") {
+    stop("spatial coordinate options require spatial_slide", call. = FALSE)
+  }
+  if (!is.null(slide_map)) slide_map <- .rad_existing_file(slide_map, "slide_map")
+  if (!is.null(bc1_axis)) bc1_axis <- .rad_existing_file(bc1_axis, "bc1_axis")
+  if (!is.null(bc2_axis)) bc2_axis <- .rad_existing_file(bc2_axis, "bc2_axis")
+  if (!is.null(slide_dir)) {
+    slide_dir <- .rad_scalar_character(slide_dir, "slide_dir")
+    if (!dir.exists(slide_dir)) stop("slide_dir must identify an existing directory", call. = FALSE)
+    slide_dir <- normalizePath(slide_dir, mustWork = TRUE)
+  }
   using_input <- !is.null(input)
   using_batch <- !is.null(batch_csv)
-  if (using_input == using_batch) {
+  if ((using_input && using_batch) || (!using_input && !using_batch && !slide_mode)) {
     stop("supply exactly one of input and batch_csv", call. = FALSE)
   }
 
@@ -443,14 +508,14 @@ rad_scan_wl <- function(input = NULL,
   if (!is.null(adapter_seq)) {
     adapter_seq <- .rad_scalar_character(adapter_seq, "adapter_seq")
   }
-  if (!rescan && is.null(adapter_seq)) {
+  if (!rescan && !slide_mode && is.null(adapter_seq)) {
     stop("adapter_seq is required for sequence scans", call. = FALSE)
   }
   barcode_length <- .rad_scalar_integer(
     barcode_length, "barcode_length", minimum = 1L
   )
-  if (barcode_length > 32L) {
-    stop("barcode_length must be between 1 and 32", call. = FALSE)
+  if (barcode_length > 64L) {
+    stop("barcode_length must be between 1 and 64", call. = FALSE)
   }
   left_margin <- .rad_scalar_integer(
     left_margin, "left_margin", minimum = 0L
@@ -475,6 +540,10 @@ rad_scan_wl <- function(input = NULL,
   selection <- match.arg(
     tolower(selection), c("high_specificity", "above_floor")
   )
+  if (identical(spatial_platform, "visium-hd") && spatial_selection == "legacy" &&
+      selection == "above_floor") {
+    stop("legacy Visium HD uses occupancy selection; above_floor does not apply", call. = FALSE)
+  }
   bc1_whitelist <- .rad_scan_whitelist_reference(
     bc1_whitelist, "bc1_whitelist"
   )
@@ -490,7 +559,7 @@ rad_scan_wl <- function(input = NULL,
     stop("whitelist and two-part barcode whitelists are alternatives",
          call. = FALSE)
   }
-  if (rescan && split_mode) {
+  if (rescan && split_mode && !slide_mode) {
     stop("rescan does not support two-part barcode whitelists",
          call. = FALSE)
   }
@@ -504,11 +573,11 @@ rad_scan_wl <- function(input = NULL,
   bc2_length <- .rad_scalar_integer(
     bc2_length, "bc2_length", minimum = 1L, allow_null = TRUE
   )
-  if (!is.null(bc1_length) && bc1_length > 32L) {
-    stop("bc1_length must be between 1 and 32", call. = FALSE)
+  if (!is.null(bc1_length) && bc1_length > 64L) {
+    stop("bc1_length must be between 1 and 64", call. = FALSE)
   }
-  if (!is.null(bc2_length) && bc2_length > 32L) {
-    stop("bc2_length must be between 1 and 32", call. = FALSE)
+  if (!is.null(bc2_length) && bc2_length > 64L) {
+    stop("bc2_length must be between 1 and 64", call. = FALSE)
   }
   if (!split_mode && (!is.null(bc1_length) || !is.null(bc2_length))) {
     stop("bc1_length and bc2_length require two-part barcode whitelists",
@@ -527,14 +596,27 @@ rad_scan_wl <- function(input = NULL,
     stop("offset_min must not exceed offset_max", call. = FALSE)
   }
 
-  if (using_input) {
-    input <- if (rescan) {
+  if (capture_mode == "masked" && !rescan && !is.null(adapter_seq)) {
+    captured <- nchar(gsub("[^N]", "", adapter_seq))
+    is_split <- split_mode || identical(spatial_platform, "visium-hd")
+    if (is_split && captured > 0L) stop("split masked patterns use lowercase n; uppercase N capture is not supported", call. = FALSE)
+    if (!is_split && (captured < 1L || captured > 64L)) stop("masked capture requires 1 to 64 uppercase N positions", call. = FALSE)
+    if (left_margin != 0L || right_margin != 0L) stop("masked capture does not use margins", call. = FALSE)
+    if (!is_split) {
+      if (barcode_length_explicit && barcode_length != captured) stop("barcode_length disagrees with masked capture length", call. = FALSE)
+      barcode_length <- as.integer(captured)
+    }
+  }
+  if (!using_input && !using_batch && rescan) stop("rescan requires input", call. = FALSE)
+
+  if (!using_batch) {
+    if (using_input) input <- if (rescan) {
       .rad_existing_file(input, "input")
     } else {
       .rad_scan_sequence_file(input, "input")
     }
     if (is.null(output_prefix)) {
-      output_prefix <- if (rescan) {
+      output_prefix <- if (rescan && using_input) {
         .rad_scan_default_rescan_prefix(input)
       } else {
         "barcodes"
@@ -552,7 +634,8 @@ rad_scan_wl <- function(input = NULL,
     batch <- .rad_scan_parse_batch(
       batch_csv,
       split_mode = split_mode,
-      protected_paths = c(whitelist, bc1_whitelist, bc2_whitelist)
+      protected_paths = c(whitelist, bc1_whitelist, bc2_whitelist,
+                          slide_map, bc1_axis, bc2_axis)
     )
   }
 
@@ -589,7 +672,17 @@ rad_scan_wl <- function(input = NULL,
       umi_length = umi_length,
       offset_min = offset_min,
       offset_max = offset_max,
-      verbose = verbose
+      verbose = verbose,
+      capture_mode = capture_mode,
+      barcode_length_explicit = barcode_length_explicit,
+      spatial = spatial,
+      spatial_slide = spatial_slide,
+      spatial_platform = spatial_platform,
+      slide_map = slide_map,
+      slide_dir = slide_dir,
+      bc1_axis = bc1_axis,
+      bc2_axis = bc2_axis,
+      spatial_selection = spatial_selection
     ))
     .rad_scan_run(native_options, core)
   }

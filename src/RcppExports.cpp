@@ -258,6 +258,19 @@ BEGIN_RCPP
 END_RCPP
 }
 
+SEXP rad_discover_cpp(Rcpp::List options);
+RcppExport SEXP _rrad_rad_discover_cpp(SEXP optionsSEXP) {
+BEGIN_RCPP
+    return rad_discover_cpp(Rcpp::List(optionsSEXP));
+END_RCPP
+}
+SEXP rad_spatial_reformat_cpp(Rcpp::List options);
+RcppExport SEXP _rrad_rad_spatial_reformat_cpp(SEXP optionsSEXP) {
+BEGIN_RCPP
+    return rad_spatial_reformat_cpp(Rcpp::List(optionsSEXP));
+END_RCPP
+}
+
 static const R_CallMethodDef CallEntries[] = {
     {"_rrad_packed_reads_build_cpp", (DL_FUNC) &_rrad_packed_reads_build_cpp, 5},
     {"_rrad_packed_id_decode_cpp", (DL_FUNC) &_rrad_packed_id_decode_cpp, 1},
@@ -282,6 +295,8 @@ static const R_CallMethodDef CallEntries[] = {
     {"_rrad_rad_scan_wl_cpp", (DL_FUNC) &_rrad_rad_scan_wl_cpp, 1},
     {"_rrad_rad_reformat_cpp", (DL_FUNC) &_rrad_rad_reformat_cpp, 1},
     {"_rrad_rad_demux_cpp", (DL_FUNC) &_rrad_rad_demux_cpp, 1},
+    {"_rrad_rad_discover_cpp", (DL_FUNC) &_rrad_rad_discover_cpp, 1},
+    {"_rrad_rad_spatial_reformat_cpp", (DL_FUNC) &_rrad_rad_spatial_reformat_cpp, 1},
     {NULL, NULL, 0}
 };
 

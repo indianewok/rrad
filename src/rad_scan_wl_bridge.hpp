@@ -27,11 +27,77 @@ struct NativeScanConfig {
     int offset_min = 0;
     int offset_max = 3;
     bool verbose = false;
+    bool masked_capture = false;
+    bool barcode_length_explicit = false;
+    bool spatial = false;
+    bool spatial_legacy = false;
+    core::rad_scan_spatial::Options spatial_options;
+
+    bool slide_mode() const { return !spatial_options.slide.empty(); }
+
 
     bool split_mode() const {
         return !bc1_whitelist.empty() && !bc2_whitelist.empty();
     }
 };
+
+// Called by the native entry point after the shared scan fields are parsed.
+void parse_scan_extensions(const Rcpp::List& options, NativeScanConfig& config) {
+    const auto capture = string_option(options, "capture_mode", "after_adapter");
+    if (capture != "after_adapter" && capture != "masked")
+        throw std::invalid_argument("`capture_mode` must be 'after_adapter' or 'masked'");
+    config.masked_capture = capture == "masked";
+    config.barcode_length_explicit = bool_option(options, "barcode_length_explicit", false);
+    config.spatial = bool_option(options, "spatial", false);
+    auto& spatial = config.spatial_options;
+    spatial.slide = string_option(options, "spatial_slide");
+    spatial.platform = string_option(options, "spatial_platform");
+    spatial.slide_map = string_option(options, "slide_map");
+    spatial.slide_dir = string_option(options, "slide_dir");
+    spatial.bc1_axis = string_option(options, "bc1_axis");
+    spatial.bc2_axis = string_option(options, "bc2_axis");
+    const auto selection = string_option(options, "spatial_selection", "abundance");
+    if (selection != "abundance" && selection != "legacy")
+        throw std::invalid_argument("`spatial_selection` must be 'abundance' or 'legacy'");
+    config.spatial_legacy = selection == "legacy";
+    if (config.slide_mode()) {
+        const std::set<std::string> platforms = {"visium", "visium-hd", "curio-seeker", "curio-trekker", "stereo-seq"};
+        if (!platforms.count(spatial.platform))
+            throw std::invalid_argument("spatial_slide requires a supported spatial_platform");
+        spatial.platform_flags = 1;
+        config.spatial = true;
+        if (!config.rescan && !config.input.empty() && config.adapter_seq.empty()) {
+            if (spatial.platform == "curio-seeker") {
+                config.adapter_seq = "NNNNNNNNTCTTCAGCGTTCCCGAGANNNNNN";
+                config.masked_capture = true;
+            } else if (spatial.platform == "visium" || spatial.platform == "visium-hd") {
+                config.adapter_seq = "CTACACGACGCTCTTCCGATCT";
+            } else throw std::invalid_argument("adapter_seq is required for this spatial platform");
+        }
+        if (!config.whitelist.empty())
+            throw std::invalid_argument("spatial slide scans use the slide catalog, not `whitelist`");
+    } else if (!spatial.platform.empty() || !spatial.slide_map.empty() || !spatial.slide_dir.empty() ||
+               !spatial.bc1_axis.empty() || !spatial.bc2_axis.empty() || config.spatial_legacy) {
+        throw std::invalid_argument("spatial coordinate options require `spatial_slide`");
+    }
+    if (config.input.empty() && (!config.slide_mode() || config.rescan))
+        throw std::invalid_argument("`input` is required except for slide coordinate export");
+    if (config.masked_capture && !config.rescan && !config.adapter_seq.empty()) {
+        const size_t length = core::scan_masked_capture_length(config.adapter_seq);
+        const bool split = config.split_mode() || spatial.platform == "visium-hd";
+        if (split && length)
+            throw std::invalid_argument("split masked patterns use lowercase n; uppercase N capture is not supported");
+        if (!split && (length == 0 || length > 64))
+            throw std::invalid_argument("masked capture requires 1 to 64 uppercase N positions");
+        if (config.left_margin || config.right_margin)
+            throw std::invalid_argument("masked capture does not use margins");
+        if (!split) {
+            if (config.barcode_length_explicit && config.barcode_length != static_cast<int>(length))
+                throw std::invalid_argument("barcode_length disagrees with masked capture length");
+            config.barcode_length = static_cast<int>(length);
+        }
+    }
+}
 
 struct NativeScanRun {
     std::string input;
@@ -41,11 +107,13 @@ struct NativeScanRun {
     std::string log;
     std::string valid_pairs;
     std::string spatial_mask;
+    std::string coordinates, regions, abundance_csv, abundance_whitelist;
     std::string mode;
     core::whitelist_scan_stats stats;
     std::uint64_t input_rows = 0;
     std::size_t bc1_whitelist_size = 0;
     std::size_t bc2_whitelist_size = 0;
+    int effective_barcode_length = 0;
     int effective_bc1_length = 0;
     int effective_bc2_length = 0;
     std::string staging_base;
@@ -65,6 +133,10 @@ std::string public_scan_log(std::string log, const NativeScanRun& run) {
     replace_all(run.staging_base + "_scan_wl.log", run.log);
     replace_all(run.staging_base + "_valid_pairs.csv", run.valid_pairs);
     replace_all(run.staging_base + "_spat_mask.csv", run.spatial_mask);
+    replace_all(run.staging_base + "_coordinates.tsv.gz", run.coordinates);
+    replace_all(run.staging_base + "_regions.tsv", run.regions);
+    replace_all(run.staging_base + "_rad.csv", run.abundance_csv);
+    replace_all(run.staging_base + "_rad.txt", run.abundance_whitelist);
     return log;
 }
 
@@ -459,6 +531,16 @@ Rcpp::List scan_config_as_list(const NativeScanConfig& config) {
     value["offset_min"] = config.offset_min;
     value["offset_max"] = config.offset_max;
     value["verbose"] = config.verbose;
+    value["capture_mode"] = config.masked_capture ? "masked" : "after_adapter";
+    value["barcode_length_explicit"] = config.barcode_length_explicit;
+    value["spatial"] = config.spatial;
+    value["spatial_slide"] = optional_string(config.spatial_options.slide);
+    value["spatial_platform"] = optional_string(config.spatial_options.platform);
+    value["slide_map"] = optional_string(config.spatial_options.slide_map);
+    value["slide_dir"] = optional_string(config.spatial_options.slide_dir);
+    value["bc1_axis"] = optional_string(config.spatial_options.bc1_axis);
+    value["bc2_axis"] = optional_string(config.spatial_options.bc2_axis);
+    value["spatial_selection"] = config.spatial_legacy ? "legacy" : "abundance";
     return value;
 }
 
@@ -503,6 +585,7 @@ Rcpp::List scan_run_as_list(const NativeScanRun& run,
     NativeScanConfig effective = config;
     effective.input = run.input;
     effective.output_prefix = run.output_prefix;
+    if (run.effective_barcode_length > 0) effective.barcode_length = run.effective_barcode_length;
     if (run.effective_bc1_length > 0) {
         effective.bc1_length = run.effective_bc1_length;
     }
@@ -519,7 +602,11 @@ Rcpp::List scan_run_as_list(const NativeScanRun& run,
             Rcpp::_["whitelist"] = run.whitelist,
             Rcpp::_["scan_log"] = run.log,
             Rcpp::_["valid_pairs"] = run.valid_pairs,
-            Rcpp::_["spatial_mask"] = run.spatial_mask),
+            Rcpp::_["spatial_mask"] = run.spatial_mask,
+            Rcpp::_["coordinates"] = run.coordinates,
+            Rcpp::_["regions"] = run.regions,
+            Rcpp::_["abundance_csv"] = run.abundance_csv,
+            Rcpp::_["abundance_whitelist"] = run.abundance_whitelist),
         Rcpp::_["stats"] = scan_stats_as_list(
             run, effective.requested_threads, effective.effective_threads));
 }
@@ -527,8 +614,8 @@ Rcpp::List scan_run_as_list(const NativeScanRun& run,
 NativeScanRun run_scan_whitelist(
     const NativeScanConfig& config,
     std::function<void()> boundary_poll = {}) {
-    const fs::path input = fs::absolute(config.input).lexically_normal();
-    if (!fs::is_regular_file(input)) {
+    const fs::path input = config.input.empty() ? fs::path() : fs::absolute(config.input).lexically_normal();
+    if ((!config.slide_mode() || !config.input.empty()) && !fs::is_regular_file(input)) {
         throw std::invalid_argument("scan input does not exist: " +
                                     input.string());
     }
@@ -556,6 +643,10 @@ NativeScanRun run_scan_whitelist(
                                          .lexically_normal();
     const fs::path final_pairs = output_prefix.string() + "_valid_pairs.csv";
     const fs::path final_mask = output_prefix.string() + "_spat_mask.csv";
+    const fs::path final_coordinates = output_prefix.string() + "_coordinates.tsv.gz";
+    const fs::path final_regions = output_prefix.string() + "_regions.tsv";
+    const fs::path final_abundance_csv = output_prefix.string() + "_rad.csv";
+    const fs::path final_abundance_txt = output_prefix.string() + "_rad.txt";
     const fs::path commit_lock =
         output_prefix.parent_path() /
         ("." + output_prefix.filename().string() + ".rrad-commit.lock");
@@ -568,7 +659,14 @@ NativeScanRun run_scan_whitelist(
             "whitelist scan log cannot replace its publication lock");
     }
 
-    std::vector<NamedPath> inputs{{"scan input", input}};
+    std::vector<NamedPath> inputs;
+    if (!input.empty()) inputs.emplace_back("scan input", input);
+    for (const auto& path : {config.spatial_options.slide_map, config.spatial_options.bc1_axis, config.spatial_options.bc2_axis})
+        if (!path.empty()) inputs.emplace_back("spatial coordinate input", fs::path(path));
+    if (config.slide_mode() && config.spatial_options.bc1_axis.empty()) {
+        try { inputs.emplace_back("slide map", fs::path(core::rad_scan_spatial::resolve(config.spatial_options))); }
+        catch (const std::exception&) { if (config.spatial_options.platform != "visium-hd") throw; }
+    }
     if (!config.whitelist.empty()) {
         inputs.emplace_back(
             "reference whitelist",
@@ -589,12 +687,14 @@ NativeScanRun run_scan_whitelist(
         {"selected whitelist", final_txt},
         {"scan log", final_log},
         {"valid barcode pairs", final_pairs},
-        {"spatial mask", final_mask}};
+        {"spatial mask", final_mask},
+        {"slide coordinates", final_coordinates}, {"HD regions", final_regions},
+        {"abundance statistics", final_abundance_csv}, {"abundance whitelist", final_abundance_txt}};
     reject_input_output_collisions(inputs, outputs);
     reject_input_output_collisions(
         inputs, {{"scan publication lock", commit_lock}});
     std::vector<fs::path> final_targets{
-        final_csv, final_txt, final_log, final_pairs, final_mask};
+        final_csv, final_txt, final_log, final_pairs, final_mask, final_coordinates, final_regions, final_abundance_csv, final_abundance_txt};
     preflight_scan_outputs(final_targets);
 
     ScanStagingDirectory staging(output_prefix);
@@ -612,7 +712,31 @@ NativeScanRun run_scan_whitelist(
     run.staging_base = stage_base;
     const auto started = std::chrono::steady_clock::now();
 
-    if (config.rescan) {
+    if (config.slide_mode()) {
+        run.mode = input.empty() ? "spatial_export" : "spatial";
+        auto spatial_options = config.spatial_options;
+        spatial_options.enabled = true;
+        spatial_options.slide_filter = !config.spatial_legacy;
+        spatial_options.masked_capture = config.masked_capture;
+        spatial_options.bc1_length = config.bc1_length;
+        spatial_options.bc2_length = config.bc2_length;
+        spatial_options.boundary_poll = boundary_poll;
+        core::rad_scan_spatial::run(spatial_options, input.string(), stage_base,
+            config.adapter_seq, config.barcode_length, config.barcode_length_explicit,
+            config.rescan, config.left_margin, config.right_margin, config.max_reads,
+            config.max_error, config.chunk_size, config.effective_threads,
+            config.umi_length, config.offset_min, config.offset_max,
+            config.bc1_whitelist, config.bc2_whitelist,
+            config.selection == core::scan_whitelist_selection::above_floor,
+            false, config.verbose, &run.stats, &run.input_rows, &run.effective_barcode_length);
+        if (input.empty()) {
+            std::ofstream log(stage_log);
+            log << "RAD slide coordinate export\nspatial_platform=" << spatial_options.platform
+                << "\nslide=" << spatial_options.slide << '\n';
+            log.close();
+            if (!log) throw std::runtime_error("could not write coordinate export log");
+        }
+    } else if (config.rescan) {
         run.mode = "rescan";
         const core::scan_wl_rescan_input retained =
             core::read_scan_wl_rescan_counts(input.string(), boundary_poll);
@@ -621,7 +745,7 @@ NativeScanRun run_scan_whitelist(
         if (!core::count_perfect_matches_with_stats(
                 retained.counts, no_filter, stage_csv.string(),
                 stage_txt.string(), config.verbose, config.selection,
-                &run.stats, boundary_poll)) {
+                &run.stats, boundary_poll, config.spatial)) {
             throw std::runtime_error("whitelist rescan failed");
         }
     } else if (config.split_mode()) {
@@ -684,7 +808,7 @@ NativeScanRun run_scan_whitelist(
                 bc1.seqs, bc1.lengths, bc2.seqs, bc2.lengths,
                 config.offset_min, config.offset_max, config.max_reads,
                 config.max_error, config.chunk_size,
-                config.effective_threads, boundary_poll);
+                config.effective_threads, boundary_poll, config.masked_capture);
         if (!core::write_split_pair_counts(barcodes,
                                            stage_pairs.string())) {
             throw std::runtime_error("could not write valid barcode pairs");
@@ -697,7 +821,7 @@ NativeScanRun run_scan_whitelist(
         if (!core::count_perfect_matches_with_stats(
                 barcodes, no_filter, stage_csv.string(), stage_txt.string(),
                 config.verbose, config.selection, &run.stats,
-                boundary_poll)) {
+                boundary_poll, config.spatial)) {
             throw std::runtime_error("two-part whitelist selection failed");
         }
     } else {
@@ -717,14 +841,14 @@ NativeScanRun run_scan_whitelist(
             input.string(), config.adapter_seq, config.barcode_length,
             config.left_margin, config.right_margin, config.max_reads,
             config.max_error, config.chunk_size, config.effective_threads,
-            filter.empty() ? nullptr : &filter, boundary_poll);
+            filter.empty() ? nullptr : &filter, boundary_poll, config.masked_capture);
         if (!barcodes.succeeded) {
             throw std::runtime_error("whitelist scan could not read the input");
         }
         if (!core::count_perfect_matches_with_stats(
                 barcodes, filter.long_barcodes, stage_csv.string(),
                 stage_txt.string(), config.verbose, config.selection,
-                &run.stats, boundary_poll)) {
+                &run.stats, boundary_poll, config.spatial)) {
             throw std::runtime_error("whitelist selection failed");
         }
     }
@@ -732,35 +856,52 @@ NativeScanRun run_scan_whitelist(
     const double wall_seconds = std::chrono::duration<double>(
                                     std::chrono::steady_clock::now() - started)
                                     .count();
-    if (!core::write_whitelist_scan_log(stage_log.string(), input.string(),
+    if (!config.slide_mode() && !core::write_whitelist_scan_log(stage_log.string(), input.string(),
                                         run.stats, wall_seconds)) {
         throw std::runtime_error("could not write whitelist scan summary");
     }
 
-    require_scan_output(stage_csv, "whitelist statistics");
-    require_scan_output(stage_txt, "selected whitelist");
+    if (!input.empty()) {
+        require_scan_output(stage_csv, "whitelist statistics");
+        require_scan_output(stage_txt, "selected whitelist");
+    }
     require_scan_output(stage_log, "whitelist scan log");
-    if (config.split_mode()) {
+    if (config.split_mode() && !config.slide_mode()) {
         require_scan_output(stage_pairs, "valid barcode pair table");
         require_scan_output(stage_mask, "spatial mask");
     }
 
-    const bool split = config.split_mode();
+    const bool split = config.split_mode() && !config.slide_mode();
+    const bool slide = config.slide_mode();
+    const bool hd = config.spatial_options.platform == "visium-hd";
+    const bool abundance = slide && !input.empty() && (!hd || !config.spatial_legacy);
+    if (slide) require_scan_output(stage_base + "_coordinates.tsv.gz", "slide coordinates");
+    if (slide && hd && !input.empty()) require_scan_output(stage_base + "_regions.tsv", "HD regions");
+    if (abundance) {
+        require_scan_output(stage_base + "_rad.csv", "abundance statistics");
+        require_scan_output(stage_base + "_rad.txt", "abundance whitelist");
+    }
     std::vector<ScanCommitItem> commits{
-        {stage_csv, final_csv, true},
-        {stage_txt, final_txt, true},
+        {stage_csv, final_csv, !input.empty()},
+        {stage_txt, final_txt, !input.empty()},
         {stage_log, final_log, true},
         {stage_pairs, final_pairs, split},
-        {stage_mask, final_mask, split}};
+        {stage_mask, final_mask, split},
+        {stage_base + "_coordinates.tsv.gz", final_coordinates, slide},
+        {stage_base + "_regions.tsv", final_regions, slide && hd && !input.empty()},
+        {stage_base + "_rad.csv", final_abundance_csv, abundance},
+        {stage_base + "_rad.txt", final_abundance_txt, abundance}};
     commit_scan_outputs(commits, staging.path().filename().string(),
                         commit_lock);
 
-    run.csv = final_csv.string();
-    run.whitelist = final_txt.string();
+    if (!input.empty()) { run.csv = final_csv.string(); run.whitelist = final_txt.string(); }
     run.log = final_log.string();
-    if (config.split_mode()) {
+    if (split) {
         run.valid_pairs = final_pairs.string();
         run.spatial_mask = final_mask.string();
     }
+    if (slide) run.coordinates = final_coordinates.string();
+    if (slide && hd && !input.empty()) run.regions = final_regions.string();
+    if (abundance) { run.abundance_csv = final_abundance_csv.string(); run.abundance_whitelist = final_abundance_txt.string(); }
     return run;
 }

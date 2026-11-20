@@ -1,6 +1,48 @@
 #pragma once
 #include "rad_headers.h"
 
+// Adapter edit-distance limits and the misalignment calibration sample.
+namespace adapter_thresholds {
+
+constexpr std::size_t fallback_error_num = 3;
+constexpr std::size_t fallback_error_denom = 10;
+
+/**
+ * Return the shared fallback edit-distance limit for an uncalibrated adapter.
+ *
+ * Keep this integer-only so layout preparation and read processing cannot
+ * drift because of different rounding rules or duplicated constants.
+ */
+constexpr int fallback_max_edit_distance(std::size_t adapter_length) {
+    const auto rounded_up =
+        (adapter_length * fallback_error_num +
+         fallback_error_denom - 1) /
+        fallback_error_denom;
+    return std::max(1, static_cast<int>(rounded_up));
+}
+
+static_assert(fallback_max_edit_distance(22) == 7,
+              "22 nt adapters must allow seven fallback edits");
+static_assert(fallback_max_edit_distance(23) == 7,
+              "23 nt adapters must allow seven fallback edits");
+
+// misalign_lower = largest edit distance with at most this share of the
+// element's chance hits (the null) at or below it.
+constexpr double misalign_lower_chance_share = 0.05;
+
+// Chance hits an element needs for a calibrated threshold; below this,
+// update_read_layout uses fallback_max_edit_distance.
+constexpr std::size_t min_misal_obs = 100;
+
+// Misalignment calibration sample: the first block (rad prep: -n), then
+// further blocks until every element has min_misal_obs chance
+// hits, up to cal_max_reads. Whole blocks keep the sample independent
+// of the thread count.
+constexpr std::size_t cal_block_reads = 50000;
+constexpr std::size_t cal_max_reads = 1000000;
+
+}  // namespace adapter_thresholds
+
 /**
  * @brief Represents a position in the ReadLayout. Each string from position strings is processed in this manner.
  * @param ref_id Reference element ID this position is based on
@@ -253,6 +295,12 @@ public:
     std::string sequencing_type;
     std::unordered_map<std::string, ReferencePositions> position_map;
 
+    // --concat-hmm: calibrated hmm_* parameters and the shared read-only model.
+    concat_hmm::Params concat_params;
+    std::shared_ptr<const concat_hmm::Model> concat_model;
+    // --concat-hmm-abstain=legacy: abstained reads take the default path instead of being dropped.
+    bool concat_abstain_legacy = false;
+
     //A bunch of access-based methods for the multi-index container
     auto& by_id() { return layout.get<id_tag>(); }
     auto& by_length() { return layout.get<length_tag>(); }
@@ -270,6 +318,58 @@ public:
     const auto& by_direction() const { return layout.get<direction_tag>(); }
     const auto& by_global_class() const { return layout.get<global_class_tag>(); }
     const auto& by_dir_order() const { return layout.get<dir_order_tag>(); }
+
+    // ReadLayout -> concat_hmm::layout_spec.
+    concat_hmm::layout_spec to_concat_layout_spec() const {
+        concat_hmm::layout_spec spec;
+        spec.name = "rad_read_layout";
+        spec.mode = sequencing_type;
+        spec.bulk = (sequencing_type == "bulk");
+        for (const auto& e : by_order()) {
+            concat_hmm::layout_element x;
+            x.id = e.class_id;
+            x.seq = e.seq;
+            x.is_static = (e.type == "static");
+            x.klass = e.global_class.empty() ? e.class_id : e.global_class;
+            if (x.klass == "poly_t" || x.klass == "poly_a") x.klass = "poly_tail";
+            x.direction = (e.direction.rfind("reverse", 0) == 0) ? 'R' : 'F';
+            x.order = e.order;
+            x.length_candidates = e.length_candidates;
+            if (x.length_candidates.empty() && e.expected_length && *e.expected_length > 0)
+                x.length_candidates = {*e.expected_length};
+            if (e.misalignment_threshold) x.max_edits = std::get<0>(*e.misalignment_threshold);
+            spec.elements.push_back(std::move(x));
+        }
+        return spec;
+    }
+
+    // On failure the model stays unset and every read takes the default path.
+    bool build_concat_model(bool verbose) {
+        try {
+            const concat_hmm::layout_spec spec = to_concat_layout_spec();
+            const concat_hmm::Params* p = concat_params.empty() ? nullptr : &concat_params;
+            auto model = std::make_shared<concat_hmm::Model>(concat_hmm::Model::build(spec, p));
+            RAD_COUT << "[concat_hmm] Model built: " << model->tpl.size() << " templates, "
+                      << model->A << " anchors, params="
+                      << (p ? "position-map hmm_* columns" : "layout priors")
+                      << (!model->param_warnings.empty()
+                              ? " (invalid hmm_* cells: every read uses the existing path; remove the hmm_* columns to recalibrate)"
+                              : model->guard_failed ? " (calibration guard FAILED: every read uses the existing path)" : "")
+                      << "\n";
+            for (const auto& w : model->param_warnings) RAD_CERR << "[concat_hmm] WARNING: " << w << "\n";
+            if (p && concat_params.topology != 0 && concat_params.topology != model->topo_hash)
+                RAD_COUT << "[concat_hmm] WARNING: hmm_* columns were calibrated on a different layout topology; "
+                             "structural tables fall back to priors\n";
+            if (verbose) RAD_COUT << model->describe();
+            concat_model = std::move(model);
+            return true;
+        } catch (const concat_hmm::layout_spec_error& ex) {
+            RAD_CERR << "[concat_hmm] WARNING: cannot build the HMM for this layout (" << ex.what()
+                      << "); --concat-hmm disabled, every read uses the existing path\n";
+            concat_model.reset();
+            return false;
+        }
+    }
 
     static std::optional<std::string> get_optional_csv_string(const csv::CSVRow& row, const std::string& field) {
         try {
@@ -1152,10 +1252,24 @@ public:
         if(which_file == "pos_map" || which_file == "both") {
             // Alignment and threshold information
             std::ostringstream align_file;
+            // Concat-HMM calibration (hmm_* columns) is appended only when present.
+            // Readers find columns by name and ignore extra ones.
+            std::map<std::string, std::map<std::string, std::string>> hmm_cells;
+            std::vector<std::string> hmm_cols;
+            if (!concat_params.empty()) {
+                hmm_cells = concat_hmm::params_to_columns(concat_params);
+                for (const auto& row : hmm_cells)
+                    for (const auto& col : row.second)
+                        if (std::find(hmm_cols.begin(), hmm_cols.end(), col.first) == hmm_cols.end())
+                            hmm_cols.push_back(col.first);
+                std::sort(hmm_cols.begin(), hmm_cols.end());
+            }
             align_file << "id,primary_start,primary_stop,secondary_start,secondary_stop,"
                 << "misalign_lower,misalign_mean,misalign_upper,"
                 << "align_start,var_start,align_stop,var_stop,"
-                << "misalign_start,mvar_start,misalign_stop,mvar_stop\n";
+                << "misalign_start,mvar_start,misalign_stop,mvar_stop";
+            for (const auto& col : hmm_cols) align_file << "," << col;
+            align_file << "\n";
             
             for (const auto& element : by_order()) {
                 align_file << element.class_id;
@@ -1202,7 +1316,29 @@ public:
                     align_file << ",,,,";  // Four commas for aligned positions
                     align_file << ",,,,";  // Four commas for misaligned positions
                 }
+                if (!hmm_cols.empty()) {
+                    const auto row_it = hmm_cells.find(element.class_id);
+                    for (const auto& col : hmm_cols) {
+                        align_file << ",";
+                        if (row_it == hmm_cells.end()) continue;
+                        const auto cell_it = row_it->second.find(col);
+                        if (cell_it != row_it->second.end()) align_file << cell_it->second;
+                    }
+                }
                 align_file << "\n";
+            }
+            // Mirrored anchors and poly-tail states need not be explicit
+            // layout elements. Preserve their calibrated emissions as rows
+            // with no positional fields; they do not create layout elements.
+            for (const auto& row : hmm_cells) {
+                if (by_id().find(row.first) != by_id().end()) continue;
+                align_file << row.first << std::string(15, ',');
+                for (const auto& col : hmm_cols) {
+                    align_file << ',';
+                    const auto cell = row.second.find(col);
+                    if (cell != row.second.end()) align_file << cell->second;
+                }
+                align_file << '\n';
             }
             checked_replace(path_prefix + "_position_map.csv",
                             align_file.str());
@@ -1396,15 +1532,40 @@ public:
     
     // import a position map .csv
     void import_position_map(const std::string& map_csv,bool verbose){
+        concat_params = concat_hmm::Params{};
+        concat_model.reset();
         using namespace csv;
         // set up CSV reader for the position map
         CSVFormat fmt;
         fmt.delimiter(',').quote('"').header_row(0)
             .variable_columns(VariableColumnPolicy::KEEP);
         CSVReader reader(map_csv, fmt);
+        // Optional concat-HMM calibration columns (hmm_*).
+        std::vector<std::string> hmm_cols;
+        std::map<std::string, std::size_t> hmm_column_indices;
+        const auto column_names = reader.get_col_names();
+        for (std::size_t i = 0; i < column_names.size(); ++i) {
+            const auto& name = column_names[i];
+            if (name.rfind("hmm_", 0) == 0) {
+                hmm_cols.push_back(name);
+                hmm_column_indices.emplace(name, i);
+            }
+        }
+        std::map<std::string, std::map<std::string, std::string>> hmm_cells;
         // iterate rows
         for (auto &row : reader) {
             std::string id = row["id"].get<std::string>();
+            // Import parameter-only mirrored states before ignoring their
+            // nonexistent position-map entry. Bounds checks also preserve
+            // support for older short rows without swallowing failures.
+            for (const auto& col : hmm_cols) {
+                const auto index = hmm_column_indices.at(col);
+                if (index >= row.size()) continue;
+                auto field = row[index];
+                if (field.is_null()) continue;
+                std::string cell = field.get<std::string>();
+                if (!cell.empty()) hmm_cells[id][col] = std::move(cell);
+            }
             // find the corresponding element from the layout
             auto element_it = by_id().find(id);
             if (element_it == by_id().end()) {
@@ -1413,7 +1574,6 @@ public:
                 }
                 continue;
             }
-
             // only proceed if we have a non-empty primary_start
             const std::string &ps = row["primary_start"].get<std::string>();
             if (!ps.empty()) {
@@ -1489,6 +1649,15 @@ public:
                 }
             }
         }
+        if (!hmm_cells.empty()) {
+            // Malformed cells are retained in Params::bad_cells so model
+            // construction can disable the HMM explicitly. Allocation or
+            // other resource failures must reach the host unchanged.
+            concat_params = concat_hmm::params_from_columns(to_concat_layout_spec(), hmm_cells);
+            if (verbose)
+                RAD_COUT << "[pos_map] concat-HMM calibration loaded (" << hmm_cols.size()
+                          << " hmm_* columns" << (concat_params.guard_failed ? ", guard failed" : "") << ")\n";
+        }
     }
 
     // Generate position map
@@ -1529,6 +1698,64 @@ public:
         wl_map.lists.clear();
         wl_map.maps.clear();
 
+        // A joint element's axis:mask declaration is not the generic
+        // global:true dual-whitelist syntax. Resolve it before catalog import.
+        auto joint_group = [](const ReadElement& elem) -> std::optional<int> {
+            std::string flags = elem.flags;
+            std::transform(flags.begin(), flags.end(), flags.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            for (char& c : flags) {
+                if (c == ',' || c == ';' || c == '|') c = ' ';
+            }
+            std::istringstream tokens(flags);
+            std::string token;
+            std::optional<int> group;
+            while (tokens >> token) {
+                if (token.rfind("joint_barcode", 0) != 0) continue;
+                std::smatch match;
+                static const std::regex grammar("^joint_barcode(?::([0-9]+)(?:_([0-9]+))?)?$");
+                if (!std::regex_match(token, match, grammar) || group.has_value()) {
+                    throw std::runtime_error("Invalid joint barcode flags for " + elem.class_id);
+                }
+                group = match[1].matched ? std::stoi(match[1].str()) : 0;
+            }
+            return group;
+        };
+        std::map<int, std::vector<const ReadElement*>> joint_groups;
+        std::unordered_map<std::string, std::string> joint_axis_specs;
+        std::string mask_csv_path;
+        std::optional<int> masked_group;
+        for (const auto& elem : by_order()) {
+            if (elem.global_class != "barcode" || elem.type != "variable") continue;
+            auto group = joint_group(elem);
+            if (!group) continue;
+            auto colon = elem.whitelist_path.find(':');
+            std::string axis = elem.whitelist_path.substr(0, colon);
+            joint_axis_specs[seq_utils::remove_rc(elem.class_id)] = axis;
+            if (elem.direction == "forward") joint_groups[*group].push_back(&elem);
+            if (colon == std::string::npos) continue;
+            std::string mask = elem.whitelist_path.substr(colon + 1);
+            if (axis.empty() || mask.empty() || mask.find(':') != std::string::npos) {
+                throw std::runtime_error("Expected axis:mask for joint barcode " + elem.class_id);
+            }
+            std::string resolved = whitelist_utils::kit_to_path(mask);
+            if ((masked_group && *masked_group != *group) ||
+                (!mask_csv_path.empty() && mask_csv_path != resolved)) {
+                throw std::runtime_error("Conflicting spatial mask declarations; only one masked joint group is supported");
+            }
+            masked_group = *group;
+            mask_csv_path = resolved;
+        }
+        if (masked_group) {
+            if (wl_path || typed_global || typed_true) {
+                throw std::runtime_error("A whitelist override cannot be combined with a declared joint spatial mask");
+            }
+            if (joint_groups.size() != 1 || joint_groups[*masked_group].size() != 2) {
+                throw std::runtime_error("A spatial mask requires exactly one joint group with two forward-defined barcode axes");
+            }
+        }
+
         // 1) collect static seqs for filter_bcs
         std::vector<std::string> static_seqs;
         for (auto const &elem : layout) {
@@ -1557,6 +1784,7 @@ public:
 
             const bool typed = typed_global.has_value() || typed_true.has_value();
             std::string spec = wl_path ? wl_path.value() : elem.whitelist_path;
+            if (!wl_path && joint_axis_specs.count(key)) spec = joint_axis_specs.at(key);
             if (!typed && spec.empty()) {
                 throw std::invalid_argument(
                     "No whitelist was provided for barcode element " +
@@ -1581,7 +1809,10 @@ public:
                       << "] @ " << path << "\n";
 
             // import into the pool if not already
-            auto pit = wl_map.lists.find(path);
+            // Isolate masked axes from other elements that reuse their catalog.
+            const std::string pool_key = masked_group && joint_axis_specs.count(key)
+                ? path + "#joint:" + key : path;
+            auto pit = wl_map.lists.find(pool_key);
             if (pit == wl_map.lists.end()) {
                 if (verbose) RAD_COUT << "[load_wl] Loading from " << path << " ...\n";
                 auto t1 = high_resolution_clock::now();
@@ -1629,7 +1860,7 @@ public:
                 double ms = duration<double, std::milli>(t2 - t1).count();
                 RAD_COUT << "[load_wl] loaded in " << (ms/1000.0) << " s\n";
                 memory_utils::get_rss();
-                pit = wl_map.lists.emplace(path, std::move(entry)).first;
+                pit = wl_map.lists.emplace(pool_key, std::move(entry)).first;
             }
 
             // alias into maps by reference
@@ -1655,78 +1886,70 @@ public:
             }
         }
 
-        // Load spat_mask for joint barcode elements whose whitelist field
-        // contains a colon separator (e.g. "visium_hd_bc1:spat_mask.csv").
-        // The mask CSV path is the same for both bc1 and bc2 — passed on either.
-        // We load it once onto the first joint barcode element's wl_entry.
-        {
-            std::string mask_csv_path;
-            std::string bc1_wl_path, bc2_wl_path;
-            std::string first_joint_key;
-
-            for (auto const& elem : layout) {
-                if (elem.global_class != "barcode" || elem.type != "variable") continue;
-                if (elem.flags.find("joint_barcode") == std::string::npos) continue;
-
-                // Check if whitelist field has a colon (individual_wl:spat_mask_path)
-                auto colon = elem.whitelist_path.find(':');
-                if (colon != std::string::npos) {
-                    std::string individual_spec = elem.whitelist_path.substr(0, colon);
-                    std::string mask_spec = elem.whitelist_path.substr(colon + 1);
-
-                    // Resolve the mask path
-                    std::string resolved_mask = mask_spec;
-                    try {
-                        // If it's not an absolute path, try resolving as kit key
-                        if (!std::filesystem::path(mask_spec).is_absolute() &&
-                            !std::filesystem::exists(mask_spec)) {
-                            resolved_mask = whitelist_utils::kit_to_path(mask_spec);
-                        }
-                    } catch (...) {}
-
-                    if (mask_csv_path.empty()) {
-                        mask_csv_path = resolved_mask;
-                    }
-
-                    // Resolve individual whitelist path for axis mapping
-                    std::string resolved_wl = whitelist_utils::kit_to_path(individual_spec);
-                    if (bc1_wl_path.empty()) {
-                        bc1_wl_path = resolved_wl;
-                        first_joint_key = seq_utils::remove_rc(elem.class_id);
-                    } else if (bc2_wl_path.empty()) {
-                        bc2_wl_path = resolved_wl;
+        // Validate the matrix strictly before the legacy loader consumes it.
+        // A requested but unusable mask must never turn into an unrestricted run.
+        if (masked_group) {
+            const auto& members = joint_groups.at(*masked_group);
+            const std::string bc1_path = whitelist_utils::kit_to_path(joint_axis_specs.at(seq_utils::remove_rc(members[0]->class_id)));
+            const std::string bc2_path = whitelist_utils::kit_to_path(joint_axis_specs.at(seq_utils::remove_rc(members[1]->class_id)));
+            auto axis_size = [](const std::string& path) {
+                std::unordered_set<std::string> seen;
+                bool first = true;
+                for (const auto& raw : streaming_utils::import_text(path)) {
+                    std::string line = seq_utils::trim(raw);
+                    if (line.empty()) continue;
+                    if (first && line == "whitelist_bcs") { first = false; continue; }
+                    first = false;
+                    if (line.size() > 64 || line.find_first_not_of("ACGT") != std::string::npos ||
+                        !seen.insert(line).second) {
+                        throw std::runtime_error("Spatial mask axes require unique DNA barcode lines: " + path);
                     }
                 }
-            }
-
-            if (!mask_csv_path.empty() && !bc1_wl_path.empty() && !bc2_wl_path.empty()) {
-                auto mit = wl_map.maps.find(first_joint_key);
-                if (mit != wl_map.maps.end()) {
-                    auto& entry = mit->second.get();
-                    entry.spat_wl.emplace();
-                    bool ok = entry.spat_wl->load(mask_csv_path, bc1_wl_path, bc2_wl_path, verbose);
-                    if (!ok) {
-                        entry.spat_wl.reset();
-                        RAD_CERR << "[load_wl] Failed to load spat_mask from " << mask_csv_path << "\n";
-                    } else {
-                        RAD_COUT << "[load_wl] Spatial mask loaded: "
-                                  << entry.spat_wl->count_valid() << " valid pairs\n";
-                    }
+                if (seen.empty() || seen.size() > std::numeric_limits<uint16_t>::max()) {
+                    throw std::runtime_error("Invalid spatial mask axis size: " + path);
                 }
+                return seen.size();
+            };
+            const size_t rows = axis_size(bc1_path), cols = axis_size(bc2_path);
+            std::ifstream matrix(mask_csv_path);
+            if (!matrix) throw std::runtime_error("Cannot open spatial mask: " + mask_csv_path);
+            size_t row_count = 0;
+            std::string line;
+            while (std::getline(matrix, line)) {
+                size_t col_count = 0, start = 0;
+                while (true) {
+                    auto comma = line.find(',', start);
+                    std::string value = seq_utils::trim(line.substr(start, comma == std::string::npos ? comma : comma - start));
+                    if (value != "0" && value != "1") {
+                        throw std::runtime_error("spatial mask cells must be exactly 0 or 1: " + mask_csv_path);
+                    }
+                    ++col_count;
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+                if (col_count != cols)
+                    throw std::runtime_error("spatial mask column count does not match the BC2 axis: " + mask_csv_path);
+                if (++row_count > rows)
+                    throw std::runtime_error("spatial mask row count does not match the BC1 axis: " + mask_csv_path);
             }
+            if (matrix.bad()) throw std::runtime_error("Could not read spatial mask: " + mask_csv_path);
+            if (row_count != rows)
+                throw std::runtime_error("spatial mask row count does not match the BC1 axis: " + mask_csv_path);
+            auto& entry = wl_map.maps.at(seq_utils::remove_rc(members[0]->class_id)).get();
+            entry.spat_wl.emplace();
+            if (!entry.spat_wl->load(mask_csv_path, bc1_path, bc2_path, verbose)) {
+                throw std::runtime_error("Failed to load requested spatial mask: " + mask_csv_path);
+            }
+            RAD_COUT << "[load_wl] Spatial mask loaded: " << entry.spat_wl->count_valid() << " valid pairs\n";
         }
 
         for (auto & [key, entry_ref] : wl_map.maps) {
             auto &E = entry_ref.get();
-            std::unordered_set<int64_seq> to_remove;
-            to_remove.reserve(E.true_bcs.size());
-            for (auto const & [bc,be] : E.true_bcs){
-                to_remove.insert(bc);
-            }
-
-            for (auto const &bc : to_remove){
-                E.global_bcs.remove_bc_entry(bc);
-            }
+            // The true and global tables own separate storage, so removing
+            // global overlaps does not invalidate this association traversal.
+            E.true_bcs.for_each_association([&](const auto& barcode, const auto&) {
+                E.global_bcs.remove_bc_entry(barcode);
+            });
 
             // final report
             RAD_COUT << "[load_wl]"
@@ -1735,6 +1958,10 @@ public:
                     << ", true = "  << E.true_bcs.size()
                     << ", filter = "<< E.filter_bcs.size()
                     << "\n";
+            RAD_COUT << "[load_wl] [" << key << "] true logical associations = "
+                      << E.true_bcs.association_size()
+                      << ", explicit alias keys = " << E.true_bcs.physical_alias_size()
+                      << "\n";
             for (auto const &kv : wl_map.maps) {
                 auto const &E = kv.second.get();
                 
@@ -1757,6 +1984,13 @@ public:
             }
         }
 
+        // Part tables for the exhaustive scan; true_bcs must not change after this point.
+        for (auto & [pool_key, E] : wl_map.lists) {
+            E.build_part_idx(verbose);
+        }
+
+        memory_utils::release_unused_heap();
+
         auto t3 = high_resolution_clock::now();
         double total_s = duration<double>(t3 - t0).count();
         RAD_COUT << "[load_wl] finished loading all whitelists in "
@@ -1773,13 +2007,12 @@ public:
         
         if (whitelist_type == "true" || whitelist_type == "both") {
             std::unordered_set<int64_seq> seen_true;
-            seen_true.reserve(entry.true_bcs.size());
-            for (auto const &kv : entry.true_bcs) {
-                auto cnt = kv.second.count.load(barcode_counts::total);
-                if (cnt > 0) {
-                    seen_true.insert(kv.second.barcode);
+            // Allocate only for the positive-count barcodes selected below.
+            entry.true_bcs.for_each_entry([&](const auto& value) {
+                if (value.count.load(barcode_counts::total) > 0) {
+                    seen_true.emplace(value.key());
                 }
-            }
+            });
 
             if (!seen_true.empty()) {
                 entry.true_bcs.write_wl_summary(out, class_id, &seen_true);
@@ -1788,13 +2021,12 @@ public:
         
         if ((whitelist_type == "global" || whitelist_type == "both") && full) {
             std::unordered_set<int64_seq> seen_global;
-            seen_global.reserve(entry.global_bcs.size());
-            for (auto const &kv : entry.global_bcs) {
-                auto cnt = kv.count.load(barcode_counts::total);
-                if (cnt > 0) {
-                    seen_global.insert(kv.barcode);
+            // The catalog can be huge even when few barcodes have counts.
+            entry.global_bcs.for_each_entry([&](const auto& value) {
+                if (value.count.load(barcode_counts::total) > 0) {
+                    seen_global.emplace(value.key());
                 }
-            }
+            });
             
             if (!seen_global.empty()) {
                 entry.global_bcs.write_wl_summary(out, class_id, &seen_global);
@@ -2552,6 +2784,142 @@ private:
 };
 
 /**
+ * @brief Concat-HMM calibration (hmm_* columns). Workers get a fixed strided partition of each chunk
+ * and are merged in worker order, so the result does not depend on scheduling.
+ */
+class concat_hmm_cal {
+public:
+    concat_hmm_cal(const ReadLayout& layout, int num_threads)
+        : prior_(concat_hmm::Model::build(layout.to_concat_layout_spec())),
+          master_(prior_),
+          nthreads_(std::max(1, std::min(num_threads, 16))) {}
+
+    void add_chunk(const std::vector<read_streaming::sequence>& chunk, size_t max_reads,
+                   const std::function<void()>& boundary_poll = {}) {
+        std::lock_guard<std::mutex> lock(mu_);
+        const size_t room = max_reads > added_ ? max_reads - added_ : 0;
+        const size_t n = std::min(chunk.size(), room);
+        if (n == 0) return;
+        if (boundary_poll) boundary_poll();
+        const int workers = static_cast<int>(std::max<size_t>(1, std::min<size_t>(nthreads_, n / 1000)));
+        std::vector<concat_hmm::Calibrator> cals;
+        cals.reserve(workers);
+        for (int w = 0; w < workers; ++w) cals.emplace_back(prior_);
+        if (workers == 1) {
+            for (size_t r = 0; r < n; ++r) {
+                if (boundary_poll && r % 32 == 0) boundary_poll();
+                cals[0].add_read(chunk[r].seq.data(), checked_length(chunk[r].seq.size()));
+            }
+        } else {
+            std::atomic<bool> cancelled{false};
+            std::atomic<int> remaining{workers};
+            std::mutex state_mutex;
+            std::condition_variable ready;
+            std::exception_ptr worker_error;
+            std::vector<std::thread> pool;
+            pool.reserve(workers);
+            auto join_all = [&]() {
+                for (auto& worker : pool) if (worker.joinable()) worker.join();
+            };
+            try {
+                for (int w = 0; w < workers; ++w) {
+                    pool.emplace_back([&, w]() {
+                        try {
+                            for (size_t r = static_cast<size_t>(w); r < n;
+                                 r += static_cast<size_t>(workers)) {
+                                if (cancelled.load(std::memory_order_acquire)) break;
+                                cals[w].add_read(chunk[r].seq.data(), checked_length(chunk[r].seq.size()));
+                            }
+                        } catch (...) {
+                            std::lock_guard<std::mutex> state_lock(state_mutex);
+                            if (!worker_error) worker_error = std::current_exception();
+                            cancelled.store(true, std::memory_order_release);
+                        }
+                        remaining.fetch_sub(1, std::memory_order_release);
+                        ready.notify_one();
+                    });
+                }
+                while (remaining.load(std::memory_order_acquire) != 0) {
+                    if (boundary_poll) boundary_poll();
+                    std::unique_lock<std::mutex> state_lock(state_mutex);
+                    ready.wait_for(state_lock, std::chrono::milliseconds(50), [&]() {
+                        return remaining.load(std::memory_order_acquire) == 0;
+                    });
+                }
+            } catch (...) {
+                // Includes host cancellation and failure to create a later
+                // thread: no joinable thread may escape stack unwinding.
+                cancelled.store(true, std::memory_order_release);
+                join_all();
+                throw;
+            }
+            join_all();
+            if (worker_error) std::rethrow_exception(worker_error);
+        }
+        for (const auto& cal : cals) {
+            if (boundary_poll) boundary_poll();
+            master_.merge(cal);
+        }
+        added_ += n;
+    }
+
+    // Finalizes (hard-EM + calibration guard), prints the report and stores the parameters.
+    bool finish(ReadLayout& layout, const std::function<void()>& boundary_poll = {}) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (master_.n_reads() == 0) {
+            RAD_CERR << "[concat_hmm] WARNING: no reads for calibration; layout priors will be used\n";
+            return false;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        concat_hmm::Params params = master_.finalize(20, 0.001, boundary_poll);
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        RAD_COUT << "[concat_hmm] Calibration on " << master_.n_reads() << " reads (EM " << secs << " s):\n"
+                  << master_.report();
+        if (!master_.layout_matches())
+            RAD_COUT << "[concat_hmm] WARNING: calibration guard failed (the layout does not match these reads); "
+                         "the HMM is disabled and every read uses the existing path\n";
+        layout.concat_params = std::move(params);
+        return master_.layout_matches();
+    }
+
+    // Cached runs whose position map has no hmm_* columns: calibrate from the FASTQ head
+    // without redoing the misalignment step.
+    static bool calibrate_from_fastq(const std::string& fastq_path, ReadLayout& layout, int num_threads,
+                                     size_t max_reads = 50000,
+                                     const std::function<void()>& boundary_poll = {}) {
+        // Input corruption, resource failures, and host cancellation must
+        // propagate. A model/layout mismatch is handled by build_concat_model.
+        if (max_reads == 0 || max_reads > static_cast<size_t>(std::numeric_limits<int64_t>::max()))
+            throw std::invalid_argument("Invalid HMM calibration read count");
+        std::unique_ptr<concat_hmm_cal> cal;
+        try { cal = std::make_unique<concat_hmm_cal>(layout, num_threads); }
+        catch (const concat_hmm::layout_spec_error& error) {
+            RAD_CERR << "[concat_hmm] WARNING: cannot calibrate this layout (" << error.what() << ")\n";
+            return false;
+        }
+        using ChunkFunc = std::function<void(const std::vector<read_streaming::sequence>&, const std::string&)>;
+        ChunkFunc feed = [&](const std::vector<read_streaming::sequence>& chunk, const std::string&) {
+            cal->add_chunk(chunk, max_reads, boundary_poll);
+        };
+        chunk_streaming<read_streaming::sequence, ChunkFunc> streamer(std::min<size_t>(max_reads, 50000));
+        streamer.process_chunks(fastq_path, feed, 1, static_cast<int64_t>(max_reads), false, 0, boundary_poll);
+        return cal->finish(layout, boundary_poll);
+    }
+
+private:
+    static int checked_length(size_t size) {
+        if (size > static_cast<size_t>(std::numeric_limits<int>::max()))
+            throw std::length_error("Read is too long for concat-HMM calibration");
+        return static_cast<int>(size);
+    }
+    concat_hmm::Model prior_;
+    concat_hmm::Calibrator master_;
+    int nthreads_;
+    size_t added_ = 0;
+    std::mutex mu_;
+};
+
+/**
  * @brief This class contains all of the setup for the misalignment threshold, as well as the masked adapters.
  * @brief contains structures for perfect matches, misalignment statistics, and position statistics.
  * @struct perfect_match
@@ -2590,6 +2958,7 @@ public:
         size_t total_reads_seen;
         bool is_stable;
         std::pair<size_t, size_t> dir_counts;
+        std::vector<size_t> ed_hist;  // accrued values per edit distance (index = edit distance)
 
     /**
      * @brief nested structure for storing position statistics
@@ -2646,6 +3015,11 @@ public:
     void update_stats(int new_edit_distance, size_t total_reads, size_t forward_count, size_t reverse_count) {
             double old_mean = mean;
             count++;
+            if (new_edit_distance >= 0) {
+                if (ed_hist.size() <= static_cast<size_t>(new_edit_distance))
+                    ed_hist.resize(static_cast<size_t>(new_edit_distance) + 1, 0);
+                ed_hist[static_cast<size_t>(new_edit_distance)]++;
+            }
             total_reads_seen = total_reads;
             mean = mean + (new_edit_distance - mean) / count;
             sum_squares += (new_edit_distance - old_mean) * (new_edit_distance - mean);
@@ -2691,11 +3065,91 @@ public:
         }
     };
 
+    /**
+     * @brief Chance hits of one element's misalignment edit distances. Values at or below the lowest bin
+     * under the mode (v) are true copies when a higher bin lies below v; all other values are chance hits.
+     */
+    struct chance_hit_stats {
+        size_t n_all = 0;              // accrued values
+        size_t n_low = 0;              // values in the low group (true copies), removed
+        size_t n_chance = 0;           // values in the chance-hit group
+        int mode = -1;                 // main peak used for the split
+        int split = -1;                // last edit distance of the low group; -1 when there is no low group
+        double mean = 0.0;             // mean of the chance hits
+        double sd = 0.0;               // sample standard deviation of the chance hits
+        int lower = -1;                // largest edit distance with a cumulative chance-hit share <= chance_share
+        double share_at_lower = 0.0;   // cumulative chance-hit share at lower
+        double share_above_lower = 0.0;// cumulative chance-hit share at lower + 1
+    };
+
+    static chance_hit_stats chance_hits_from_histogram(const std::vector<size_t>& hist, double chance_share) {
+        chance_hit_stats r;
+        for (size_t c : hist) r.n_all += c;
+        if (hist.empty() || r.n_all == 0) return r;
+        const int last = static_cast<int>(hist.size()) - 1;
+        auto argmax_from = [&](int from) {
+            int m = -1;
+            size_t best = 0;
+            for (int d = from; d <= last; ++d)
+                if (hist[d] > 0 && hist[d] >= best) { best = hist[d]; m = d; }
+            return m;
+        };
+        int mode = argmax_from(0);
+        if (mode == 0) {
+            const int m1 = argmax_from(1);
+            if (m1 > 0) mode = m1;
+        }
+        r.mode = mode;
+        int v = 0;
+        size_t vmin = hist[0];
+        for (int d = 0; d <= mode; ++d)
+            if (hist[d] <= vmin) { vmin = hist[d]; v = d; }
+        size_t below_max = 0;
+        for (int d = 0; d < v; ++d) below_max = std::max(below_max, hist[d]);
+        const int first = (below_max > vmin) ? v + 1 : 0;   // first edit distance of the chance-hit group
+        r.split = first - 1;
+        double sum = 0.0;
+        for (int d = 0; d <= last; ++d) {
+            if (d < first) { r.n_low += hist[d]; continue; }
+            r.n_chance += hist[d];
+            sum += static_cast<double>(d) * static_cast<double>(hist[d]);
+        }
+        if (r.n_chance == 0) return r;
+        r.mean = sum / static_cast<double>(r.n_chance);
+        double ss = 0.0;
+        for (int d = first; d <= last; ++d) {
+            const double diff = static_cast<double>(d) - r.mean;
+            ss += diff * diff * static_cast<double>(hist[d]);
+        }
+        r.sd = r.n_chance > 1 ? std::sqrt(ss / static_cast<double>(r.n_chance - 1)) : 0.0;
+        auto share_at = [&](int d) {
+            size_t cum = 0;
+            for (int e = first; e <= std::min(d, last); ++e) cum += hist[e];
+            return static_cast<double>(cum) / static_cast<double>(r.n_chance);
+        };
+        r.lower = -1;
+        for (int d = 0; d <= last; ++d) {
+            if (share_at(d) <= chance_share) r.lower = d;
+            else break;
+        }
+        if (r.lower < 0) r.lower = 0;   // chance hits at edit distance 0 above the limit: nothing but exact copies
+        r.share_at_lower = share_at(r.lower);
+        r.share_above_lower = share_at(r.lower + 1);
+        return r;
+    }
+
 /**
  * @brief Constructor that initializes the Misalignment_Setup with a given ReadLayout
  * @param layout ReadLayout object
+ * @param misalign_lower_chance_share accepted cumulative share of chance hits at misalign_lower (default
+ *        adapter_thresholds::misalign_lower_chance_share)
  */
-    Misalignment_Setup(const ReadLayout& layout) {
+    Misalignment_Setup(const ReadLayout& layout,
+                       double misalign_lower_chance_share = adapter_thresholds::misalign_lower_chance_share)
+        : misalign_lower_chance_share_(misalign_lower_chance_share) {
+        if (!std::isfinite(misalign_lower_chance_share_) || misalign_lower_chance_share_ < 0 ||
+            misalign_lower_chance_share_ > 1)
+            throw std::invalid_argument("Misalignment chance share must be between zero and one");
         // Extract static adapters (non poly-tail, non start/stop)
         // guards against empty seq -- need to update for static indexing
         for (const auto& elem : layout.by_type()) {
@@ -2716,26 +3170,29 @@ public:
         }
     }
 
+    /**
+     * @brief Accrue the misalignment null from the FASTQ head (sample rule: adapter_thresholds) and update the layout.
+     * @param min_reads size of the first block (rad prep: -n)
+     * @param calibrate_concat_hmm also calibrate the concat-HMM, on the first min_reads reads only
+     */
     void generate_misalignment_data(
-        const std::string& fastq_path, ReadLayout& layout,
-        int num_threads = 1, size_t max_reads = 50000,
-        std::function<void()> boundary_poll = {}
+        const std::string& fastq_path, ReadLayout& layout, int num_threads = 1,
+        size_t min_reads = adapter_thresholds::cal_block_reads,
+        std::function<void()> boundary_poll = {},
+        bool calibrate_concat_hmm = false
     ) {
+        if (min_reads == 0) throw std::invalid_argument("Calibration read count must be positive");
+        if (boundary_poll) boundary_poll();
         prune_similar_reverse_adapters(layout);
 
-        using ChunkFunc = std::function<bool(const std::vector<read_streaming::sequence>&, const std::string&)>;
-        chunk_streaming<read_streaming::sequence, ChunkFunc> streamer(max_reads);
-        
         size_t forward_count = 0;
         size_t reverse_count = 0;
         size_t total_reads_processed = 0;
-        constexpr size_t kMinPerfectMatches = 10;
-        
+
         //collecting statistics of both adapter stats and misalignment stats
         std::unordered_map<std::string, static_alignment_stats> adapter_stats;
         std::unordered_map<std::string, static_alignment_stats> misalignment_stats;
-        ChunkFunc process_func = [&](const std::vector<read_streaming::sequence>& chunk, const std::string& file) -> bool {
-            #pragma omp atomic
+        auto process_block = [&](const std::vector<read_streaming::sequence>& chunk) {
             total_reads_processed += chunk.size();
             process_misalignment_chunk(
                 chunk,
@@ -2743,68 +3200,120 @@ public:
                 reverse_count,
                 adapter_stats,
                 misalignment_stats,
-                total_reads_processed
+                total_reads_processed, boundary_poll
             );
             // Print progress and current misalignment thresholds.
-            #pragma omp critical
-            {
-                RAD_COUT << 
-                "\r[misalignment_stats] Processed " << total_reads_processed << 
-                " total reads - Forward perfect: " <<  forward_count  << 
-                ", Reverse perfect: " << reverse_count << "\n";
+            RAD_COUT <<
+            "\r[misalignment_stats] Processed " << total_reads_processed <<
+            " total reads - Forward perfect: " <<  forward_count  <<
+            ", Reverse perfect: " << reverse_count << "\n";
 
-                for (const auto& [adapter_id, stats] : adapter_stats) {
-                    RAD_COUT << 
-                    "[misalignment_stats] " << adapter_id << 
-                    " misalignment mean: " <<  misalignment_stats[adapter_id].mean  << 
-                    " (total times detected properly = " << stats.count << "," << 
-                    " misaligned forward: " << misalignment_stats[adapter_id].dir_counts.first << 
-                    ", misaligned reverse: " << misalignment_stats[adapter_id].dir_counts.second << 
-                    ")" << 
-                    (stats.is_stable ? " [STABLE]" : "") << 
-                    "\n";
-                }
+            for (const auto& [adapter_id, stats] : adapter_stats) {
+                RAD_COUT <<
+                "[misalignment_stats] " << adapter_id <<
+                " misalignment mean: " <<  misalignment_stats[adapter_id].mean  <<
+                " (total times detected properly = " << stats.count << "," <<
+                " misaligned forward: " << misalignment_stats[adapter_id].dir_counts.first <<
+                ", misaligned reverse: " << misalignment_stats[adapter_id].dir_counts.second <<
+                ")" <<
+                (stats.is_stable ? " [STABLE]" : "") <<
+                "\n";
             }
-            // Determine if processing should stop.
-            bool has_min_perfect = (forward_count >= kMinPerfectMatches) || (reverse_count >= kMinPerfectMatches);
-            bool reached_read_limit = total_reads_processed >= max_reads;
-
-            bool all_stable = false;
-            #pragma omp critical(adapter_stats_read)
-            {
-                if (!misalignment_stats.empty()) {
-                    all_stable = std::all_of(
-                        misalignment_stats.begin(),
-                        misalignment_stats.end(),
-                        [](const auto& pair) { 
-                            return pair.second.is_stable; 
-                        }
-                    );
-                }
-            }
-            if (!has_min_perfect && !reached_read_limit) {
-                return true;  // Need more data before considering stopping conditions.
-            }
-            if (all_stable || reached_read_limit) {
-                return false;  // Signal to stop processing
-            }
-            return true;  // Continue processing
         };
 
-        streamer.process_chunks(fastq_path, process_func, num_threads,
-                                max_reads, false, 0, boundary_poll);
+        // chance hits of every element that a perfect read of the other direction feeds
+        auto chance_counts = [&]() {
+            std::vector<std::pair<std::string, size_t>> n;
+            for (const auto* adapters : {&forward_adapters, &reverse_adapters})
+                for (const auto& [id, seq] : *adapters) {
+                    auto it = misalignment_stats.find(id);
+                    n.emplace_back(id, it == misalignment_stats.end() ? size_t{0}
+                        : chance_hits_from_histogram(it->second.ed_hist, misalign_lower_chance_share_).n_chance);
+                }
+            return n;
+        };
+
+        const size_t block = adapter_thresholds::cal_block_reads;
+        const size_t cap = std::max(adapter_thresholds::cal_max_reads, min_reads);
+        const size_t need = adapter_thresholds::min_misal_obs;
+        file_streaming files(fastq_path, 4);
+        read_streaming reader(files);
+        size_t target = min_reads;
+        size_t blocks = 0;
+        bool end_of_input = false;
+        std::string stop_reason;
+        std::vector<std::pair<std::string, size_t>> n_chance;
+        while (true) {
+            // At most one block in memory; only the sequence is kept.
+            while (total_reads_processed < target && !end_of_input) {
+                std::vector<read_streaming::sequence> chunk;
+                const size_t want = std::min(block, target - total_reads_processed);
+                chunk.reserve(want);
+                while (chunk.size() < want) {
+                    if (boundary_poll && chunk.size() % 1024 == 0) boundary_poll();
+                    auto rec = reader.next_sequence();
+                    if (!rec) { end_of_input = true; break; }
+                    if (!keep_perf_matches) { rec->qual = std::string(); rec->comment = std::string(); }
+                    chunk.push_back(std::move(*rec));
+                }
+                if (!chunk.empty()) {
+                    process_block(chunk);
+                    ++blocks;
+                }
+            }
+            if (reader.read_failed()) {
+                std::string message = "sequence read failed (kseq code " +
+                    std::to_string(reader.read_error_code()) + ") in " + reader.read_error_path();
+                if (!reader.read_error_detail().empty())
+                    message += " (" + reader.read_error_detail() + ")";
+                throw std::runtime_error(message);
+            }
+            if (boundary_poll) boundary_poll();
+            n_chance = chance_counts();
+            if (n_chance.empty()) { stop_reason = "no static element to calibrate"; break; }
+            size_t slowest = std::numeric_limits<size_t>::max();
+            for (const auto& [id, n] : n_chance) slowest = std::min(slowest, n);
+            if (slowest >= need) { stop_reason = "every element has enough chance hits"; break; }
+            if (end_of_input) { stop_reason = "end of input"; break; }
+            if (total_reads_processed >= cap) { stop_reason = "read limit reached"; break; }
+            const double projected = slowest == 0 ? std::numeric_limits<double>::infinity()
+                : static_cast<double>(total_reads_processed) * static_cast<double>(need) / static_cast<double>(slowest);
+            if (projected > static_cast<double>(cap)) {
+                stop_reason = slowest == 0 ? "an element has no chance hits"
+                                           : "projected sample above the read limit";
+                break;
+            }
+            target = std::min(total_reads_processed + block, cap);
+        }
+        RAD_COUT << "[misalignment_stats] Calibration sample: " << total_reads_processed << " reads in "
+                  << blocks << " block(s); stop: " << stop_reason << " (need " << need
+                  << " chance hits per element, read limit " << cap << "); chance hits:";
+        for (const auto& [id, n] : n_chance) RAD_COUT << " " << id << "=" << n;
+        RAD_COUT << "\n";
+
         
         // Write final results
-        write_perfect_matches();
+        write_perfect_matches(keep_perf_matches);
         update_read_layout(layout, adapter_stats, misalignment_stats);
         layout.generate_position_mapping();
+        // Adapter calibration can remove unobserved layout elements. Build the
+        // HMM only after that final topology is known; otherwise its freshly
+        // learned structural tables would be discarded as a cache mismatch.
+        // A bounded second pass avoids retaining the raw sample in memory.
+        if (calibrate_concat_hmm) {
+            concat_hmm_cal::calibrate_from_fastq(fastq_path, layout, num_threads,
+                                                 min_reads, boundary_poll);
+        }
     }
 
 private:
+    double misalign_lower_chance_share_; /// accepted cumulative share of chance hits at misalign_lower
     std::unordered_map<std::string, std::vector<consensus_matrix>> consensus_matrices;
     std::vector<std::pair<std::string, std::string>> forward_adapters; /// vector of forward adapters, stored as `pair:[class_id, seq]`
     std::vector<std::pair<std::string, std::string>> reverse_adapters; /// vector of reverse adapters, stored as `pair:[class_id, seq]`
-    std::vector<perfect_match> perfect_matches; /// vector of perfect matches
+    // Debug only: keep perfect reads for write_perfect_matches (large memory).
+    static constexpr bool keep_perf_matches = false;
+    std::vector<perfect_match> perfect_matches; /// vector of perfect matches (only with keep_perf_matches)
 
     double alignment_distance_fraction(const std::string& lhs, const std::string& rhs) const {
         if (lhs.empty() && rhs.empty()) return 0.0;
@@ -2885,9 +3394,12 @@ private:
         size_t& reverse_count,
         std::unordered_map<std::string, static_alignment_stats>& adapter_stats,
         std::unordered_map<std::string, static_alignment_stats>& misalignment_stats,
-        size_t total_reads
+        size_t total_reads,
+        const std::function<void()>& boundary_poll = {}
     ) {
+        size_t processed = 0;
         for (const auto& read : chunk) {
+            if (boundary_poll && processed++ % 128 == 0) boundary_poll();
 
             bool perfect_forward = find_perfect_match(read.seq, forward_adapters, adapter_stats, total_reads, "forward");
             bool perfect_reverse = find_perfect_match(read.seq, reverse_adapters, adapter_stats, total_reads, "reverse");
@@ -2899,7 +3411,7 @@ private:
                 );
                 #pragma omp critical
                 {
-                    perfect_matches.push_back({read, "forward"});
+                    if (keep_perf_matches) perfect_matches.push_back({read, "forward"});
                     #pragma omp atomic
                     forward_count++;
                 }
@@ -2911,7 +3423,7 @@ private:
                 );
                 #pragma omp critical
                 {
-                    perfect_matches.push_back({read, "reverse"});
+                    if (keep_perf_matches) perfect_matches.push_back({read, "reverse"});
                     #pragma omp atomic
                     reverse_count++;
                 }
@@ -3131,11 +3643,13 @@ private:
  * @brief generate a masked adapter sequence based on consensus matrices and misalignment statistics
  * @param adapter_id the ID of the adapter
  * @param adapter_seq the original adapter sequence
- * @param stats the misalignment statistics for the adapter
+ * @param misalign_mean mean of the misalignment edit distances used for the thresholds (chance hits, or the fallback)
+ * @param misalign_sd standard deviation of the same values
  * @return the masked adapter sequence
  */
-    std::string generate_masked_adapter(const std::string& adapter_id, const std::string adapter_seq, const static_alignment_stats& stats) {
-    int threshold = static_cast<int>(std::floor(stats.mean - stats.get_sd()));
+    std::string generate_masked_adapter(const std::string& adapter_id, const std::string adapter_seq,
+                                        double misalign_mean, double misalign_sd) {
+    int threshold = static_cast<int>(std::floor(misalign_mean - misalign_sd));
     // Define max consecutive N's allowed as (threshold - 1), with a minimum of 1.
     int max_consecutive_N = (threshold > 1 ? threshold - 1 : 1);
     int max_total_N = 12;
@@ -3250,8 +3764,6 @@ private:
                 }
 
                 std::string seq = it->seq;
-                std::string masked = generate_masked_adapter(adapter_id, seq, stats);
-                double sd = stats.get_sd();
 
                 AlignmentPositions align_pos = stats.position_stats.calculate();
                 AlignmentPositions misalign_pos = misalignment_stats[adapter_id].position_stats.calculate();
@@ -3263,19 +3775,54 @@ private:
                     continue;
                 }
 
+                // thresholds from the chance hits only
                 auto& misalignment = misalignment_stats[adapter_id];
-                double mean = misalignment.mean;
-                constexpr size_t kMinMisalignmentObservations = 100;
+                const chance_hit_stats chance =
+                    chance_hits_from_histogram(misalignment.ed_hist, misalign_lower_chance_share_);
+                const double mean_all = misalignment.mean;
+                const double sd_all = misalignment.get_sd();
+                double mean = chance.mean;
+                double sd = chance.sd;
+                int lower = chance.lower;
                 const int fallback_threshold =
                     adapter_thresholds::fallback_max_edit_distance(seq.length());
                 const bool use_fallback_threshold =
-                    misalignment.count < kMinMisalignmentObservations ||
+                    chance.n_chance < adapter_thresholds::min_misal_obs ||
                     !std::isfinite(mean) ||
                     mean < 1.0;
                 if (use_fallback_threshold) {
                     mean = static_cast<double>(fallback_threshold);
                     sd = 0.0;
+                    lower = fallback_threshold;
                 }
+                // the masking generator reads the same statistics as the thresholds
+                std::string masked = generate_masked_adapter(adapter_id, seq, mean, sd);
+
+                std::tuple<int, int, int> threshold =
+                    use_fallback_threshold
+                        ? std::make_tuple(
+                              fallback_threshold,
+                              fallback_threshold,
+                              fallback_threshold)
+                        : std::make_tuple(
+                              lower,
+                              static_cast<int>(std::floor(mean)),
+                              static_cast<int>(std::round(mean + sd)));
+
+                std::ostringstream hist_text;
+                for (size_t d = 0; d < misalignment.ed_hist.size(); ++d) {
+                    if (misalignment.ed_hist[d] == 0) continue;
+                    if (hist_text.tellp() > 0) hist_text << " ";
+                    hist_text << d << ":" << misalignment.ed_hist[d];
+                }
+                auto pct = [](double x) { return std::round(x * 1000.0) / 10.0; };
+                std::ostringstream low_text;
+                if (chance.split >= 0)
+                    low_text << "ED <= " << chance.split << ": " << chance.n_low << " ("
+                             << pct(static_cast<double>(chance.n_low) / static_cast<double>(std::max<size_t>(1, chance.n_all)))
+                             << "%)";
+                else
+                    low_text << "none (no gap below the mode)";
 
                 double misal_start = 0.0;
                 double misal_stop = 0.0;
@@ -3292,14 +3839,23 @@ private:
                 << "| Metric                       | Value                |\n"
                 << "+------------------------------+----------------------+\n"
                 << "| original seq                 | " << seq << "\n"
+                << "| masked seq                   | " << masked << "\n"
+                << "| misalignment observations    | " << misalignment.count << "\n"
+                << "| misalignment ED histogram    | " << hist_text.str() << "\n"
+                << "| true-copy group (removed)    | " << low_text.str() << "\n"
+                << "| chance hits (mode ED)        | " << chance.n_chance << " (" << chance.mode << ")\n"
                 << "| misalignment mean            | " << mean << "\n"
                 << "| misalignment sd              | " << sd << "\n"
-                << "| misalignment observations    | " << misalignment.count << "\n"
+                << "| mean / sd of all values      | " << mean_all << " / " << sd_all << "\n"
+                << "| chance share <= lower, +1    | " << pct(chance.share_at_lower) << "% / "
+                << pct(chance.share_above_lower) << "% (limit " << pct(misalign_lower_chance_share_) << "%)\n"
                 << "| threshold source             | "
                 << (use_fallback_threshold
                         ? "fallback ceil(0.30 * adapter length)"
-                        : "observed misalignment distribution")
+                        : "chance hits of the misalignment distribution")
                 << "\n"
+                << "| misalign lower / mean / upper| " << std::get<0>(threshold) << " / "
+                << std::get<1>(threshold) << " / " << std::get<2>(threshold) << "\n"
                 << "| perfect adapter count        | " << adapter_stats[adapter_id].count << "\n"
                 << "| forward count                | " << adapter_stats[adapter_id].dir_counts.first << "\n"
                 << "| reverse count                | " << adapter_stats[adapter_id].dir_counts.second << "\n"
@@ -3308,18 +3864,6 @@ private:
                 << "| misaligned start pos (mean)  | " << misalign_pos.start_stats.first << "\n"
                 << "| misaligned stop pos (mean)   | " << misalign_pos.stop_stats.first << "\n"
                 << "+------------------------------+----------------------+\n";
-
-                std::tuple<int, int, int> threshold =
-                    use_fallback_threshold
-                        ? std::make_tuple(
-                              fallback_threshold,
-                              fallback_threshold,
-                              fallback_threshold)
-                        : std::make_tuple(
-                              static_cast<int>(std::round(mean - sd)),
-                              static_cast<int>(std::floor(mean)),
-                              static_cast<int>(std::round(mean + sd)));
-                
 
                 by_id_index.modify(it, [&](ReadElement& elem) {
                     elem.masked_seq = masked;

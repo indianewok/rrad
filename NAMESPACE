@@ -72,3 +72,6 @@ S3method(format,rad_phred)
 S3method(print,rad_id)
 S3method(print,rad_seq)
 S3method(print,rad_phred)
+
+export(rad_discover)
+export(rad_spatial_reformat)

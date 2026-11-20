@@ -54,6 +54,24 @@ else
     exit 1
 fi
 
+# Packed barcodes up to 64 bases use the unsigned 128-bit integer supported
+# by GCC and Clang on the package's 64-bit Linux and macOS targets.
+cat > "${rrad_probe_dir}/uint128.cpp" <<'EOF'
+#ifndef __SIZEOF_INT128__
+#error This compiler does not provide an unsigned 128-bit integer
+#endif
+__extension__ typedef unsigned __int128 rrad_uint128;
+static_assert(sizeof(rrad_uint128) == 16, "128-bit barcode storage is required");
+int main() {
+    volatile rrad_uint128 bits = rrad_uint128{1} << 127;
+    return (bits >> 127) != 1;
+}
+EOF
+if ! rrad_try_link uint128 ""; then
+    echo "configure: error: rrad requires unsigned 128-bit integer support; use a 64-bit GCC or Clang C++17 compiler" >&2
+    exit 1
+fi
+
 # The streaming writer uses std::thread even when OpenMP is disabled. Link
 # pthread explicitly so serial builds also work on older Linux toolchains.
 cat > "${rrad_probe_dir}/dependencies.cpp" <<'EOF'

@@ -1,6 +1,7 @@
 #pragma once
 #include "rad_headers.h"
 
+
 namespace basic_stats {
     double mean(const std::vector<double>& x) {
         if (x.empty()) return 0.0;
@@ -51,6 +52,15 @@ namespace basic_stats {
 };
 
 namespace memory_utils {
+
+    // Large, one-off loading allocations can leave free pages in glibc's
+    // arenas. Release those pages once loading has finished; other allocators
+    // keep their normal behavior.
+    inline void release_unused_heap() {
+        #if defined(__GLIBC__)
+            ::malloc_trim(0);
+        #endif
+    }
 
     inline double to_mib(std::size_t bytes) {
         return double(bytes) / 1024.0 / 1024.0;

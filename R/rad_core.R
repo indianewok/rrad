@@ -227,7 +227,7 @@ rad_core_info <- function() {
 #'   This is an alternative to `custom_whitelist`; supplying both is an error.
 #' @param scan_adapter Optional adapter used by automatic whitelist scanning.
 #'   `NULL` derives the nearest upstream static element from `layout`.
-#' @param scan_barcode_length Optional barcode length from 1 to 32 for
+#' @param scan_barcode_length Optional barcode length from 1 to 64 for
 #'   automatic scanning. `NULL` derives it from `layout`.
 #' @param scan_max_error Adapter edit-distance ratio from 0 to 1 used during
 #'   automatic scanning.
@@ -290,7 +290,13 @@ rad_demux <- function(layout,
                       min_read_length = NULL,
                       write_debug = FALSE,
                       verbose = FALSE,
-                      reuse_cache = FALSE) {
+                      reuse_cache = FALSE,
+                      concat_hmm = FALSE,
+                      concat_hmm_abstain = c("drop", "legacy"),
+                      calibration_reads = 50000L,
+                      output_connection = NULL,
+                      scan_capture_mode = c("after_adapter", "masked"),
+                      scan_spatial = FALSE) {
   layout <- .rad_layout_reference(layout)
   fastq <- .rad_existing_file(fastq, "fastq")
   out_dir <- .rad_scalar_character(out_dir, "out_dir")
@@ -326,8 +332,8 @@ rad_demux <- function(layout,
     scan_barcode_length, "scan_barcode_length", minimum = 1L,
     allow_null = TRUE
   )
-  if (!is.null(scan_barcode_length) && scan_barcode_length > 32L) {
-    stop("scan_barcode_length must be between 1 and 32", call. = FALSE)
+  if (!is.null(scan_barcode_length) && scan_barcode_length > 64L) {
+    stop("scan_barcode_length must be between 1 and 64", call. = FALSE)
   }
   scan_max_error <- .rad_scalar_double(
     scan_max_error, "scan_max_error", minimum = 0
@@ -346,11 +352,14 @@ rad_demux <- function(layout,
   )
   scan_selection <- match.arg(tolower(scan_selection),
                               c("high_specificity", "above_floor"))
+  scan_capture_mode <- match.arg(scan_capture_mode)
+  scan_spatial <- .rad_scalar_logical(scan_spatial, "scan_spatial")
   scan_options_requested <-
     !is.null(scan_adapter) || !is.null(scan_barcode_length) ||
     !identical(scan_max_error, 0.3) || !is.null(scan_max_reads) ||
     !is.null(scan_chunk_size) || !is.null(scan_threads) ||
-    !identical(scan_selection, "high_specificity")
+    !identical(scan_selection, "high_specificity") ||
+    scan_capture_mode != "after_adapter" || scan_spatial
   if (!auto_whitelist && scan_options_requested) {
     stop("scan_* options require auto_whitelist = TRUE", call. = FALSE)
   }
@@ -377,6 +386,21 @@ rad_demux <- function(layout,
   write_debug <- .rad_scalar_logical(write_debug, "write_debug")
   verbose <- .rad_scalar_logical(verbose, "verbose")
   reuse_cache <- .rad_scalar_logical(reuse_cache, "reuse_cache")
+  concat_hmm <- .rad_scalar_logical(concat_hmm, "concat_hmm")
+  concat_hmm_abstain <- match.arg(concat_hmm_abstain)
+  calibration_reads <- .rad_scalar_integer(calibration_reads, "calibration_reads", minimum = 1L)
+  output_callback <- NULL
+  if (!is.null(output_connection)) {
+    if (!inherits(output_connection, "connection") || !isOpen(output_connection, "w"))
+      stop("output_connection must be an open writable R connection", call. = FALSE)
+    connection_info <- summary(output_connection)
+    binary_output <- identical(connection_info$text, "binary")
+    output_callback <- function(text) {
+      if (binary_output) writeBin(charToRaw(text), output_connection)
+      else cat(text, file = output_connection, sep = "")
+      invisible(NULL)
+    }
+  }
   out_dir <- .rad_output_directory(out_dir)
 
   # Query immediately before execution. This is intentionally a runtime
@@ -434,7 +458,11 @@ rad_demux <- function(layout,
     min_read_length = min_read_length,
     write_debug = write_debug,
     verbose = verbose,
-    reuse_cache = reuse_cache
+    reuse_cache = reuse_cache,
+    concat_hmm = concat_hmm,
+    concat_hmm_abstain = concat_hmm_abstain,
+    calibration_reads = calibration_reads,
+    output_callback = output_callback
   ))
   if (auto_whitelist) {
     native_options <- c(native_options, .rad_drop_null(list(
@@ -444,7 +472,9 @@ rad_demux <- function(layout,
       scan_max_reads = scan_max_reads,
       scan_chunk_size = scan_chunk_size,
       scan_threads = scan_threads,
-      scan_selection = scan_selection
+      scan_selection = scan_selection,
+      scan_capture_mode = scan_capture_mode,
+      scan_spatial = scan_spatial
     )))
   }
 
@@ -520,7 +550,13 @@ rad_demux <- function(layout,
     min_read_length = min_read_length,
     write_debug = write_debug,
     verbose = verbose,
-    reuse_cache = reuse_cache
+    reuse_cache = reuse_cache,
+    concat_hmm = concat_hmm,
+    concat_hmm_abstain = concat_hmm_abstain,
+    calibration_reads = calibration_reads,
+    streamed = !is.null(output_connection),
+    scan_capture_mode = scan_capture_mode,
+    scan_spatial = scan_spatial
   )
 
   native_core <- .rad_validate_core_info(native$core)
